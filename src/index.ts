@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawn, spawnSync } from 'child_process';
+import { spawn, spawnSync, SpawnOptionsWithoutStdio } from 'child_process';
 import {
   existsSync,
   mkdtempSync,
@@ -13,6 +13,7 @@ import {
 } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import * as readline from 'readline';
 
 interface ToolDefinition {
   image: string;
@@ -23,6 +24,7 @@ interface ToolDefinition {
   shareHome?: boolean;
   homeReadOnly?: boolean;
   writablePaths?: string[];
+  autoBuild?: AutoBuildConfig;
 }
 
 interface ToolMap {
@@ -38,26 +40,40 @@ interface CliOptions {
   helpRequested: boolean;
 }
 
-const BUILT_IN_TOOLS: ToolMap = {
-  codex: {
-    image: 'mcr.microsoft.com/devcontainers/base:ubuntu',
-    command: ['codex'],
-    description: 'Launches the Codex CLI inside a devcontainers base image',
-    shareHome: false,
-    writablePaths: ['~/.codex'],
-  },
-  claude: {
-    image: 'mcr.microsoft.com/devcontainers/base:ubuntu',
-    command: ['claude'],
-    description: 'Runs Claude Code inside a container and mounts your workspace',
-  },
-};
+interface AutoBuildConfig {
+  dockerfile: string;
+  tag: string;
+  description?: string;
+}
 
 const CONFIG_PATH = process.env.DEVCON_TOOLS_FILE
   || path.join(os.homedir(), '.config', 'devcon', 'tools.json');
 const WORKSPACE_TARGET = '/workspace';
 const HOME_READONLY_DEFAULT = parseBooleanEnv(process.env.DEVCON_HOME_READONLY);
 const SHARE_HOME_DEFAULT = parseBooleanEnv(process.env.DEVCON_SHARE_HOME);
+const DEFAULT_IMAGE_TAG = 'devcon:latest';
+const DEFAULT_IMAGE_DOCKERFILE = path.resolve(__dirname, '..', 'docker', 'devcon', 'Dockerfile');
+const DEFAULT_AUTO_BUILD: AutoBuildConfig = {
+  dockerfile: DEFAULT_IMAGE_DOCKERFILE,
+  tag: DEFAULT_IMAGE_TAG,
+  description: 'Builds the devcon base image with Codex CLI and Claude Code preinstalled.',
+};
+
+const BUILT_IN_TOOLS: ToolMap = {
+  codex: {
+    image: DEFAULT_IMAGE_TAG,
+    command: ['codex'],
+    description: 'Launches the Codex CLI inside a devcontainers base image',
+    writablePaths: ['~/.codex'],
+    autoBuild: DEFAULT_AUTO_BUILD,
+  },
+  claude: {
+    image: DEFAULT_IMAGE_TAG,
+    command: ['claude'],
+    description: 'Runs Claude Code inside a container and mounts your workspace',
+    autoBuild: DEFAULT_AUTO_BUILD,
+  },
+};
 
 function parseBooleanEnv(value: string | undefined): boolean {
   if (!value) {
@@ -128,7 +144,14 @@ function loadCustomTools(): ToolMap {
 }
 
 function readTools(): ToolMap {
-  return { ...BUILT_IN_TOOLS, ...loadCustomTools() };
+  const merged: ToolMap = { ...BUILT_IN_TOOLS };
+  const custom = loadCustomTools();
+  for (const [name, tool] of Object.entries(custom)) {
+    const base = merged[name] ?? {};
+    merged[name] = { ...base, ...tool };
+  }
+
+  return merged;
 }
 
 function parseArgs(argv: string[]): CliOptions {
@@ -270,6 +293,78 @@ function ensureDockerAvailable(): void {
   }
 }
 
+function promptYesNo(question: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(/^y(es)?$/i.test(answer.trim()));
+    });
+  });
+}
+
+function runCommand(
+  command: string,
+  args: string[],
+  options: SpawnOptionsWithoutStdio = {},
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: 'inherit',
+      ...options,
+    });
+
+    child.on('exit', (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`${command} ${args.join(' ')} exited with code ${code ?? 1}`));
+      }
+    });
+
+    child.on('error', (error) => reject(error));
+  });
+}
+
+async function runDockerBuild(spec: AutoBuildConfig): Promise<void> {
+  const dockerfileDir = path.dirname(spec.dockerfile);
+  const dockerfileName = path.basename(spec.dockerfile);
+  console.log(`Building Docker image "${spec.tag}" using ${spec.dockerfile} ...`);
+  await runCommand('docker', ['build', '-f', dockerfileName, '-t', spec.tag, '.'], {
+    cwd: dockerfileDir,
+  });
+}
+
+async function ensureImageAvailable(image: string, autoBuild?: AutoBuildConfig): Promise<void> {
+  const inspect = spawnSync('docker', ['image', 'inspect', image], { stdio: 'ignore' });
+  if (inspect.status === 0) {
+    return;
+  }
+
+  if (!autoBuild) {
+    throw new Error(`Docker image "${image}" was not found. Please build or pull it before continuing.`);
+  }
+
+  console.warn(`Docker image "${image}" is missing.`);
+  if (autoBuild.description) {
+    console.warn(autoBuild.description);
+  }
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error(`Cannot auto-build image "${image}" because the terminal is not interactive.`);
+  }
+
+  const confirmed = await promptYesNo('Build it now? [y/N] ');
+  if (!confirmed) {
+    throw new Error('Image build cancelled by user.');
+  }
+
+  await runDockerBuild(autoBuild);
+}
+
 function printHelp(tools: ToolMap): void {
   console.log('Usage: devcon <tool> [-- tool args]\n');
   console.log('Flags:');
@@ -289,8 +384,8 @@ function buildDockerArgs(options: {
   toolName: string;
   tool: ToolDefinition;
   toolArgs: string[];
-  imageOverride?: string;
   shareHome: boolean;
+  image: string;
 }): { command: string; args: string[]; cleanup: () => void } {
   const dockerArgs: string[] = ['run', '--rm', '-it'];
   const cleanupTargets: string[] = [];
@@ -351,8 +446,7 @@ function buildDockerArgs(options: {
     dockerArgs.push('-e', `${key}=${value}`);
   }
 
-  const image = options.imageOverride ?? options.tool.image;
-  dockerArgs.push(image);
+  dockerArgs.push(options.image);
 
   const toolCommand = options.tool.command ?? [];
   const commandArgs = [...toolCommand, ...options.toolArgs];
@@ -398,13 +492,16 @@ async function main(): Promise<void> {
 
   ensureDockerAvailable();
 
+  const image = options.imageOverride ?? tool.image;
+  await ensureImageAvailable(image, options.imageOverride ? undefined : tool.autoBuild);
+
   const { command, args, cleanup } = buildDockerArgs({
     cwd: process.cwd(),
     toolName: options.toolName,
     tool,
     toolArgs: options.toolArgs,
-    imageOverride: options.imageOverride,
     shareHome: options.shareHome && tool.shareHome !== false,
+    image,
   });
 
   if (options.dryRun) {

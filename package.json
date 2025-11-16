@@ -34,7 +34,8 @@
   },
   "homepage": "https://github.com/janniklinde/devcon#readme",
   "files": [
-    "dist"
+    "dist",
+    "docker"
   ],
   "devDependencies": {
     "@types/node": "^24.10.1",
