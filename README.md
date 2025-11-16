@@ -1,12 +1,12 @@
 # devcon
 
-`devcon` is a Linux-only CLI that launches AI coding agents like Codex CLI or Claude Code in fresh Docker containers that already have your working directory and user identity wired up. It is meant to be installed globally (`npm install -g devcon`) so you can run `devcon codex` (or `devcon claude`) from any project and get a locked-down shell within seconds. The built-in tool definitions use the Microsoft Dev Containers base image, so either ship an image with the agent pre-installed or rely on the host home-directory mount so the container can reuse your already-installed CLI binaries.
+`devcon` is a Linux-only CLI that launches AI coding agents like Codex CLI or Claude Code in fresh Docker containers that already have your working directory wired up. Install globally (`npm install -g devcon`) and run `devcon codex` (or `devcon claude`) from any project to get a locked-down shell within seconds. The built-in tool definitions use the Microsoft Dev Containers base image, so either ship an image with the agent pre-installed or rely on selectively mounted host directories so the container can reuse your already-installed CLI binaries and credentials.
 
 ## What it does
 
 - Spin up a disposable Docker container per invocation.
 - Bind-mount the current working directory at `/workspace` and run as your host UID/GID so file permissions stay intact.
-- Optionally mount your host home directory (enabled by default, disable via `--no-home` or `DEVCON_SHARE_HOME=0`) so tools can see existing config and auth files.
+- Keep the host home directory private by default. Opt in with `--home` or `DEVCON_SHARE_HOME=1`, or whitelist individual directories/files via `writablePaths` so credentials like `~/.codex` can still be shared.
 - Hide `.env*`, `.git-credentials`, and other critical Git metadata from the container by overlaying empty bind mounts before the container starts.
 - Provide a simple tool registry (`codex`, `claude` by default) allowing you to define which Docker image and command should run for each agent.
 
@@ -35,12 +35,15 @@ devcon claude --no-home
 
 # Override the docker image just for this run
 devcon codex --image ghcr.io/my/codex:latest -- --trace
+
+# Temporarily share the entire home directory (default is no home mount)
+devcon codex --home
 ```
 
 Useful flags:
 
 - `--dry-run` – Print the assembled `docker run` invocation instead of executing it.
-- `--no-home` – Skip sharing your host home directory.
+- `--home` / `--no-home` – Force-enable or force-disable home-directory sharing for this run.
 - `--image=NAME` – Override the docker image configured for the tool.
 - `--help` / `--list` – Show usage plus the registered tools.
 
@@ -53,16 +56,15 @@ Devcon merges the built-in tools with an optional JSON file. Create `~/.config/d
   "codex": {
     "image": "ghcr.io/my-org/codex-cli:latest",
     "command": ["/bin/bash", "-lc", "codex"],
-    "env": {
-      "CODEX_CONFIG": "/home/user/.config/codex/config.json"
-    }
+    "writablePaths": ["~/.codex"]
   },
   "codex-locked": {
     "image": "devcon-codex",
     "homeReadOnly": true,
-    "writablePaths": [
-      "~/.codex"
-    ]
+    "writablePaths": ["~/.codex", "~/.config/codex-cli"],
+    "env": {
+      "CODEX_CONFIG": "/home/user/.config/codex/config.json"
+    }
   }
 }
 ```
@@ -73,18 +75,21 @@ Fields per tool:
 - `command` – Array describing the command to execute inside the container. Omit it to rely on the image entrypoint.
 - `env` – Additional environment variables to inject.
 - `workdir` – Alternative container working directory (defaults to `/workspace`).
-- `shareHome` – Override the CLI default for sharing the host home directory.
-- `homeReadOnly` – When `true`, the home directory mount is forced read-only; pair with `writablePaths` to selectively re-enable write access.
-- `writablePaths` – Array of paths (absolute or `~/`-prefixed) that should remain writable even if the home directory is read-only. The paths must already exist on the host.
+- `shareHome` – Override the CLI default for sharing the host home directory (default is `false`).
+- `homeReadOnly` – When `true`, the home directory mount is forced read-only; pair with `writablePaths` to selectively re-enable write access to specific paths.
+- `writablePaths` – Array of paths (absolute or `~/`-prefixed) that should remain mounted read/write even if the home directory is not mounted. The paths live under your host home directory; missing directories are created automatically.
 
-Set `DEVCON_HOME_READONLY=1` if you want every tool that shares your home directory to mount it read-only by default. Individual tools can then opt back into read/write (`homeReadOnly: false`) or specify fine-grained writable directories. This is useful for cases like Codex CLI where you only want to expose `~/.codex` for credential writes while keeping the rest of your home directory immutable.
+Environment toggles:
+
+- `DEVCON_SHARE_HOME=1` – Make home-directory sharing the default for all tools (equivalent to passing `--home` every time).
+- `DEVCON_HOME_READONLY=1` – When the home directory is shared, mount it read-only by default. Individual tools can override via `homeReadOnly: false` or expose specific `writablePaths`.
 
 ## Security defaults
 
 - Every run masks `.env`, `.env.*`, `.git/config`, `.git/index`, `.git/HEAD`, `.git-credentials`, and `.git/credentials` from the container by mounting empty placeholders over those paths after the workspace volume is attached.
 - Containers inherit your host UID/GID so they have no more privileges than you already do.
 - Each invocation runs with `--rm` and without Docker daemon side-effects, ensuring there is no long-lived state.
-- You can flip the host home directory into read-only mode via `DEVCON_HOME_READONLY=1` (or per-tool `homeReadOnly: true`) to limit exposure, then opt specific directories back into write access through `writablePaths`.
+- The host home directory is unmounted by default; opt in explicitly and/or keep it read-only (`DEVCON_HOME_READONLY=1`) while allowing write access only to trusted locations via `writablePaths`.
 
 ## Development
 

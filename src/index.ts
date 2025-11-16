@@ -1,6 +1,16 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from 'child_process';
-import { existsSync, mkdtempSync, readdirSync, rmSync, statSync, closeSync, openSync, Dirent } from 'fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  closeSync,
+  openSync,
+  Dirent,
+  mkdirSync,
+} from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
@@ -33,6 +43,8 @@ const BUILT_IN_TOOLS: ToolMap = {
     image: 'mcr.microsoft.com/devcontainers/base:ubuntu',
     command: ['codex'],
     description: 'Launches the Codex CLI inside a devcontainers base image',
+    shareHome: false,
+    writablePaths: ['~/.codex'],
   },
   claude: {
     image: 'mcr.microsoft.com/devcontainers/base:ubuntu',
@@ -45,6 +57,7 @@ const CONFIG_PATH = process.env.DEVCON_TOOLS_FILE
   || path.join(os.homedir(), '.config', 'devcon', 'tools.json');
 const WORKSPACE_TARGET = '/workspace';
 const HOME_READONLY_DEFAULT = parseBooleanEnv(process.env.DEVCON_HOME_READONLY);
+const SHARE_HOME_DEFAULT = parseBooleanEnv(process.env.DEVCON_SHARE_HOME);
 
 function parseBooleanEnv(value: string | undefined): boolean {
   if (!value) {
@@ -90,6 +103,15 @@ function detectPathType(target: string): SensitivePath['type'] {
   throw new Error(`Writable path ${target} must be a file or directory.`);
 }
 
+function ensureWritablePath(target: string): SensitivePath['type'] {
+  if (existsSync(target)) {
+    return detectPathType(target);
+  }
+
+  mkdirSync(target, { recursive: true });
+  return 'dir';
+}
+
 function loadCustomTools(): ToolMap {
   if (!existsSync(CONFIG_PATH)) {
     return {};
@@ -114,7 +136,7 @@ function parseArgs(argv: string[]): CliOptions {
   const positional: string[] = [];
   let dryRun = false;
   let imageOverride: string | undefined;
-  let shareHome = process.env.DEVCON_SHARE_HOME !== '0';
+  let shareHome = SHARE_HOME_DEFAULT;
   let forward = false;
   let helpRequested = false;
 
@@ -143,6 +165,11 @@ function parseArgs(argv: string[]): CliOptions {
 
     if (arg === '--no-home') {
       shareHome = false;
+      continue;
+    }
+
+    if (arg === '--home') {
+      shareHome = true;
       continue;
     }
 
@@ -247,6 +274,7 @@ function printHelp(tools: ToolMap): void {
   console.log('Usage: devcon <tool> [-- tool args]\n');
   console.log('Flags:');
   console.log('  --dry-run     Print the docker command without executing it');
+  console.log('  --home        Share your host home directory with the container (disabled by default)');
   console.log('  --no-home     Do not share your host home directory with the container');
   console.log('  --image=IMG   Override the docker image for this run');
   console.log('  --help        Show this message');
@@ -271,6 +299,7 @@ function buildDockerArgs(options: {
   const shareHome = options.shareHome;
   const homeReadOnly = shareHome ? (options.tool.homeReadOnly ?? HOME_READONLY_DEFAULT) : false;
   const shouldMountWritable = writablePaths.length > 0 && (!shareHome || homeReadOnly);
+  let homeEnvSet = false;
 
   if (typeof process.getuid === 'function' && typeof process.getgid === 'function') {
     dockerArgs.push('-u', `${process.getuid()}:${process.getgid()}`);
@@ -289,6 +318,11 @@ function buildDockerArgs(options: {
       : `type=bind,source=${normalizedHome},target=${normalizedHome}`;
     dockerArgs.push('--mount', mountSpec);
     dockerArgs.push('-e', `HOME=${normalizedHome}`);
+    homeEnvSet = true;
+  }
+
+  if (!homeEnvSet && homeDir) {
+    dockerArgs.push('-e', `HOME=${homeDir}`);
   }
 
   if (shouldMountWritable) {
@@ -298,10 +332,7 @@ function buildDockerArgs(options: {
     for (const rawPath of writablePaths) {
       const resolved = resolveUserPath(rawPath, homeDir);
       ensurePathWithinHome(resolved, homeDir);
-      if (!existsSync(resolved)) {
-        throw new Error(`Writable path ${resolved} does not exist on the host.`);
-      }
-      detectPathType(resolved); // Validate type; we do not need the value but ensure it is file/dir.
+      ensureWritablePath(resolved);
       dockerArgs.push('--mount', `type=bind,source=${resolved},target=${resolved}`);
     }
   } else if (shareHome && writablePaths.length > 0 && !homeReadOnly) {
