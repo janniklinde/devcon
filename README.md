@@ -23,6 +23,10 @@ You need Docker installed and accessible to your user. Only Linux hosts are supp
 
 ```bash
 devcon <tool> [-- tool arguments]
+
+# Rebuild the default tool images (all tools or a specific one)
+devcon update
+devcon update codex
 ```
 
 Examples:
@@ -57,6 +61,13 @@ docker build -f docker/devcon/Dockerfile -t devcon:latest docker/devcon
 ```
 
 The build context lives inside the npm package, so everything works even if you run `devcon codex` from a random project. If you prefer a custom image, pass `--image my/tag` or set `image` in `~/.config/devcon/tools.json`—auto-build only triggers for the default image.
+
+To manually refresh the bundled images (for example to pick up new Codex CLI releases), run:
+
+```bash
+devcon update        # rebuilds every tool with an auto-build config
+devcon update codex  # limit the rebuild to a single tool/image
+```
 
 ## Tool registry
 

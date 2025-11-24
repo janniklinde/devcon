@@ -338,6 +338,56 @@ async function runDockerBuild(spec: AutoBuildConfig): Promise<void> {
   });
 }
 
+async function handleUpdateCommand(
+  targetToolNames: string[],
+  tools: ToolMap,
+  dryRun: boolean,
+): Promise<void> {
+  const requested = targetToolNames.length > 0 ? targetToolNames : Object.keys(tools);
+  if (requested.length === 0) {
+    console.warn('No tools are available to update.');
+    return;
+  }
+
+  const specs = new Map<string, { spec: AutoBuildConfig; toolNames: string[] }>();
+  for (const name of requested) {
+    const tool = tools[name];
+    if (!tool) {
+      throw new Error(`Unknown tool "${name}" specified for update.`);
+    }
+    if (!tool.autoBuild) {
+      console.warn(`Tool "${name}" does not have an auto-build configuration and will be skipped.`);
+      continue;
+    }
+    const resolvedDockerfile = path.resolve(tool.autoBuild.dockerfile);
+    const specKey = `${resolvedDockerfile}::${tool.autoBuild.tag}`;
+    const entry = specs.get(specKey);
+    if (entry) {
+      entry.toolNames.push(name);
+    } else {
+      specs.set(specKey, {
+        spec: { ...tool.autoBuild, dockerfile: resolvedDockerfile },
+        toolNames: [name],
+      });
+    }
+  }
+
+  if (specs.size === 0) {
+    console.warn('No auto-buildable tools were selected for update.');
+    return;
+  }
+
+  for (const { spec, toolNames } of specs.values()) {
+    const descriptor = `image "${spec.tag}" for tool(s): ${toolNames.join(', ')}`;
+    if (dryRun) {
+      console.log(`[dry-run] Would rebuild ${descriptor} using ${spec.dockerfile}`);
+      continue;
+    }
+    console.log(`Rebuilding ${descriptor}`);
+    await runDockerBuild(spec);
+  }
+}
+
 async function ensureImageAvailable(image: string, autoBuild?: AutoBuildConfig): Promise<void> {
   const inspect = spawnSync('docker', ['image', 'inspect', image], { stdio: 'ignore' });
   if (inspect.status === 0) {
@@ -366,13 +416,17 @@ async function ensureImageAvailable(image: string, autoBuild?: AutoBuildConfig):
 }
 
 function printHelp(tools: ToolMap): void {
-  console.log('Usage: devcon <tool> [-- tool args]\n');
+  console.log('Usage:');
+  console.log('  devcon <tool> [-- tool args]');
+  console.log('  devcon update [tool ...]\n');
   console.log('Flags:');
   console.log('  --dry-run     Print the docker command without executing it');
   console.log('  --home        Share your host home directory with the container (disabled by default)');
   console.log('  --no-home     Do not share your host home directory with the container');
   console.log('  --image=IMG   Override the docker image for this run');
   console.log('  --help        Show this message');
+  console.log('\nCommands:');
+  console.log('  update        Rebuild Docker images for one or more tools');
   console.log('\nTools:');
   for (const [name, tool] of Object.entries(tools)) {
     console.log(`  ${name.padEnd(10)} ${tool.description ?? ''}`.trimEnd());
@@ -479,6 +533,14 @@ async function main(): Promise<void> {
     console.error('No tool specified.');
     printHelp(tools);
     process.exitCode = 1;
+    return;
+  }
+
+  if (options.toolName === 'update') {
+    if (options.imageOverride) {
+      throw new Error('The --image flag cannot be used with "devcon update". Specify the desired image in the tool configuration instead.');
+    }
+    await handleUpdateCommand(options.toolArgs, tools, options.dryRun);
     return;
   }
 
