@@ -29,6 +29,12 @@ devcon update
 devcon update codex
 devcon rebuild         # full no-cache rebuild for all auto-build tools
 devcon rebuild codex   # full no-cache rebuild of a single tool/image
+devcon sensitive list          # show effective sensitive patterns and matches
+devcon sensitive add secrets/** # add a custom sensitive pattern
+devcon sensitive remove secrets/**
+devcon skip-scan list          # show skip-scan directories (defaults + custom)
+devcon skip-scan add .cache    # add a directory name to skip during scans
+devcon skip-scan remove .cache
 ```
 
 Examples:
@@ -132,6 +138,15 @@ Environment toggles:
 - Each invocation runs with `--rm` and without Docker daemon side-effects, ensuring there is no long-lived state.
 - The host home directory is unmounted by default; opt in explicitly and/or keep it read-only (`DEVCON_HOME_READONLY=1`) while allowing write access only to trusted locations via `writablePaths`.
 - The default Codex/Claude image builds locally and never ships secrets to a registry.
+
+### Sensitive file patterns
+
+- Default sensitive patterns: `.env`, `.env.*`, `**/.env`, `**/.env.*`, `.git`, `.git-credentials`.
+- Manage additional patterns in `~/.config/devcon/sensitive.json` via `devcon sensitive`:
+  - `devcon sensitive list` – show defaults, custom patterns, and what matches in the current workspace.
+  - `devcon sensitive add "<pattern>"` – add a glob-style pattern (e.g. `secrets/**`).
+  - `devcon sensitive remove "<pattern>"` – remove a custom pattern.
+- The pattern scan skips common heavy directories (`node_modules`, `.git`, `dist`, `build`, `.next`, `.turbo`, `.cache`, `tmp`, `temp`, `.venv`, `venv`, `target`, `out`, `.yarn`, `.pnpm-store`, `coverage`) to stay fast. Add or remove skip entries via `~/.config/devcon/skip-scan.json` or `devcon skip-scan` commands.
 
 ## Development
 
