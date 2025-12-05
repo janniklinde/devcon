@@ -40,6 +40,7 @@ interface CliOptions {
   imageOverride?: string;
   shareHome: boolean;
   helpRequested: boolean;
+  allowGit: boolean;
 }
 
 interface AutoBuildConfig {
@@ -251,6 +252,7 @@ function parseArgs(argv: string[]): CliOptions {
   let dryRun = false;
   let imageOverride: string | undefined;
   let shareHome = SHARE_HOME_DEFAULT;
+  let allowGit = false;
   let forward = false;
   let helpRequested = false;
 
@@ -287,6 +289,11 @@ function parseArgs(argv: string[]): CliOptions {
       continue;
     }
 
+    if (arg === '--with-git') {
+      allowGit = true;
+      continue;
+    }
+
     if (arg.startsWith('--image=')) {
       imageOverride = arg.substring('--image='.length);
       continue;
@@ -315,7 +322,7 @@ function parseArgs(argv: string[]): CliOptions {
     toolArgs.push(extra);
   }
 
-  return { toolName, toolArgs, dryRun, imageOverride, shareHome, helpRequested };
+  return { toolName, toolArgs, dryRun, imageOverride, shareHome, helpRequested, allowGit };
 }
 
 function toPosixPath(input: string): string {
@@ -455,8 +462,9 @@ function getCurrentWorkingDirectory(): string {
   }
 }
 
-function discoverSensitivePaths(cwd: string, targetBase: string): SensitivePath[] {
-  const patterns = compileSensitivePatterns(getEffectiveSensitivePatterns());
+function discoverSensitivePaths(cwd: string, targetBase: string, options: { allowGit: boolean }): SensitivePath[] {
+  const patterns = compileSensitivePatterns(getEffectiveSensitivePatterns())
+    .filter((pattern) => (options.allowGit ? pattern.raw !== '.git' : true));
   const matches = findSensitiveMatches(cwd, patterns, getEffectiveSkipDirs());
   return matches.map((match) => ({
     hostPath: path.join(cwd, match.relPath),
@@ -813,12 +821,14 @@ function printHelp(tools: ToolMap): void {
   console.log('  --home        Share your host home directory with the container (disabled by default)');
   console.log('  --no-home     Do not share your host home directory with the container');
   console.log('  --image=IMG   Override the docker image for this run');
+  console.log('  --with-git    Unmask .git and inject a sandboxed git user inside the container');
   console.log('  --help        Show this message');
   console.log('\nCommands:');
   console.log('  update        Refresh Docker images for one or more tools (pull base, rerun npm install)');
   console.log('  rebuild       Fully rebuild Docker images for one or more tools (no cache)');
   console.log('  sensitive     List/add/remove sensitive-path patterns that get masked in containers');
   console.log('  skip-scan     List/add/remove directory names skipped during sensitive-pattern scanning');
+  console.log('  run           Launch an interactive container shell (default image)');
   console.log('\nTools:');
   for (const [name, tool] of Object.entries(tools)) {
     console.log(`  ${name.padEnd(10)} ${tool.description ?? ''}`.trimEnd());
@@ -832,6 +842,7 @@ function buildDockerArgs(options: {
   toolArgs: string[];
   shareHome: boolean;
   image: string;
+  allowGit: boolean;
 }): { command: string; args: string[]; cleanup: () => void } {
   const dockerArgs: string[] = ['run', '--rm', '-it'];
   const cleanupTargets: string[] = [];
@@ -882,7 +893,7 @@ function buildDockerArgs(options: {
 
   const scanStart = Date.now();
   console.log('Scanning workspace for sensitive paths...');
-  const sensitivePaths = discoverSensitivePaths(options.cwd, workspaceTarget);
+  const sensitivePaths = discoverSensitivePaths(options.cwd, workspaceTarget, { allowGit: options.allowGit });
   console.log(`Found ${sensitivePaths.length} sensitive path(s) to mask (in ${Date.now() - scanStart}ms)`);
   for (const sensitive of sensitivePaths) {
     const placeholder = createPlaceholder(sensitive.type, cleanupTargets);
@@ -893,6 +904,17 @@ function buildDockerArgs(options: {
   const env = options.tool.env ?? {};
   for (const [key, value] of Object.entries(env)) {
     dockerArgs.push('-e', `${key}=${value}`);
+  }
+
+  if (options.allowGit) {
+    const gitCfgDir = mkdtempSync(path.join(os.tmpdir(), 'devcon-gitcfg-'));
+    cleanupTargets.push(gitCfgDir);
+    const gitCfgPath = path.join(gitCfgDir, 'config');
+    const gitConfigContents = '[user]\n\tname = devcon-bot\n\temail = devcon@example.com\n';
+    writeFileSync(gitCfgPath, gitConfigContents, 'utf8');
+    dockerArgs.push('--mount', `type=bind,source=${gitCfgPath},target=/tmp/devcon/gitconfig,readonly`);
+    dockerArgs.push('-e', 'GIT_CONFIG_GLOBAL=/tmp/devcon/gitconfig');
+    console.log('Git access enabled: .git unmasked and sandboxed identity configured (devcon-bot).');
   }
 
   dockerArgs.push(options.image);
@@ -966,6 +988,55 @@ async function main(): Promise<void> {
   }
 
   const tool = tools[options.toolName];
+
+  if (options.toolName === 'run') {
+    ensureDockerAvailable();
+    const image = options.imageOverride ?? DEFAULT_IMAGE_TAG;
+    await ensureImageAvailable(image, image === DEFAULT_IMAGE_TAG ? DEFAULT_AUTO_BUILD : undefined);
+
+    const toolDef: ToolDefinition = {
+      image,
+      command: options.toolArgs.length === 0 ? ['/bin/bash'] : [],
+      description: 'Interactive shell',
+    };
+
+    const { command, args, cleanup } = buildDockerArgs({
+      cwd,
+      toolName: options.toolName,
+      tool: toolDef,
+      toolArgs: options.toolArgs,
+      shareHome: options.shareHome,
+      image,
+      allowGit: options.allowGit,
+    });
+
+    if (options.dryRun) {
+      console.log([command, ...args].join(' '));
+      cleanup();
+      return;
+    }
+
+    const child = spawn(command, args, { stdio: 'inherit' });
+    const terminate = (): void => {
+      child.kill('SIGINT');
+    };
+
+    process.on('SIGINT', terminate);
+    process.on('SIGTERM', terminate);
+
+    child.on('exit', (code) => {
+      cleanup();
+      process.exit(code ?? 1);
+    });
+
+    child.on('error', (error) => {
+      cleanup();
+      console.error('Failed to start docker:', error instanceof Error ? error.message : error);
+      process.exit(1);
+    });
+    return;
+  }
+
   if (!tool) {
     console.error(`Unknown tool "${options.toolName}".`);
     printHelp(tools);
@@ -987,6 +1058,7 @@ async function main(): Promise<void> {
     toolArgs: options.toolArgs,
     shareHome: options.shareHome && tool.shareHome !== false,
     image,
+    allowGit: options.allowGit,
   });
 
   if (options.dryRun) {

@@ -22,7 +22,7 @@ You need Docker installed and accessible to your user. Only Linux hosts are supp
 ## Usage
 
 ```bash
-devcon <tool> [-- tool arguments]
+devcon <tool> [flags] [-- tool arguments]
 
 # Rebuild the default tool images (all tools or a specific one)
 devcon update
@@ -35,6 +35,7 @@ devcon sensitive remove secrets/**
 devcon skip-scan list          # show skip-scan directories (defaults + custom)
 devcon skip-scan add .cache    # add a directory name to skip during scans
 devcon skip-scan remove .cache
+devcon run --with-git -- ls    # open an interactive shell (default image) and run a command
 ```
 
 Examples:
@@ -53,12 +54,20 @@ devcon codex --image ghcr.io/my/codex:latest -- --trace
 devcon codex --home
 ```
 
-Useful flags:
+Useful flags (place before `--` that separates devcon flags from tool args):
 
 - `--dry-run` – Print the assembled `docker run` invocation instead of executing it.
 - `--home` / `--no-home` – Force-enable or force-disable home-directory sharing for this run.
 - `--image=NAME` – Override the docker image configured for the tool.
+- `--with-git` – Unmask `.git` and inject a sandboxed git identity (`devcon-bot <devcon@example.com>`) inside the container.
 - `--help` / `--list` – Show usage plus the registered tools.
+
+Pass tool arguments after `--` so they are not parsed by devcon. Examples:
+
+```bash
+devcon codex --with-git -- git status
+devcon codex -- --dry-run "my prompt"
+```
 
 ## Default image (`devcon:latest`)
 
@@ -134,6 +143,7 @@ Environment toggles:
 
 - Every run masks `.env`, `.env.*`, `.git/config`, `.git/index`, `.git/HEAD`, `.git-credentials`, and `.git/credentials` from the container by mounting empty placeholders over those paths after the workspace volume is attached.
 - To keep host repo metadata private by default, the entire `.git` directory is hidden inside the container unless you opt in (e.g., via a custom tool definition).
+- Opt-in git access: pass `--with-git` to unmask `.git` for a run; Devcon injects a sandboxed git identity (`devcon-bot <devcon@example.com>`) inside the container.
 - Containers inherit your host UID/GID so they have no more privileges than you already do.
 - Each invocation runs with `--rm` and without Docker daemon side-effects, ensuring there is no long-lived state.
 - The host home directory is unmounted by default; opt in explicitly and/or keep it read-only (`DEVCON_HOME_READONLY=1`) while allowing write access only to trusted locations via `writablePaths`.
@@ -147,6 +157,7 @@ Environment toggles:
   - `devcon sensitive add "<pattern>"` – add a glob-style pattern (e.g. `secrets/**`).
   - `devcon sensitive remove "<pattern>"` – remove a custom pattern.
 - The pattern scan skips common heavy directories (`node_modules`, `.git`, `dist`, `build`, `.next`, `.turbo`, `.cache`, `tmp`, `temp`, `.venv`, `venv`, `target`, `out`, `.yarn`, `.pnpm-store`, `coverage`) to stay fast. Add or remove skip entries via `~/.config/devcon/skip-scan.json` or `devcon skip-scan` commands.
+- Masking is decided at container startup. New sensitive files created after `devcon` launches won’t be auto-masked; create placeholders (e.g., `touch path/.env`) before starting or restart the session after adding secrets.
 
 ## Development
 
