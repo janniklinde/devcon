@@ -27,6 +27,8 @@ devcon <tool> [-- tool arguments]
 # Rebuild the default tool images (all tools or a specific one)
 devcon update
 devcon update codex
+devcon rebuild         # full no-cache rebuild for all auto-build tools
+devcon rebuild codex   # full no-cache rebuild of a single tool/image
 ```
 
 Examples:
@@ -70,6 +72,13 @@ devcon update codex  # limit the rebuild to a single tool/image
 ```
 
 `devcon update` uses a cache-busting build argument to re-run the npm install layer without throwing away the whole Docker cache, so base layers stay hot while the bundled CLIs get refreshed.
+
+When you need a clean slate (ignore every cached layer), use:
+
+```bash
+devcon rebuild         # fully rebuilds every tool with an auto-build config
+devcon rebuild codex   # fully rebuild just the Codex/Claude base image
+```
 
 ## Tool registry
 

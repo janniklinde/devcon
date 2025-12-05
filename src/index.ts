@@ -329,14 +329,24 @@ function runCommand(
   });
 }
 
-async function runDockerBuild(spec: AutoBuildConfig, options: { refresh?: boolean } = {}): Promise<void> {
+async function runDockerBuild(
+  spec: AutoBuildConfig,
+  options: { refresh?: boolean; noCache?: boolean; pull?: boolean } = {},
+): Promise<void> {
   const dockerfileDir = path.dirname(spec.dockerfile);
   const dockerfileName = path.basename(spec.dockerfile);
   const args = ['build', '-f', dockerfileName, '-t', spec.tag];
 
+  if (options.refresh || options.pull) {
+    args.push('--pull');
+  }
+
+  if (options.noCache) {
+    args.push('--no-cache');
+  }
+
   if (options.refresh) {
     args.push(
-      '--pull',
       '--build-arg',
       `DEVCON_UPDATE_TOKEN=${Date.now()}`,
     );
@@ -397,6 +407,56 @@ async function handleUpdateCommand(
   }
 }
 
+async function handleRebuildCommand(
+  targetToolNames: string[],
+  tools: ToolMap,
+  dryRun: boolean,
+): Promise<void> {
+  const requested = targetToolNames.length > 0 ? targetToolNames : Object.keys(tools);
+  if (requested.length === 0) {
+    console.warn('No tools are available to rebuild.');
+    return;
+  }
+
+  const specs = new Map<string, { spec: AutoBuildConfig; toolNames: string[] }>();
+  for (const name of requested) {
+    const tool = tools[name];
+    if (!tool) {
+      throw new Error(`Unknown tool "${name}" specified for rebuild.`);
+    }
+    if (!tool.autoBuild) {
+      console.warn(`Tool "${name}" does not have an auto-build configuration and will be skipped.`);
+      continue;
+    }
+    const resolvedDockerfile = path.resolve(tool.autoBuild.dockerfile);
+    const specKey = `${resolvedDockerfile}::${tool.autoBuild.tag}`;
+    const entry = specs.get(specKey);
+    if (entry) {
+      entry.toolNames.push(name);
+    } else {
+      specs.set(specKey, {
+        spec: { ...tool.autoBuild, dockerfile: resolvedDockerfile },
+        toolNames: [name],
+      });
+    }
+  }
+
+  if (specs.size === 0) {
+    console.warn('No auto-buildable tools were selected for rebuild.');
+    return;
+  }
+
+  for (const { spec, toolNames } of specs.values()) {
+    const descriptor = `image "${spec.tag}" for tool(s): ${toolNames.join(', ')}`;
+    if (dryRun) {
+      console.log(`[dry-run] Would fully rebuild ${descriptor} (no cache) using ${spec.dockerfile}`);
+      continue;
+    }
+    console.log(`Fully rebuilding ${descriptor} (cache disabled)`);
+    await runDockerBuild(spec, { noCache: true, pull: true });
+  }
+}
+
 async function ensureImageAvailable(image: string, autoBuild?: AutoBuildConfig): Promise<void> {
   const inspect = spawnSync('docker', ['image', 'inspect', image], { stdio: 'ignore' });
   if (inspect.status === 0) {
@@ -427,7 +487,8 @@ async function ensureImageAvailable(image: string, autoBuild?: AutoBuildConfig):
 function printHelp(tools: ToolMap): void {
   console.log('Usage:');
   console.log('  devcon <tool> [-- tool args]');
-  console.log('  devcon update [tool ...]\n');
+  console.log('  devcon update [tool ...]');
+  console.log('  devcon rebuild [tool ...]\n');
   console.log('Flags:');
   console.log('  --dry-run     Print the docker command without executing it');
   console.log('  --home        Share your host home directory with the container (disabled by default)');
@@ -435,7 +496,8 @@ function printHelp(tools: ToolMap): void {
   console.log('  --image=IMG   Override the docker image for this run');
   console.log('  --help        Show this message');
   console.log('\nCommands:');
-  console.log('  update        Rebuild Docker images for one or more tools');
+  console.log('  update        Refresh Docker images for one or more tools (pull base, rerun npm install)');
+  console.log('  rebuild       Fully rebuild Docker images for one or more tools (no cache)');
   console.log('\nTools:');
   for (const [name, tool] of Object.entries(tools)) {
     console.log(`  ${name.padEnd(10)} ${tool.description ?? ''}`.trimEnd());
@@ -550,6 +612,14 @@ async function main(): Promise<void> {
       throw new Error('The --image flag cannot be used with "devcon update". Specify the desired image in the tool configuration instead.');
     }
     await handleUpdateCommand(options.toolArgs, tools, options.dryRun);
+    return;
+  }
+
+  if (options.toolName === 'rebuild') {
+    if (options.imageOverride) {
+      throw new Error('The --image flag cannot be used with "devcon rebuild". Specify the desired image in the tool configuration instead.');
+    }
+    await handleRebuildCommand(options.toolArgs, tools, options.dryRun);
     return;
   }
 
