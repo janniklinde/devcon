@@ -257,7 +257,7 @@ function discoverSensitivePaths(cwd: string, targetBase: string): SensitivePath[
     }
   }
 
-  const gitPaths = ['.git/config', '.git/credentials', '.git-credentials', '.git/HEAD', '.git/index'];
+  const gitPaths = ['.git', '.git/config', '.git/credentials', '.git-credentials', '.git/HEAD', '.git/index'];
   for (const relPath of gitPaths) {
     const hostPath = path.join(cwd, relPath);
     if (existsSync(hostPath)) {

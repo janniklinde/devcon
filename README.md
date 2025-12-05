@@ -127,6 +127,7 @@ Environment toggles:
 ## Security defaults
 
 - Every run masks `.env`, `.env.*`, `.git/config`, `.git/index`, `.git/HEAD`, `.git-credentials`, and `.git/credentials` from the container by mounting empty placeholders over those paths after the workspace volume is attached.
+- To keep host repo metadata private by default, the entire `.git` directory is hidden inside the container unless you opt in (e.g., via a custom tool definition).
 - Containers inherit your host UID/GID so they have no more privileges than you already do.
 - Each invocation runs with `--rm` and without Docker daemon side-effects, ensuring there is no long-lived state.
 - The host home directory is unmounted by default; opt in explicitly and/or keep it read-only (`DEVCON_HOME_READONLY=1`) while allowing write access only to trusted locations via `writablePaths`.
