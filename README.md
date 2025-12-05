@@ -60,6 +60,8 @@ Useful flags (place before `--` that separates devcon flags from tool args):
 - `--home` / `--no-home` – Force-enable or force-disable home-directory sharing for this run.
 - `--image=NAME` – Override the docker image configured for the tool.
 - `--with-git` – Unmask `.git` and inject a sandboxed git identity (`devcon-bot <devcon@example.com>`) inside the container.
+- `--temp-git` – Keep host `.git` masked but mount a temporary git repo/worktree in the container (sandboxed identity pre-configured).
+- `--export-patch[=PATH]` – With `--temp-git`, export patches after the run to PATH (or `.devcon/drafts/<timestamp>.patch`).
 - `--help` / `--list` – Show usage plus the registered tools.
 
 Pass tool arguments after `--` so they are not parsed by devcon. Examples:
@@ -94,6 +96,20 @@ When you need a clean slate (ignore every cached layer), use:
 devcon rebuild         # fully rebuilds every tool with an auto-build config
 devcon rebuild codex   # fully rebuild just the Codex/Claude base image
 ```
+
+Additional handy invocations:
+
+```bash
+devcon run --with-git -- ls    # open an interactive shell (default image) and run a command
+devcon run --temp-git          # open a shell with a temp git repo (host .git stays masked)
+devcon run --temp-git --export-patch   # auto-export patch to .devcon/drafts on exit
+```
+
+Notes on `--temp-git`:
+
+- Host `.git` stays masked; `GIT_DIR`/`GIT_WORK_TREE` are set in the container and a sandboxed identity is pre-configured.
+- On first use, Devcon seeds an initial commit inside the temp repo so you can format-patch changes without specifying a range.
+- Combine with `--export-patch[=PATH]` to write patches automatically after the run; baseline commit is omitted from the patch. Uncommitted changes are snapshotted into a temp commit before export.
 
 ## Tool registry
 

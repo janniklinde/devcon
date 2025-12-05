@@ -41,6 +41,8 @@ interface CliOptions {
   shareHome: boolean;
   helpRequested: boolean;
   allowGit: boolean;
+  tempGit: boolean;
+  exportPatchPath?: string;
 }
 
 interface AutoBuildConfig {
@@ -253,6 +255,8 @@ function parseArgs(argv: string[]): CliOptions {
   let imageOverride: string | undefined;
   let shareHome = SHARE_HOME_DEFAULT;
   let allowGit = false;
+  let tempGit = false;
+  let exportPatchPath: string | undefined;
   let forward = false;
   let helpRequested = false;
 
@@ -294,6 +298,21 @@ function parseArgs(argv: string[]): CliOptions {
       continue;
     }
 
+    if (arg === '--temp-git') {
+      tempGit = true;
+      continue;
+    }
+
+    if (arg === '--export-patch') {
+      exportPatchPath = '';
+      continue;
+    }
+
+    if (arg.startsWith('--export-patch=')) {
+      exportPatchPath = arg.substring('--export-patch='.length);
+      continue;
+    }
+
     if (arg.startsWith('--image=')) {
       imageOverride = arg.substring('--image='.length);
       continue;
@@ -322,7 +341,17 @@ function parseArgs(argv: string[]): CliOptions {
     toolArgs.push(extra);
   }
 
-  return { toolName, toolArgs, dryRun, imageOverride, shareHome, helpRequested, allowGit };
+  return {
+    toolName,
+    toolArgs,
+    dryRun,
+    imageOverride,
+    shareHome,
+    helpRequested,
+    allowGit,
+    tempGit,
+    exportPatchPath,
+  };
 }
 
 function toPosixPath(input: string): string {
@@ -331,6 +360,13 @@ function toPosixPath(input: string): string {
 
 function isGlobPattern(pattern: string): boolean {
   return pattern.includes('*') || pattern.includes('?');
+}
+
+function shellQuote(arg: string): string {
+  if (/^[A-Za-z0-9_\-./:@]+$/.test(arg)) {
+    return arg;
+  }
+  return `'${arg.replace(/'/g, `'"'"'`)}'`;
 }
 
 function escapeRegexExceptGlobs(input: string): string {
@@ -598,6 +634,19 @@ function handleSkipScanCommand(args: string[]): void {
   throw new Error(`Unknown "skip-scan" subcommand "${subcommand}". Use list, add, or remove.`);
 }
 
+function prepareTempGitRepo(workspaceTarget: string): { hostDir: string; containerDir: string } {
+  ensureHostGitAvailable();
+  const hostDir = mkdtempSync(path.join(os.tmpdir(), 'devcon-temp-git-'));
+  const init = spawnSync('git', ['init', '--bare', hostDir], { stdio: 'ignore' });
+  if (init.status !== 0) {
+    throw new Error('Failed to initialize temporary git repository.');
+  }
+  spawnSync('git', ['--git-dir', hostDir, 'config', 'user.name', 'devcon-bot'], { stdio: 'ignore' });
+  spawnSync('git', ['--git-dir', hostDir, 'config', 'user.email', 'devcon@example.com'], { stdio: 'ignore' });
+  spawnSync('git', ['--git-dir', hostDir, 'config', 'init.defaultBranch', 'main'], { stdio: 'ignore' });
+  return { hostDir, containerDir: '/tmp/devcon/gitdir' };
+}
+
 function createPlaceholder(type: 'file' | 'dir', cleanup: string[]): string {
   const base = mkdtempSync(path.join(os.tmpdir(), 'devcon-hide-'));
   cleanup.push(base);
@@ -616,6 +665,81 @@ function ensureDockerAvailable(): void {
   if (result.error || result.status !== 0) {
     throw new Error('Docker is required but was not found. Please install Docker and ensure it is in your PATH.');
   }
+}
+
+function ensureHostGitAvailable(): void {
+  const result = spawnSync('git', ['version'], { stdio: 'ignore' });
+  if (result.error || result.status !== 0) {
+    throw new Error('Git is required for --temp-git but was not found on the host. Please install Git.');
+  }
+}
+
+function exportTempGitPatch(gitDir: string, workTree: string, desiredPath?: string): void {
+  ensureHostGitAvailable();
+  const patchDir = desiredPath && !desiredPath.endsWith('.patch')
+    ? desiredPath
+    : desiredPath
+      ? path.dirname(desiredPath)
+      : workTree;
+  if (!existsSync(patchDir)) {
+    mkdirSync(patchDir, { recursive: true });
+  }
+  const patchPath = desiredPath && desiredPath.endsWith('.patch')
+    ? desiredPath
+    : path.join(patchDir, `${Date.now()}.patch`);
+
+  const gitArgs = ['--git-dir', gitDir, '--work-tree', workTree];
+
+  // Ensure a HEAD exists; if not, try to create the baseline commit.
+  const headCheck = spawnSync('git', [...gitArgs, 'rev-parse', 'HEAD'], { stdio: 'ignore' });
+  if (headCheck.status !== 0) {
+    const addBaseline = spawnSync('git', [...gitArgs, 'add', '-A'], { stdio: 'ignore' });
+    if (addBaseline.status !== 0) {
+      console.warn('Failed to stage baseline for temp git repo; skipping patch export.');
+      return;
+    }
+    const commitBaseline = spawnSync('git', [...gitArgs, 'commit', '-m', 'devcon baseline'], { stdio: 'ignore' });
+    if (commitBaseline.status !== 0) {
+      console.warn('Failed to create baseline commit for temp git repo; skipping patch export.');
+      return;
+    }
+  }
+
+  // Snapshot any remaining worktree changes into a temp commit for export.
+  const status = spawnSync('git', [...gitArgs, 'status', '--porcelain'], { encoding: 'utf8' });
+  if (status.status === 0 && status.stdout.trim().length > 0) {
+    spawnSync('git', [...gitArgs, 'add', '-A'], { stdio: 'ignore' });
+    const snap = spawnSync('git', [...gitArgs, 'commit', '-m', 'devcon export snapshot'], { stdio: 'ignore' });
+    if (snap.status !== 0) {
+      console.warn('Failed to snapshot working tree before export; skipping patch export.');
+      return;
+    }
+  }
+
+  const revList = spawnSync('git', ['--git-dir', gitDir, '--work-tree', workTree, 'rev-list', '--max-parents=0', 'HEAD'], { encoding: 'utf8' });
+  if (revList.status !== 0 || !revList.stdout.trim()) {
+    console.warn('No commits found in temp git repo; skipping patch export.');
+    return;
+  }
+  const rootCommit = revList.stdout.trim().split('\n')[0];
+  const head = spawnSync('git', ['--git-dir', gitDir, '--work-tree', workTree, 'rev-parse', 'HEAD'], { encoding: 'utf8' });
+  if (head.status !== 0 || !head.stdout.trim()) {
+    console.warn('Unable to resolve HEAD for temp git repo; skipping patch export.');
+    return;
+  }
+  const headCommit = head.stdout.trim();
+  if (headCommit === rootCommit) {
+    console.log('Only baseline commit exists; no changes to export.');
+    return;
+  }
+
+  const format = spawnSync('git', ['--git-dir', gitDir, '--work-tree', workTree, 'format-patch', `${rootCommit}..HEAD`, '--stdout'], { encoding: 'utf8' });
+  if (format.status !== 0) {
+    console.warn('Failed to generate patch from temp git repo.');
+    return;
+  }
+  writeFileSync(patchPath, format.stdout, 'utf8');
+  console.log(`Exported temp-git patch to ${patchPath}`);
 }
 
 function promptYesNo(question: string): Promise<boolean> {
@@ -822,6 +946,8 @@ function printHelp(tools: ToolMap): void {
   console.log('  --no-home     Do not share your host home directory with the container');
   console.log('  --image=IMG   Override the docker image for this run');
   console.log('  --with-git    Unmask .git and inject a sandboxed git user inside the container');
+  console.log('  --temp-git    Mask host .git but provide a temporary git repo/worktree inside the container');
+  console.log('  --export-patch[=PATH] Export changes from temp-git repo after run (defaults to .devcon/drafts/<ts>.patch)');
   console.log('  --help        Show this message');
   console.log('\nCommands:');
   console.log('  update        Refresh Docker images for one or more tools (pull base, rerun npm install)');
@@ -843,7 +969,8 @@ function buildDockerArgs(options: {
   shareHome: boolean;
   image: string;
   allowGit: boolean;
-}): { command: string; args: string[]; cleanup: () => void } {
+  tempGit: boolean;
+}): { command: string; args: string[]; cleanup: () => void; tempGitDir?: string } {
   const dockerArgs: string[] = ['run', '--rm', '-it'];
   const cleanupTargets: string[] = [];
   const writablePaths = options.tool.writablePaths ?? [];
@@ -906,6 +1033,33 @@ function buildDockerArgs(options: {
     dockerArgs.push('-e', `${key}=${value}`);
   }
 
+  let initScriptPath: string | undefined;
+
+  let tempGitDir: string | undefined;
+
+  if (options.tempGit) {
+    const temp = prepareTempGitRepo(workspaceTarget);
+    tempGitDir = temp.hostDir;
+    cleanupTargets.push(temp.hostDir);
+    dockerArgs.push('--mount', `type=bind,source=${temp.hostDir},target=${temp.containerDir}`);
+    dockerArgs.push('-e', `GIT_DIR=${temp.containerDir}`);
+    dockerArgs.push('-e', `GIT_WORK_TREE=${workspaceTarget}`);
+    console.log('Temporary git repo enabled: host .git remains masked.');
+
+    const initDir = mkdtempSync(path.join(os.tmpdir(), 'devcon-temp-git-init-'));
+    cleanupTargets.push(initDir);
+    initScriptPath = path.join(initDir, 'init.sh');
+    const initScript = `#!/bin/bash
+set -e
+if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
+  git add -A >/dev/null 2>&1 || true
+  git commit -m "devcon baseline" >/dev/null 2>&1 || true
+fi
+`;
+    writeFileSync(initScriptPath, initScript, { encoding: 'utf8', mode: 0o755 });
+    dockerArgs.push('--mount', `type=bind,source=${initScriptPath},target=/tmp/devcon/init.sh,readonly`);
+  }
+
   if (options.allowGit) {
     const gitCfgDir = mkdtempSync(path.join(os.tmpdir(), 'devcon-gitcfg-'));
     cleanupTargets.push(gitCfgDir);
@@ -921,7 +1075,15 @@ function buildDockerArgs(options: {
 
   const toolCommand = options.tool.command ?? [];
   const commandArgs = [...toolCommand, ...options.toolArgs];
-  dockerArgs.push(...commandArgs);
+
+  if (initScriptPath) {
+    const commandString = commandArgs.length > 0
+      ? commandArgs.map(shellQuote).join(' ')
+      : '/bin/bash';
+    dockerArgs.push('/bin/bash', '-lc', `source /tmp/devcon/init.sh && exec ${commandString}`);
+  } else {
+    dockerArgs.push(...commandArgs);
+  }
 
   const cleanup = (): void => {
     for (const target of cleanupTargets) {
@@ -933,7 +1095,7 @@ function buildDockerArgs(options: {
     }
   };
 
-  return { command: 'docker', args: dockerArgs, cleanup };
+  return { command: 'docker', args: dockerArgs, cleanup, tempGitDir };
 }
 
 async function main(): Promise<void> {
@@ -944,6 +1106,14 @@ async function main(): Promise<void> {
   if (options.helpRequested) {
     printHelp(tools);
     return;
+  }
+
+  if (options.allowGit && options.tempGit) {
+    throw new Error('Use either --with-git or --temp-git, not both.');
+  }
+
+  if (options.exportPatchPath !== undefined && !options.tempGit) {
+    throw new Error('--export-patch requires --temp-git so the host repository stays masked.');
   }
 
   if (!options.toolName) {
@@ -1008,6 +1178,7 @@ async function main(): Promise<void> {
       shareHome: options.shareHome,
       image,
       allowGit: options.allowGit,
+      tempGit: options.tempGit,
     });
 
     if (options.dryRun) {
@@ -1051,7 +1222,7 @@ async function main(): Promise<void> {
   const image = options.imageOverride ?? tool.image;
   await ensureImageAvailable(image, options.imageOverride ? undefined : tool.autoBuild);
 
-  const { command, args, cleanup } = buildDockerArgs({
+  const { command, args, cleanup, tempGitDir } = buildDockerArgs({
     cwd,
     toolName: options.toolName,
     tool,
@@ -1059,6 +1230,7 @@ async function main(): Promise<void> {
     shareHome: options.shareHome && tool.shareHome !== false,
     image,
     allowGit: options.allowGit,
+    tempGit: options.tempGit,
   });
 
   if (options.dryRun) {
@@ -1076,6 +1248,13 @@ async function main(): Promise<void> {
   process.on('SIGTERM', terminate);
 
   child.on('exit', (code) => {
+    if (options.tempGit && tempGitDir && options.exportPatchPath !== undefined) {
+      try {
+        exportTempGitPatch(tempGitDir, cwd, options.exportPatchPath || undefined);
+      } catch (error) {
+        console.warn('Failed to export patch from temp git repo:', error instanceof Error ? error.message : error);
+      }
+    }
     cleanup();
     process.exit(code ?? 1);
   });
