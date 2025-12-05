@@ -329,13 +329,22 @@ function runCommand(
   });
 }
 
-async function runDockerBuild(spec: AutoBuildConfig): Promise<void> {
+async function runDockerBuild(spec: AutoBuildConfig, options: { refresh?: boolean } = {}): Promise<void> {
   const dockerfileDir = path.dirname(spec.dockerfile);
   const dockerfileName = path.basename(spec.dockerfile);
+  const args = ['build', '-f', dockerfileName, '-t', spec.tag];
+
+  if (options.refresh) {
+    args.push(
+      '--pull',
+      '--build-arg',
+      `DEVCON_UPDATE_TOKEN=${Date.now()}`,
+    );
+  }
+
+  args.push('.');
   console.log(`Building Docker image "${spec.tag}" using ${spec.dockerfile} ...`);
-  await runCommand('docker', ['build', '-f', dockerfileName, '-t', spec.tag, '.'], {
-    cwd: dockerfileDir,
-  });
+  await runCommand('docker', args, { cwd: dockerfileDir });
 }
 
 async function handleUpdateCommand(
@@ -384,7 +393,7 @@ async function handleUpdateCommand(
       continue;
     }
     console.log(`Rebuilding ${descriptor}`);
-    await runDockerBuild(spec);
+    await runDockerBuild(spec, { refresh: true });
   }
 }
 

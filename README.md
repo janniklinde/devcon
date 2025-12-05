@@ -69,6 +69,8 @@ devcon update        # rebuilds every tool with an auto-build config
 devcon update codex  # limit the rebuild to a single tool/image
 ```
 
+`devcon update` uses a cache-busting build argument to re-run the npm install layer without throwing away the whole Docker cache, so base layers stay hot while the bundled CLIs get refreshed.
+
 ## Tool registry
 
 Devcon merges the built-in tools with an optional JSON file. Create `~/.config/devcon/tools.json` (or point `DEVCON_TOOLS_FILE` somewhere else) to declare images, commands, and optional environment variables per tool:
