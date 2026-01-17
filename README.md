@@ -13,11 +13,15 @@
 
 ## Installation
 
-```bash
-npm install -g devcon
-```
+You need Docker installed and running. Only Linux hosts are supported for now because the CLI relies on Unix-specific APIs such as `getuid`/`getgid`.
 
-You need Docker installed and accessible to your user. Only Linux hosts are supported for now because the CLI relies on Unix-specific APIs such as `getuid`/`getgid`.
+If you're working from a clone (like this repo), build and install the CLI locally:
+
+```bash
+npm install
+npm run build
+npm install -g .
+```
 
 ## Usage
 
