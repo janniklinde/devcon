@@ -1127,6 +1127,14 @@ interface DockerAttachStream {
   onClose: (handler: () => void) => void;
 }
 
+interface PromptExecCapabilities {
+  config: boolean;
+  sandbox: boolean;
+  approval: boolean;
+  reasoningEffort: boolean;
+  model: boolean;
+}
+
 async function openDockerAttachStream(containerId: string): Promise<DockerAttachStream> {
   const socketPath = resolveDockerSocketPath();
   const pathWithQuery = `/v1.41/containers/${containerId}/attach?stream=1&stdin=1&stdout=1&stderr=1&logs=1`;
@@ -1171,6 +1179,36 @@ async function openDockerAttachStream(containerId: string): Promise<DockerAttach
   });
 }
 
+function detectPromptExecCapabilities(
+  containerId: string,
+  promptExecCommand: string[],
+): PromptExecCapabilities {
+  const defaults: PromptExecCapabilities = {
+    config: true,
+    sandbox: true,
+    approval: false,
+    reasoningEffort: false,
+    model: false,
+  };
+  if (promptExecCommand.length === 0) {
+    return defaults;
+  }
+
+  const probe = spawnSync(
+    'docker',
+    ['exec', '-i', containerId, ...promptExecCommand, '--help'],
+    { encoding: 'utf8' },
+  );
+  const output = `${probe.stdout || ''}\n${probe.stderr || ''}`;
+  return {
+    config: output.includes('--config'),
+    sandbox: output.includes('--sandbox'),
+    approval: output.includes('--approval'),
+    reasoningEffort: output.includes('--reasoning-effort'),
+    model: output.includes('--model'),
+  };
+}
+
 async function runApiModeSession(options: {
   toolName: string;
   command: string;
@@ -1208,6 +1246,9 @@ async function runApiModeSession(options: {
   resizeContainerTty(containerId, API_TTY_COLUMNS, API_TTY_ROWS);
 
   const promptExecMode = Array.isArray(options.promptExecCommand) && options.promptExecCommand.length > 0;
+  const promptExecCapabilities = promptExecMode
+    ? detectPromptExecCapabilities(containerId, options.promptExecCommand as string[])
+    : undefined;
   let attachStream: DockerAttachStream | undefined;
   if (!promptExecMode) {
     try {
@@ -1331,6 +1372,7 @@ async function runApiModeSession(options: {
     pid: waitChild.pid ?? null,
     containerId,
     command: commandDescription,
+    promptExecCapabilities: promptExecCapabilities ?? null,
   });
   if (!promptExecMode) {
     publish('busy', {
@@ -1466,6 +1508,10 @@ async function runApiModeSession(options: {
         const body = await readJsonBody(req);
         const text = typeof body.text === 'string' ? body.text : '';
         const appendNewline = body.appendNewline === true;
+        const sandbox = typeof body.sandbox === 'string' ? body.sandbox.trim() : '';
+        const approval = typeof body.approval === 'string' ? body.approval.trim() : '';
+        const reasoningEffort = typeof body.reasoningEffort === 'string' ? body.reasoningEffort.trim() : '';
+        const model = typeof body.model === 'string' ? body.model.trim() : '';
         if (!text) {
           sendJson(res, 400, { error: 'Body must include a non-empty string field: text' });
           return;
@@ -1492,7 +1538,51 @@ async function runApiModeSession(options: {
             confidence: 0.1,
             status: { ...status },
           });
-          const execArgs = ['exec', '-i', containerId, ...options.promptExecCommand as string[], text];
+          const effectiveSandbox = sandbox || 'danger-full-access';
+          const ignoredOptions: string[] = [];
+          const execPromptArgs = [...options.promptExecCommand as string[]];
+          const configOverrides: string[] = [];
+          if (promptExecCapabilities?.sandbox) {
+            execPromptArgs.push('--sandbox', effectiveSandbox);
+          } else {
+            ignoredOptions.push('sandbox');
+          }
+          if (approval) {
+            if (promptExecCapabilities?.approval) {
+              execPromptArgs.push('--approval', approval);
+            } else if (promptExecCapabilities?.config) {
+              configOverrides.push(`approval_policy="${approval}"`);
+            } else {
+              ignoredOptions.push('approval');
+            }
+          }
+          if (reasoningEffort) {
+            if (promptExecCapabilities?.reasoningEffort) {
+              execPromptArgs.push('--reasoning-effort', reasoningEffort);
+            } else if (promptExecCapabilities?.config) {
+              configOverrides.push(`model_reasoning_effort="${reasoningEffort}"`);
+            } else {
+              ignoredOptions.push('reasoningEffort');
+            }
+          }
+          if (model) {
+            if (promptExecCapabilities?.model) {
+              execPromptArgs.push('--model', model);
+            } else {
+              ignoredOptions.push('model');
+            }
+          }
+          for (const override of configOverrides) {
+            execPromptArgs.push('--config', override);
+          }
+          if (ignoredOptions.length > 0) {
+            publish('warning', {
+              message: `Ignored unsupported codex exec options: ${ignoredOptions.join(', ')}`,
+              ignoredOptions,
+              capabilities: promptExecCapabilities,
+            });
+          }
+          const execArgs = ['exec', '-i', containerId, ...execPromptArgs, text];
           const execChild = spawn('docker', execArgs, {
             stdio: ['ignore', 'pipe', 'pipe'],
           });
@@ -1539,11 +1629,25 @@ async function runApiModeSession(options: {
           publish('input', {
             bytes: Buffer.byteLength(payload),
             mode: 'prompt-exec',
+            sandbox: effectiveSandbox,
+            approval: approval || null,
+            reasoningEffort: reasoningEffort || null,
+            model: model || null,
+            configOverrides,
+            ignoredOptions,
+            capabilities: promptExecCapabilities,
           }, false);
           sendJson(res, 202, {
             accepted: true,
             bytes: Buffer.byteLength(payload),
             mode: 'prompt-exec',
+            sandbox: effectiveSandbox,
+            approval: approval || null,
+            reasoningEffort: reasoningEffort || null,
+            model: model || null,
+            configOverrides,
+            ignoredOptions,
+            capabilities: promptExecCapabilities,
           });
           return;
         }
@@ -2177,7 +2281,7 @@ async function main(): Promise<void> {
       ...tool,
       command: ['/bin/sh', '-lc', 'while true; do sleep 3600; done'],
     };
-    apiPromptExecCommand = ['codex', 'exec', '--sandbox', 'danger-full-access'];
+    apiPromptExecCommand = ['codex', 'exec'];
   }
 
   const image = options.imageOverride ?? tool.image;

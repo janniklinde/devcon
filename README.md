@@ -88,6 +88,10 @@ When `-api` (or `--api`) is enabled, Devcon launches the selected tool with stdi
 - `GET /events` – Server-Sent Events stream (`starting`, `output`, `busy`, `ready`, `exit`, `error`, `signal`).
 - `POST /input` – send input to the running tool:
   - body: `{ "text": "your command", "appendNewline": true }`
+  - Codex API mode extras (optional): `sandbox`, `approval`, `reasoningEffort`, `model`
+  - example:
+    - `{ "text": "Create test.txt", "appendNewline": true, "sandbox": "danger-full-access", "approval": "never", "reasoningEffort": "high", "model": "gpt-5.3-codex" }`
+  - note: extra Codex flags are applied only if supported by the installed `codex exec`; when flag support is missing, devcon falls back to `--config` overrides where possible (e.g. `model_reasoning_effort`, `approval_policy`). Remaining unsupported options are ignored and reported in API response/events.
 - `POST /signal` – send a process signal (default `SIGINT`):
   - body: `{ "signal": "SIGINT" }`
 - `POST /shutdown` – stop API server and terminate the session if still running.

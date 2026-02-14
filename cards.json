@@ -1,0 +1,287 @@
+{
+  "deck_name": "Bandwidth Brawl: 30 Cards of Internet Chaos",
+  "version": "1.0",
+  "description": "Complete rules for play: This is a 2-player dueling card game deck. Each player uses an identical copy of this 30-card deck. Each player starts at 25 Avatar HP. Shuffle your deck and draw 5 cards. You may mulligan once by shuffling any number of cards from your hand into your deck, then drawing that many.\n\nTurn structure: (1) Start of turn: gain +1 max Ping (resource), up to 10, then refill Ping to max. (2) Draw 1 card. (3) Main phase: play any number of cards by paying Ping costs. Unit cards enter the board. Action cards resolve immediately, then go to discard. (4) Combat: each ready friendly Unit may attack once, targeting either an enemy Unit or the enemy Avatar. (5) End turn.\n\nBoard and combat rules: Maximum 5 Units per side. Units have Attack and Health. Damage stays on Units until healed. If a Unit's Health is 0 or less, it is destroyed. Units cannot attack on the turn they are played unless they have Rush.\n\nKeywords: Firewall = enemy Units must attack a friendly Firewall Unit before they can attack other friendly Units or the Avatar. Rush = can attack enemy Units on the turn it is played. Sneaky = cannot be targeted by enemy Action cards until it deals combat damage for the first time. Stun = a stunned Unit cannot attack on its controller's next turn.\n\nDeck identity and balance notes: This singleton deck has 30 unique cards with a balanced curve (6 one-cost, 7 two-cost, 7 three-cost, 5 four-cost, 3 five-cost, 2 six-cost). It includes tempo, draw, healing, single-target removal, and board control so games have multiple viable lines and no single auto-win combo.",
+  "cards": [
+    {
+      "id": "C01",
+      "name": "404 Scout",
+      "type": "Unit",
+      "cost": 1,
+      "attack": 1,
+      "health": 2,
+      "text": "On Play: Look at the top card of your deck. You may put it on the bottom.",
+      "flavor": "Never found, always somehow first to report in."
+    },
+    {
+      "id": "C02",
+      "name": "Cookie Click Intern",
+      "type": "Unit",
+      "cost": 1,
+      "attack": 1,
+      "health": 1,
+      "text": "On Play: Gain 1 Ping this turn only.",
+      "flavor": "Legally not a tracker, spiritually very much a tracker."
+    },
+    {
+      "id": "C03",
+      "name": "Captcha Goblin",
+      "type": "Unit",
+      "cost": 1,
+      "attack": 2,
+      "health": 1,
+      "text": "On Play: Enemy Avatar takes 1 damage unless that player discards a card.",
+      "flavor": "Select all images with bicycles. There are no bicycles."
+    },
+    {
+      "id": "C04",
+      "name": "Cache Squirrel",
+      "type": "Unit",
+      "cost": 1,
+      "attack": 0,
+      "health": 3,
+      "text": "Firewall.",
+      "flavor": "It hoards acorns and last year's JavaScript."
+    },
+    {
+      "id": "C05",
+      "name": "Typo Ninja",
+      "type": "Unit",
+      "cost": 1,
+      "attack": 1,
+      "health": 1,
+      "text": "Sneaky. Whenever this deals combat damage, draw a card, then discard a card.",
+      "flavor": "Now introducing the all-new pubic beta."
+    },
+    {
+      "id": "C06",
+      "name": "Status Page Optimist",
+      "type": "Action",
+      "cost": 1,
+      "text": "Restore 2 Health to any target. Draw a card if that target is at full Health afterward.",
+      "flavor": "All systems operational (except the system that checks systems)."
+    },
+    {
+      "id": "C07",
+      "name": "Ad Block Barbarian",
+      "type": "Unit",
+      "cost": 2,
+      "attack": 2,
+      "health": 2,
+      "text": "On Play: Remove all temporary Attack buffs from a Unit.",
+      "flavor": "If it moves, he installs an extension on it."
+    },
+    {
+      "id": "C08",
+      "name": "Midnight Moderator",
+      "type": "Unit",
+      "cost": 2,
+      "attack": 1,
+      "health": 4,
+      "text": "Firewall. On Play: Stun an enemy Unit with cost 2 or less.",
+      "flavor": "Bonk. Next case."
+    },
+    {
+      "id": "C09",
+      "name": "Emoji Necromancer",
+      "type": "Unit",
+      "cost": 2,
+      "attack": 2,
+      "health": 2,
+      "text": "Whenever this survives damage, draw a card.",
+      "flavor": "He speaks only in skulls and sparkles."
+    },
+    {
+      "id": "C10",
+      "name": "Lag Wizard",
+      "type": "Unit",
+      "cost": 2,
+      "attack": 3,
+      "health": 1,
+      "text": "Rush.",
+      "flavor": "You are already defeated. Your connection just has not shown it yet."
+    },
+    {
+      "id": "C11",
+      "name": "Terms and Conditions",
+      "type": "Action",
+      "cost": 2,
+      "text": "Stun a Unit. Draw a card.",
+      "flavor": "By continuing, you agree to continue forever."
+    },
+    {
+      "id": "C12",
+      "name": "Screenshot Evidence",
+      "type": "Action",
+      "cost": 2,
+      "text": "Deal 2 damage to any target.",
+      "flavor": "Enhance. Enhance. Enhance. Yup, that is definitely embarrassing."
+    },
+    {
+      "id": "C13",
+      "name": "Reboot Ritual",
+      "type": "Action",
+      "cost": 2,
+      "text": "Draw 2 cards, then your Avatar takes 1 damage.",
+      "flavor": "Have you tried turning your strategy off and on again?"
+    },
+    {
+      "id": "C14",
+      "name": "Patch Tuesday Paladin",
+      "type": "Unit",
+      "cost": 3,
+      "attack": 3,
+      "health": 3,
+      "text": "On Play: Restore 3 Health to your Avatar or a friendly Unit.",
+      "flavor": "Ships fixes at dawn, new bugs by lunch."
+    },
+    {
+      "id": "C15",
+      "name": "Doomscroll Diver",
+      "type": "Unit",
+      "cost": 3,
+      "attack": 4,
+      "health": 2,
+      "text": "At end of your turn, if this did not attack, it takes 1 damage.",
+      "flavor": "Just one more post."
+    },
+    {
+      "id": "C16",
+      "name": "VPN Vagabond",
+      "type": "Unit",
+      "cost": 3,
+      "attack": 2,
+      "health": 4,
+      "text": "Sneaky.",
+      "flavor": "Today he logs in from three countries and one toaster."
+    },
+    {
+      "id": "C17",
+      "name": "Keyboard Warrior",
+      "type": "Unit",
+      "cost": 3,
+      "attack": 3,
+      "health": 2,
+      "text": "Rush. Whenever this destroys a Unit, gain +1/+1.",
+      "flavor": "Caps Lock is not a key, it is a lifestyle."
+    },
+    {
+      "id": "C18",
+      "name": "Cloud Hoarder",
+      "type": "Action",
+      "cost": 3,
+      "text": "Draw 2 cards. You cannot play more than 1 additional card this turn.",
+      "flavor": "Unlimited storage, limited self-control."
+    },
+    {
+      "id": "C19",
+      "name": "Hotfix Hero",
+      "type": "Action",
+      "cost": 3,
+      "text": "Deal 3 damage to a Unit. If it is destroyed, draw a card.",
+      "flavor": "Fast, brave, and tested in production."
+    },
+    {
+      "id": "C20",
+      "name": "Group Chat Stampede",
+      "type": "Action",
+      "cost": 3,
+      "text": "Your Units gain +1 Attack this turn. Draw a card if you control 3 or more Units.",
+      "flavor": "Muting was never an option."
+    },
+    {
+      "id": "C21",
+      "name": "Influencer Bard",
+      "type": "Unit",
+      "cost": 4,
+      "attack": 4,
+      "health": 4,
+      "text": "On Play: Each player draws a card.",
+      "flavor": "Do not forget to like, subscribe, and fear my sponsored combo."
+    },
+    {
+      "id": "C22",
+      "name": "Firewall Dragon",
+      "type": "Unit",
+      "cost": 4,
+      "attack": 3,
+      "health": 6,
+      "text": "Firewall.",
+      "flavor": "Breathes encrypted flames and legal disclaimers."
+    },
+    {
+      "id": "C23",
+      "name": "Bug Report Genie",
+      "type": "Unit",
+      "cost": 4,
+      "attack": 2,
+      "health": 5,
+      "text": "On Play: Return another friendly Unit to your hand. Draw a card.",
+      "flavor": "Wish granted: issue reproduced instantly."
+    },
+    {
+      "id": "C24",
+      "name": "Ctrl+Alt+Defeat",
+      "type": "Action",
+      "cost": 4,
+      "text": "Destroy a damaged Unit.",
+      "flavor": "Task failed successfully."
+    },
+    {
+      "id": "C25",
+      "name": "Comment Section Cleanup",
+      "type": "Action",
+      "cost": 4,
+      "text": "Deal 2 damage to all Units.",
+      "flavor": "Some threads cannot be saved, only archived."
+    },
+    {
+      "id": "C26",
+      "name": "Algorithm Overlord",
+      "type": "Unit",
+      "cost": 5,
+      "attack": 5,
+      "health": 5,
+      "text": "At end of your turn, if you played 2 or more cards this turn, draw a card.",
+      "flavor": "It knows what you want before you do, and it is wrong."
+    },
+    {
+      "id": "C27",
+      "name": "Meme Mech Titan",
+      "type": "Unit",
+      "cost": 5,
+      "attack": 6,
+      "health": 4,
+      "text": "Rush.",
+      "flavor": "Powered by reposts and unresolved irony."
+    },
+    {
+      "id": "C28",
+      "name": "Customer Support Phoenix",
+      "type": "Unit",
+      "cost": 5,
+      "attack": 4,
+      "health": 5,
+      "text": "When this is destroyed, restore 5 Health to your Avatar.",
+      "flavor": "Your ticket is very important to us and also immortal."
+    },
+    {
+      "id": "C29",
+      "name": "Patch Notes Final Boss",
+      "type": "Unit",
+      "cost": 6,
+      "attack": 6,
+      "health": 6,
+      "text": "On Play: Deal 2 damage to all enemy Units.",
+      "flavor": "Nerfed, buffed, reworked, still terrifying."
+    },
+    {
+      "id": "C30",
+      "name": "Internet Outage",
+      "type": "Action",
+      "cost": 6,
+      "text": "Deal 4 damage to all Units. Then each Avatar restores 4 Health.",
+      "flavor": "Everyone logs off and suddenly remembers birds exist."
+    }
+  ]
+}
