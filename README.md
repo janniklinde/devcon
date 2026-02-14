@@ -26,7 +26,7 @@ npm install -g .
 ## Usage
 
 ```bash
-devcon <tool> [flags] [-- tool arguments]
+devcon [-api] <tool> [flags] [-- tool arguments]
 
 # Rebuild the default tool images (all tools or a specific one)
 devcon update
@@ -40,6 +40,7 @@ devcon skip-scan list          # show skip-scan directories (defaults + custom)
 devcon skip-scan add .cache    # add a directory name to skip during scans
 devcon skip-scan remove .cache
 devcon run --with-git -- ls    # open an interactive shell (default image) and run a command
+devcon -api codex              # start Codex with HTTP API control + SSE events
 ```
 
 Examples:
@@ -66,6 +67,9 @@ Useful flags (place before `--` that separates devcon flags from tool args):
 - `--with-git` – Unmask `.git` and inject a sandboxed git identity (`devcon-bot <devcon@example.com>`) inside the container.
 - `--temp-git` – Keep host `.git` masked but mount a temporary git repo/worktree in the container (sandboxed identity pre-configured).
 - `--export-patch[=PATH]` – With `--temp-git`, export patches after the run to PATH (or `.devcon/drafts/<timestamp>.patch`).
+- `-api` / `--api` – Start the tool in API-controlled mode (HTTP + SSE).
+- `--api-host=HOST` – Bind host/interface for API mode (default `127.0.0.1` or `DEVCON_API_HOST`).
+- `--api-port=PORT` – Bind port for API mode (default `3784` or `DEVCON_API_PORT`).
 - `--help` / `--list` – Show usage plus the registered tools.
 
 Pass tool arguments after `--` so they are not parsed by devcon. Examples:
@@ -73,7 +77,25 @@ Pass tool arguments after `--` so they are not parsed by devcon. Examples:
 ```bash
 devcon codex --with-git -- git status
 devcon codex -- --dry-run "my prompt"
+devcon -api --api-port=4800 codex
 ```
+
+## API mode (`-api`)
+
+When `-api` (or `--api`) is enabled, Devcon launches the selected tool with stdin/stdout piped through an HTTP control plane.
+
+- `GET /status` – returns current session state (`starting`, `busy`, `ready`, `exited`, `error`).
+- `GET /events` – Server-Sent Events stream (`starting`, `output`, `busy`, `ready`, `exit`, `error`, `signal`).
+- `POST /input` – send input to the running tool:
+  - body: `{ "text": "your command", "appendNewline": true }`
+- `POST /signal` – send a process signal (default `SIGINT`):
+  - body: `{ "signal": "SIGINT" }`
+- `POST /shutdown` – stop API server and terminate the session if still running.
+
+The `ready` event is heuristic-based. Devcon watches terminal output and marks the session as `ready` after a stability window where output and rendered screen state no longer change.
+
+Codex note:
+- In `devcon -api codex`, input requests are executed with `codex exec "<prompt>"` inside the running container to avoid upstream TUI crashes in detached API mode. This is robust for remote automation, but it is request-oriented rather than a single continuous chat TUI session.
 
 ## Default image (`devcon:latest`)
 

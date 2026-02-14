@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn, spawnSync, SpawnOptionsWithoutStdio } from 'child_process';
+import { createHash } from 'crypto';
 import {
   existsSync,
   mkdtempSync,
@@ -13,6 +14,7 @@ import {
   Dirent,
   mkdirSync,
 } from 'fs';
+import { createServer, IncomingMessage, ServerResponse, request } from 'http';
 import * as os from 'os';
 import * as path from 'path';
 import * as readline from 'readline';
@@ -43,6 +45,9 @@ interface CliOptions {
   allowGit: boolean;
   tempGit: boolean;
   exportPatchPath?: string;
+  apiMode: boolean;
+  apiPort: number;
+  apiHost: string;
 }
 
 interface AutoBuildConfig {
@@ -51,11 +56,39 @@ interface AutoBuildConfig {
   description?: string;
 }
 
+interface ApiEvent {
+  id: number;
+  type: string;
+  timestamp: string;
+  payload: Record<string, unknown>;
+}
+
+interface ApiStatus {
+  state: 'starting' | 'busy' | 'ready' | 'exited' | 'error';
+  tool: string;
+  pid: number | null;
+  containerId?: string;
+  exitCode: number | null;
+  signal: string | null;
+  readyConfidence: number;
+  spawnCommand?: string;
+  lastErrorMessage?: string;
+  recentOutputTail?: string;
+}
+
 const CONFIG_PATH = process.env.DEVCON_TOOLS_FILE
   || path.join(os.homedir(), '.config', 'devcon', 'tools.json');
 const SENSITIVE_CONFIG_PATH = path.join(os.homedir(), '.config', 'devcon', 'sensitive.json');
 const SKIP_SCAN_CONFIG_PATH = path.join(os.homedir(), '.config', 'devcon', 'skip-scan.json');
 const WORKSPACE_TARGET = '/workspace';
+const API_DEFAULT_PORT = parseIntegerEnv(process.env.DEVCON_API_PORT, 3784);
+const API_DEFAULT_HOST = process.env.DEVCON_API_HOST || '127.0.0.1';
+const API_TTY_COLUMNS = 120;
+const API_TTY_ROWS = 40;
+const READY_QUIET_WINDOW_MS = 1200;
+const READY_MIN_INPUT_QUIET_MS = 400;
+const READY_POLL_INTERVAL_MS = 200;
+const ANSI_PATTERN = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\)|[@-Z\\-_])/g;
 const HOME_READONLY_DEFAULT = parseBooleanEnv(process.env.DEVCON_HOME_READONLY);
 const SHARE_HOME_DEFAULT = parseBooleanEnv(process.env.DEVCON_SHARE_HOME);
 const DEFAULT_IMAGE_TAG = 'devcon:latest';
@@ -115,6 +148,17 @@ function parseBooleanEnv(value: string | undefined): boolean {
 
   const normalized = value.toLowerCase();
   return normalized === '1' || normalized === 'true' || normalized === 'yes';
+}
+
+function parseIntegerEnv(value: string | undefined, fallback: number): number {
+  if (!value) {
+    return fallback;
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (Number.isNaN(parsed) || parsed <= 0 || parsed > 65535) {
+    return fallback;
+  }
+  return parsed;
 }
 
 function resolveUserPath(input: string, homeDir: string): string {
@@ -257,6 +301,9 @@ function parseArgs(argv: string[]): CliOptions {
   let allowGit = false;
   let tempGit = false;
   let exportPatchPath: string | undefined;
+  let apiMode = false;
+  let apiPort = API_DEFAULT_PORT;
+  let apiHost = API_DEFAULT_HOST;
   let forward = false;
   let helpRequested = false;
 
@@ -280,6 +327,56 @@ function parseArgs(argv: string[]): CliOptions {
 
     if (arg === '--dry-run') {
       dryRun = true;
+      continue;
+    }
+
+    if (arg === '--api' || arg === '-api') {
+      apiMode = true;
+      continue;
+    }
+
+    if (arg.startsWith('--api-port=')) {
+      const parsed = Number.parseInt(arg.substring('--api-port='.length), 10);
+      if (Number.isNaN(parsed) || parsed <= 0 || parsed > 65535) {
+        throw new Error('--api-port must be a valid TCP port between 1 and 65535.');
+      }
+      apiPort = parsed;
+      continue;
+    }
+
+    if (arg === '--api-port') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--api-port requires a value, e.g. --api-port 3784');
+      }
+      const parsed = Number.parseInt(next, 10);
+      if (Number.isNaN(parsed) || parsed <= 0 || parsed > 65535) {
+        throw new Error('--api-port must be a valid TCP port between 1 and 65535.');
+      }
+      apiPort = parsed;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--api-host=')) {
+      const value = arg.substring('--api-host='.length).trim();
+      if (!value) {
+        throw new Error('--api-host requires a non-empty hostname or IP.');
+      }
+      apiHost = value;
+      continue;
+    }
+
+    if (arg === '--api-host') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--api-host requires a value, e.g. --api-host 127.0.0.1');
+      }
+      apiHost = next.trim();
+      if (!apiHost) {
+        throw new Error('--api-host requires a non-empty hostname or IP.');
+      }
+      i += 1;
       continue;
     }
 
@@ -351,6 +448,9 @@ function parseArgs(argv: string[]): CliOptions {
     allowGit,
     tempGit,
     exportPatchPath,
+    apiMode,
+    apiPort,
+    apiHost,
   };
 }
 
@@ -755,6 +855,813 @@ function promptYesNo(question: string): Promise<boolean> {
   });
 }
 
+function stripAnsiSequences(input: string): string {
+  return input.replace(ANSI_PATTERN, '');
+}
+
+class ConsoleSnapshotTracker {
+  private history: string[] = [];
+
+  private currentLine = '';
+
+  feed(rawChunk: string): string {
+    const chunk = stripAnsiSequences(rawChunk);
+    for (const char of chunk) {
+      if (char === '\r') {
+        this.currentLine = '';
+        continue;
+      }
+      if (char === '\n') {
+        this.history.push(this.currentLine);
+        if (this.history.length > 120) {
+          this.history.shift();
+        }
+        this.currentLine = '';
+        continue;
+      }
+      if (char === '\b' || char === '\x7f') {
+        this.currentLine = this.currentLine.slice(0, -1);
+        continue;
+      }
+      if (char < ' ' && char !== '\t') {
+        continue;
+      }
+      this.currentLine += char;
+      if (this.currentLine.length > 500) {
+        this.currentLine = this.currentLine.slice(-500);
+      }
+    }
+
+    return this.getHash();
+  }
+
+  getHash(): string {
+    const snapshot = [...this.history.slice(-80), this.currentLine].join('\n');
+    return createHash('sha1').update(snapshot).digest('hex');
+  }
+}
+
+interface ReadyTransition {
+  state: 'busy' | 'ready';
+  reason: string;
+  confidence: number;
+  quietMs: number;
+  visualStableMs: number;
+  inputQuietMs: number;
+}
+
+class OutputStabilityDetector {
+  private readonly tracker = new ConsoleSnapshotTracker();
+
+  private readonly onTransition: (transition: ReadyTransition) => void;
+
+  private lastHash = this.tracker.getHash();
+
+  private lastOutputAt = Date.now();
+
+  private lastVisualChangeAt = Date.now();
+
+  private lastInputAt = Date.now();
+
+  private state: 'busy' | 'ready' = 'busy';
+
+  private timer: NodeJS.Timeout | null = null;
+
+  constructor(onTransition: (transition: ReadyTransition) => void) {
+    this.onTransition = onTransition;
+  }
+
+  start(): void {
+    if (this.timer) {
+      return;
+    }
+    this.timer = setInterval(() => this.tick(), READY_POLL_INTERVAL_MS);
+  }
+
+  stop(): void {
+    if (!this.timer) {
+      return;
+    }
+    clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  noteInput(): void {
+    this.lastInputAt = Date.now();
+    this.toBusy('input');
+  }
+
+  feedOutput(rawChunk: string): void {
+    const now = Date.now();
+    this.lastOutputAt = now;
+    const nextHash = this.tracker.feed(rawChunk);
+    if (nextHash !== this.lastHash) {
+      this.lastHash = nextHash;
+      this.lastVisualChangeAt = now;
+    }
+    this.toBusy('output');
+  }
+
+  private toBusy(reason: string): void {
+    if (this.state === 'busy') {
+      return;
+    }
+    this.state = 'busy';
+    const now = Date.now();
+    this.onTransition({
+      state: 'busy',
+      reason,
+      confidence: 0.1,
+      quietMs: now - this.lastOutputAt,
+      visualStableMs: now - this.lastVisualChangeAt,
+      inputQuietMs: now - this.lastInputAt,
+    });
+  }
+
+  private tick(): void {
+    if (this.state === 'ready') {
+      return;
+    }
+    const now = Date.now();
+    const quietMs = now - this.lastOutputAt;
+    const visualStableMs = now - this.lastVisualChangeAt;
+    const inputQuietMs = now - this.lastInputAt;
+
+    if (
+      quietMs < READY_QUIET_WINDOW_MS
+      || visualStableMs < READY_QUIET_WINDOW_MS
+      || inputQuietMs < READY_MIN_INPUT_QUIET_MS
+    ) {
+      return;
+    }
+
+    this.state = 'ready';
+    this.onTransition({
+      state: 'ready',
+      reason: 'screen-stable',
+      confidence: this.calculateConfidence(quietMs, visualStableMs, inputQuietMs),
+      quietMs,
+      visualStableMs,
+      inputQuietMs,
+    });
+  }
+
+  private calculateConfidence(quietMs: number, visualStableMs: number, inputQuietMs: number): number {
+    let score = 0.65;
+    if (quietMs >= READY_QUIET_WINDOW_MS * 2) {
+      score += 0.15;
+    }
+    if (visualStableMs >= READY_QUIET_WINDOW_MS * 2) {
+      score += 0.1;
+    }
+    if (inputQuietMs >= READY_MIN_INPUT_QUIET_MS * 3) {
+      score += 0.05;
+    }
+    if (quietMs >= READY_QUIET_WINDOW_MS * 3) {
+      score += 0.05;
+    }
+    return Math.min(0.99, Number(score.toFixed(2)));
+  }
+}
+
+async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buffer.length;
+    if (total > 1024 * 1024) {
+      throw new Error('Request body too large.');
+    }
+    chunks.push(buffer);
+  }
+  if (chunks.length === 0) {
+    return {};
+  }
+  const raw = Buffer.concat(chunks).toString('utf8').trim();
+  if (!raw) {
+    return {};
+  }
+  const parsed = JSON.parse(raw) as unknown;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('JSON body must be an object.');
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function sendJson(res: ServerResponse, statusCode: number, payload: Record<string, unknown>): void {
+  const body = JSON.stringify(payload);
+  res.statusCode = statusCode;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Content-Length', Buffer.byteLength(body));
+  res.end(body);
+}
+
+function formatSse(event: ApiEvent): string {
+  return `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+}
+
+function buildDetachedDockerRunArgs(args: string[]): string[] | null {
+  if (args.length === 0 || args[0] !== 'run') {
+    return null;
+  }
+
+  const detachedArgs: string[] = ['run', '-d', '-i', '-t'];
+  for (const token of args.slice(1)) {
+    if (
+      token === '--rm'
+      || token === '--detach'
+      || token === '--interactive'
+      || token === '--tty'
+    ) {
+      continue;
+    }
+
+    if (/^-[A-Za-z]+$/.test(token)) {
+      const filtered = token
+        .slice(1)
+        .split('')
+        .filter((ch) => ch !== 'd' && ch !== 'i' && ch !== 't');
+      if (filtered.length === 0) {
+        continue;
+      }
+      detachedArgs.push(`-${filtered.join('')}`);
+      continue;
+    }
+
+    detachedArgs.push(token);
+  }
+
+  return detachedArgs;
+}
+
+function removeContainerIfExists(containerId: string): void {
+  spawnSync('docker', ['rm', '-f', containerId], { stdio: 'ignore' });
+}
+
+function resizeContainerTty(containerId: string, cols: number, rows: number): void {
+  const resize = spawnSync(
+    'docker',
+    ['container', 'resize', '--height', String(rows), '--width', String(cols), containerId],
+    { stdio: 'ignore' },
+  );
+  if (resize.status !== 0) {
+    // Non-fatal: some Docker backends may reject resize in detached/bridge setups.
+    console.warn(`Warning: failed to set container TTY size to ${cols}x${rows}.`);
+  }
+}
+
+function resolveDockerSocketPath(): string {
+  const dockerHost = process.env.DOCKER_HOST;
+  if (dockerHost && dockerHost.startsWith('unix://')) {
+    return dockerHost.slice('unix://'.length);
+  }
+  return '/var/run/docker.sock';
+}
+
+interface DockerAttachStream {
+  write: (data: string | Buffer) => boolean;
+  close: () => void;
+  onData: (handler: (chunk: Buffer) => void) => void;
+  onError: (handler: (error: Error) => void) => void;
+  onClose: (handler: () => void) => void;
+}
+
+async function openDockerAttachStream(containerId: string): Promise<DockerAttachStream> {
+  const socketPath = resolveDockerSocketPath();
+  const pathWithQuery = `/v1.41/containers/${containerId}/attach?stream=1&stdin=1&stdout=1&stderr=1&logs=1`;
+
+  return new Promise((resolve, reject) => {
+    const req = request({
+      socketPath,
+      method: 'POST',
+      path: pathWithQuery,
+      headers: {
+        Connection: 'Upgrade',
+        Upgrade: 'tcp',
+      },
+    });
+
+    req.once('upgrade', (_res, socket, head) => {
+      if (head && head.length > 0) {
+        socket.unshift(head);
+      }
+      resolve({
+        write: (data: string | Buffer) => socket.write(data),
+        close: () => socket.end(),
+        onData: (handler: (chunk: Buffer) => void) => socket.on('data', handler),
+        onError: (handler: (error: Error) => void) => socket.on('error', handler),
+        onClose: (handler: () => void) => socket.on('close', handler),
+      });
+    });
+
+    req.once('response', (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      res.on('end', () => {
+        const payload = Buffer.concat(chunks).toString('utf8');
+        reject(new Error(`Docker attach failed (${res.statusCode ?? 'unknown'}): ${payload || 'no body'}`));
+      });
+    });
+
+    req.once('error', (error) => reject(error));
+    req.end();
+  });
+}
+
+async function runApiModeSession(options: {
+  toolName: string;
+  command: string;
+  args: string[];
+  cwd: string;
+  apiHost: string;
+  apiPort: number;
+  promptExecCommand?: string[];
+  tempGit: boolean;
+  tempGitDir?: string;
+  exportPatchPath?: string;
+  cleanup: () => void;
+}): Promise<void> {
+  const commandDescription = [options.command, ...options.args].map(shellQuote).join(' ');
+  const detachedDockerArgs = options.command === 'docker'
+    ? buildDetachedDockerRunArgs(options.args)
+    : null;
+  if (!detachedDockerArgs) {
+    options.cleanup();
+    throw new Error('API mode currently supports docker-backed tool sessions only.');
+  }
+
+  const launch = spawnSync('docker', detachedDockerArgs, { encoding: 'utf8' });
+  if (launch.status !== 0) {
+    const details = `${launch.stdout || ''}${launch.stderr || ''}`.trim();
+    options.cleanup();
+    throw new Error(`Failed to start detached docker session. ${details}`);
+  }
+
+  const containerId = (launch.stdout || '').trim().split('\n')[0]?.trim();
+  if (!containerId) {
+    options.cleanup();
+    throw new Error('Failed to start detached docker session: no container id returned.');
+  }
+  resizeContainerTty(containerId, API_TTY_COLUMNS, API_TTY_ROWS);
+
+  const promptExecMode = Array.isArray(options.promptExecCommand) && options.promptExecCommand.length > 0;
+  let attachStream: DockerAttachStream | undefined;
+  if (!promptExecMode) {
+    try {
+      attachStream = await openDockerAttachStream(containerId);
+    } catch (error) {
+      options.cleanup();
+      removeContainerIfExists(containerId);
+      throw new Error(`Failed to attach to container stdin/stdout: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  const waitChild = spawn('docker', ['wait', containerId], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let waitStdout = '';
+  let running = true;
+  let attachClosed = false;
+  let promptInFlight = false;
+
+  const sendSignal = (signal: NodeJS.Signals): boolean => {
+    const kill = spawnSync('docker', ['kill', '--signal', signal, containerId], { stdio: 'ignore' });
+    return kill.status === 0;
+  };
+
+  const status: ApiStatus = {
+    state: 'starting',
+    tool: options.toolName,
+    pid: waitChild.pid ?? null,
+    containerId,
+    exitCode: null,
+    signal: null,
+    readyConfidence: 0,
+    spawnCommand: commandDescription,
+    lastErrorMessage: undefined,
+    recentOutputTail: '',
+  };
+
+  let recentOutputTail = '';
+  const appendRecentOutput = (chunk: string): void => {
+    const next = `${recentOutputTail}${chunk}`;
+    recentOutputTail = next.length > 6000 ? next.slice(next.length - 6000) : next;
+    status.recentOutputTail = recentOutputTail;
+  };
+
+  let sequence = 0;
+  let cleanedUp = false;
+  let shuttingDown = false;
+  const clients = new Set<ServerResponse>();
+  const history: ApiEvent[] = [];
+
+  const publish = (
+    type: string,
+    payload: Record<string, unknown>,
+    retain: boolean = true,
+  ): void => {
+    const event: ApiEvent = {
+      id: sequence += 1,
+      type,
+      timestamp: new Date().toISOString(),
+      payload,
+    };
+    if (retain) {
+      history.push(event);
+      if (history.length > 100) {
+        history.shift();
+      }
+    }
+    const message = formatSse(event);
+    for (const client of clients) {
+      client.write(message);
+    }
+  };
+
+  const detector = new OutputStabilityDetector((transition) => {
+    if (promptExecMode) {
+      return;
+    }
+    status.state = transition.state;
+    status.readyConfidence = transition.confidence;
+    publish(transition.state, {
+      ...transition,
+      status: { ...status },
+    });
+  });
+  if (!promptExecMode) {
+    detector.start();
+  }
+
+  const cleanup = (): void => {
+    if (cleanedUp) {
+      return;
+    }
+    cleanedUp = true;
+    running = false;
+    if (attachStream && !attachClosed) {
+      attachStream.close();
+    }
+    if (waitChild.exitCode === null) {
+      waitChild.kill('SIGTERM');
+    }
+    removeContainerIfExists(containerId);
+    options.cleanup();
+  };
+
+  const finalizeTempPatch = (): void => {
+    if (options.tempGit && options.tempGitDir && options.exportPatchPath !== undefined) {
+      try {
+        exportTempGitPatch(options.tempGitDir, options.cwd, options.exportPatchPath || undefined);
+      } catch (error) {
+        publish('warning', {
+          message: `Failed to export patch from temp git repo: ${error instanceof Error ? error.message : error}`,
+        });
+      }
+    }
+  };
+
+  status.state = promptExecMode ? 'ready' : 'busy';
+  status.readyConfidence = promptExecMode ? 1 : 0;
+  publish('starting', {
+    status: { ...status },
+    pid: waitChild.pid ?? null,
+    containerId,
+    command: commandDescription,
+  });
+  if (!promptExecMode) {
+    publish('busy', {
+      reason: 'startup',
+      confidence: 0,
+      status: { ...status },
+    });
+  } else {
+    publish('ready', {
+      reason: 'prompt-exec-mode',
+      confidence: 1,
+      status: { ...status },
+    });
+  }
+
+  if (!waitChild.stdout || !waitChild.stderr || (!promptExecMode && !attachStream)) {
+    cleanup();
+    throw new Error('Failed to initialize API wait streams.');
+  }
+
+  if (attachStream) {
+    attachStream.onData((chunk: Buffer) => {
+      const text = chunk.toString('utf8');
+      appendRecentOutput(text);
+      detector.feedOutput(text);
+      publish('output', { stream: 'attach', text }, false);
+    });
+
+    attachStream.onError((error: Error) => {
+      if (!running || status.state === 'exited') {
+        return;
+      }
+      status.lastErrorMessage = error.message;
+      publish('warning', {
+        message: `Attach stream error: ${error.message}`,
+      });
+    });
+
+    attachStream.onClose(() => {
+      attachClosed = true;
+      if (!running || status.state === 'exited') {
+        return;
+      }
+      publish('warning', {
+        message: 'Attach stream closed while container is still running.',
+      });
+    });
+  }
+
+  waitChild.stdout.on('data', (chunk: Buffer) => {
+    waitStdout += chunk.toString('utf8');
+  });
+
+  waitChild.stderr.on('data', (chunk: Buffer) => {
+    const text = chunk.toString('utf8');
+    appendRecentOutput(text);
+    publish('output', { stream: 'wait-stderr', text }, false);
+  });
+
+  waitChild.on('exit', () => {
+    if (!running || status.state === 'exited' || status.state === 'error') {
+      return;
+    }
+    running = false;
+    if (!promptExecMode) {
+      detector.stop();
+    }
+    status.state = 'exited';
+    const parsedCode = Number.parseInt(waitStdout.trim().split('\n')[0] || '', 10);
+    status.exitCode = Number.isNaN(parsedCode) ? null : parsedCode;
+    status.signal = null;
+    status.pid = null;
+    status.readyConfidence = 1;
+    publish('exit', {
+      status: { ...status },
+      code: status.exitCode,
+      signal: null,
+      recentOutputTail,
+    });
+    finalizeTempPatch();
+    cleanup();
+  });
+
+  waitChild.on('error', (error) => {
+    if (status.state === 'exited') {
+      return;
+    }
+    if (!promptExecMode) {
+      detector.stop();
+    }
+    status.state = 'error';
+    status.readyConfidence = 0;
+    status.lastErrorMessage = error instanceof Error ? error.message : String(error);
+    publish('error', {
+      status: { ...status },
+      message: status.lastErrorMessage,
+    });
+    cleanup();
+  });
+
+  const server = createServer((req, res) => {
+    const handle = async (): Promise<void> => {
+      const method = req.method || 'GET';
+      const parsed = new URL(req.url || '/', 'http://localhost');
+
+      if (method === 'GET' && parsed.pathname === '/status') {
+        sendJson(res, 200, {
+          status,
+          apiHost: options.apiHost,
+          apiPort: options.apiPort,
+          recentOutputTail,
+        });
+        return;
+      }
+
+      if (method === 'GET' && parsed.pathname === '/events') {
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.write('\n');
+        for (const event of history) {
+          res.write(formatSse(event));
+        }
+        clients.add(res);
+        req.on('close', () => {
+          clients.delete(res);
+        });
+        return;
+      }
+
+      if (method === 'POST' && parsed.pathname === '/input') {
+        const body = await readJsonBody(req);
+        const text = typeof body.text === 'string' ? body.text : '';
+        const appendNewline = body.appendNewline === true;
+        if (!text) {
+          sendJson(res, 400, { error: 'Body must include a non-empty string field: text' });
+          return;
+        }
+        if (!running || status.state === 'exited' || status.state === 'error') {
+          sendJson(res, 409, {
+            error: 'Session is not accepting input.',
+            status,
+            recentOutputTail,
+          });
+          return;
+        }
+        const payload = appendNewline ? `${text}\n` : text;
+        if (promptExecMode) {
+          if (promptInFlight) {
+            sendJson(res, 409, { error: 'Another prompt is still running.' });
+            return;
+          }
+          promptInFlight = true;
+          status.state = 'busy';
+          status.readyConfidence = 0.1;
+          publish('busy', {
+            reason: 'prompt-exec-start',
+            confidence: 0.1,
+            status: { ...status },
+          });
+          const execArgs = ['exec', '-i', containerId, ...options.promptExecCommand as string[], text];
+          const execChild = spawn('docker', execArgs, {
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
+          execChild.stdout?.on('data', (chunk: Buffer) => {
+            const out = chunk.toString('utf8');
+            appendRecentOutput(out);
+            publish('output', { stream: 'prompt-stdout', text: out }, false);
+          });
+          execChild.stderr?.on('data', (chunk: Buffer) => {
+            const out = chunk.toString('utf8');
+            appendRecentOutput(out);
+            publish('output', { stream: 'prompt-stderr', text: out }, false);
+          });
+          execChild.on('exit', (code) => {
+            promptInFlight = false;
+            if (!running || status.state === 'exited' || status.state === 'error') {
+              return;
+            }
+            publish('prompt-exit', {
+              code: code ?? null,
+              status: { ...status },
+            });
+            status.state = 'ready';
+            status.readyConfidence = code === 0 ? 0.95 : 0.6;
+            publish('ready', {
+              reason: 'prompt-exec-complete',
+              confidence: status.readyConfidence,
+              status: { ...status },
+            });
+          });
+          execChild.on('error', (error) => {
+            promptInFlight = false;
+            if (!running || status.state === 'exited') {
+              return;
+            }
+            status.state = 'error';
+            status.readyConfidence = 0;
+            status.lastErrorMessage = error instanceof Error ? error.message : String(error);
+            publish('error', {
+              status: { ...status },
+              message: status.lastErrorMessage,
+            });
+          });
+          publish('input', {
+            bytes: Buffer.byteLength(payload),
+            mode: 'prompt-exec',
+          }, false);
+          sendJson(res, 202, {
+            accepted: true,
+            bytes: Buffer.byteLength(payload),
+            mode: 'prompt-exec',
+          });
+          return;
+        }
+
+        const wrote = attachStream?.write(payload) ?? false;
+        if (!wrote) {
+          sendJson(res, 409, {
+            error: 'Failed to write input to attached session stream.',
+            status,
+            recentOutputTail,
+          });
+          return;
+        }
+        detector.noteInput();
+        publish('input', {
+          bytes: Buffer.byteLength(payload),
+          mode: 'attach',
+        }, false);
+        sendJson(res, 202, {
+          accepted: true,
+          bytes: Buffer.byteLength(payload),
+          mode: 'attach',
+        });
+        return;
+      }
+
+      if (method === 'POST' && parsed.pathname === '/signal') {
+        const body = await readJsonBody(req);
+        const signal = (typeof body.signal === 'string' ? body.signal : 'SIGINT') as NodeJS.Signals;
+        if (!running || status.state === 'exited') {
+          sendJson(res, 409, { error: 'Session has already exited.' });
+          return;
+        }
+        const ok = sendSignal(signal);
+        if (!ok) {
+          sendJson(res, 500, { error: `Failed to deliver signal ${signal}.` });
+          return;
+        }
+        publish('signal', { signal });
+        sendJson(res, 202, { accepted: true, signal });
+        return;
+      }
+
+      if (method === 'POST' && parsed.pathname === '/shutdown') {
+        sendJson(res, 202, { accepted: true });
+        if (status.state !== 'exited') {
+          sendSignal('SIGTERM');
+        }
+        shuttingDown = true;
+        for (const client of clients) {
+          client.end();
+        }
+        clients.clear();
+        server.close();
+        return;
+      }
+
+      sendJson(res, 404, { error: `Unknown endpoint ${method} ${parsed.pathname}` });
+    };
+
+    handle().catch((error) => {
+      sendJson(res, 400, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  });
+
+  const heartbeat = setInterval(() => {
+    for (const client of clients) {
+      client.write(': keepalive\n\n');
+    }
+  }, 15000);
+
+  const shutdownFromSignal = (): void => {
+    if (status.state !== 'exited') {
+      sendSignal('SIGINT');
+    }
+    shuttingDown = true;
+    for (const client of clients) {
+      client.end();
+    }
+    clients.clear();
+    server.close();
+  };
+
+  process.on('SIGINT', shutdownFromSignal);
+  process.on('SIGTERM', shutdownFromSignal);
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', (error) => {
+      clearInterval(heartbeat);
+      process.off('SIGINT', shutdownFromSignal);
+      process.off('SIGTERM', shutdownFromSignal);
+      reject(error);
+    });
+
+    server.listen(options.apiPort, options.apiHost, () => {
+      publish('api-ready', {
+        status: { ...status },
+        apiHost: options.apiHost,
+        apiPort: options.apiPort,
+      });
+      console.log(`API mode enabled at http://${options.apiHost}:${options.apiPort}`);
+      console.log('Endpoints: GET /status, GET /events, POST /input, POST /signal, POST /shutdown');
+    });
+
+    server.once('close', () => {
+      clearInterval(heartbeat);
+      process.off('SIGINT', shutdownFromSignal);
+      process.off('SIGTERM', shutdownFromSignal);
+      if (!shuttingDown && status.state !== 'exited') {
+        sendSignal('SIGTERM');
+      }
+      resolve();
+    });
+  });
+}
+
 function runCommand(
   command: string,
   args: string[],
@@ -906,7 +1813,11 @@ async function handleRebuildCommand(
   }
 }
 
-async function ensureImageAvailable(image: string, autoBuild?: AutoBuildConfig): Promise<void> {
+async function ensureImageAvailable(
+  image: string,
+  autoBuild?: AutoBuildConfig,
+  options: { allowNonInteractiveBuild?: boolean } = {},
+): Promise<void> {
   const inspect = spawnSync('docker', ['image', 'inspect', image], { stdio: 'ignore' });
   if (inspect.status === 0) {
     return;
@@ -922,6 +1833,11 @@ async function ensureImageAvailable(image: string, autoBuild?: AutoBuildConfig):
   }
 
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    if (options.allowNonInteractiveBuild) {
+      console.warn(`Auto-building missing image "${image}" in non-interactive mode.`);
+      await runDockerBuild(autoBuild);
+      return;
+    }
     throw new Error(`Cannot auto-build image "${image}" because the terminal is not interactive.`);
   }
 
@@ -935,7 +1851,7 @@ async function ensureImageAvailable(image: string, autoBuild?: AutoBuildConfig):
 
 function printHelp(tools: ToolMap): void {
   console.log('Usage:');
-  console.log('  devcon <tool> [-- tool args]');
+  console.log('  devcon [-api] <tool> [-- tool args]');
   console.log('  devcon update [tool ...]');
   console.log('  devcon rebuild [tool ...]');
   console.log('  devcon sensitive <list|add|remove> [pattern]');
@@ -948,6 +1864,9 @@ function printHelp(tools: ToolMap): void {
   console.log('  --with-git    Unmask .git and inject a sandboxed git user inside the container');
   console.log('  --temp-git    Mask host .git but provide a temporary git repo/worktree inside the container');
   console.log('  --export-patch[=PATH] Export changes from temp-git repo after run (defaults to .devcon/drafts/<ts>.patch)');
+  console.log(`  -api, --api   Enable API mode (HTTP control plane, defaults to ${API_DEFAULT_HOST}:${API_DEFAULT_PORT})`);
+  console.log('  --api-host    Host/interface to bind API server');
+  console.log('  --api-port    TCP port for API mode');
   console.log('  --help        Show this message');
   console.log('\nCommands:');
   console.log('  update        Refresh Docker images for one or more tools (pull base, rerun npm install)');
@@ -970,8 +1889,11 @@ function buildDockerArgs(options: {
   image: string;
   allowGit: boolean;
   tempGit: boolean;
+  interactiveTerminal: boolean;
 }): { command: string; args: string[]; cleanup: () => void; tempGitDir?: string } {
-  const dockerArgs: string[] = ['run', '--rm', '-it'];
+  const dockerArgs: string[] = options.interactiveTerminal
+    ? ['run', '--rm', '-it']
+    : ['run', '--rm', '-i'];
   const cleanupTargets: string[] = [];
   const writablePaths = options.tool.writablePaths ?? [];
   const homeDir = os.homedir();
@@ -1123,6 +2045,13 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (
+    options.apiMode
+    && ['update', 'rebuild', 'sensitive', 'skip-scan'].includes(options.toolName)
+  ) {
+    throw new Error('API mode is only supported for tool sessions (e.g. "devcon -api codex" or "devcon -api run").');
+  }
+
   if (options.toolName === 'update') {
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon update". Specify the desired image in the tool configuration instead.');
@@ -1162,7 +2091,11 @@ async function main(): Promise<void> {
   if (options.toolName === 'run') {
     ensureDockerAvailable();
     const image = options.imageOverride ?? DEFAULT_IMAGE_TAG;
-    await ensureImageAvailable(image, image === DEFAULT_IMAGE_TAG ? DEFAULT_AUTO_BUILD : undefined);
+    await ensureImageAvailable(
+      image,
+      image === DEFAULT_IMAGE_TAG ? DEFAULT_AUTO_BUILD : undefined,
+      { allowNonInteractiveBuild: options.apiMode },
+    );
 
     const toolDef: ToolDefinition = {
       image,
@@ -1170,7 +2103,7 @@ async function main(): Promise<void> {
       description: 'Interactive shell',
     };
 
-    const { command, args, cleanup } = buildDockerArgs({
+    const { command, args, cleanup, tempGitDir } = buildDockerArgs({
       cwd,
       toolName: options.toolName,
       tool: toolDef,
@@ -1179,11 +2112,28 @@ async function main(): Promise<void> {
       image,
       allowGit: options.allowGit,
       tempGit: options.tempGit,
+      interactiveTerminal: true,
     });
 
     if (options.dryRun) {
       console.log([command, ...args].join(' '));
       cleanup();
+      return;
+    }
+
+    if (options.apiMode) {
+      await runApiModeSession({
+        toolName: options.toolName,
+        command,
+        args,
+        cwd,
+        apiHost: options.apiHost,
+        apiPort: options.apiPort,
+        tempGit: options.tempGit,
+        tempGitDir,
+        exportPatchPath: options.exportPatchPath,
+        cleanup,
+      });
       return;
     }
 
@@ -1219,23 +2169,56 @@ async function main(): Promise<void> {
 
   console.log(`Preparing to launch tool "${options.toolName}" using image "${tool.image}"...`);
 
+  let apiPromptExecCommand: string[] | undefined;
+  let effectiveTool = tool;
+  if (options.apiMode && options.toolName === 'codex') {
+    // Codex TUI crashes in detached/bridged terminal mode; use per-request exec instead.
+    effectiveTool = {
+      ...tool,
+      command: ['/bin/sh', '-lc', 'while true; do sleep 3600; done'],
+    };
+    apiPromptExecCommand = ['codex', 'exec', '--sandbox', 'danger-full-access'];
+  }
+
   const image = options.imageOverride ?? tool.image;
-  await ensureImageAvailable(image, options.imageOverride ? undefined : tool.autoBuild);
+  await ensureImageAvailable(
+    image,
+    options.imageOverride ? undefined : tool.autoBuild,
+    { allowNonInteractiveBuild: options.apiMode },
+  );
 
   const { command, args, cleanup, tempGitDir } = buildDockerArgs({
     cwd,
     toolName: options.toolName,
-    tool,
+    tool: effectiveTool,
     toolArgs: options.toolArgs,
-    shareHome: options.shareHome && tool.shareHome !== false,
+    shareHome: options.shareHome && effectiveTool.shareHome !== false,
     image,
     allowGit: options.allowGit,
     tempGit: options.tempGit,
+    interactiveTerminal: true,
   });
 
   if (options.dryRun) {
     console.log([command, ...args].join(' '));
     cleanup();
+    return;
+  }
+
+  if (options.apiMode) {
+    await runApiModeSession({
+      toolName: options.toolName,
+      command,
+      args,
+      cwd,
+      apiHost: options.apiHost,
+      apiPort: options.apiPort,
+      promptExecCommand: apiPromptExecCommand,
+      tempGit: options.tempGit,
+      tempGitDir,
+      exportPatchPath: options.exportPatchPath,
+      cleanup,
+    });
     return;
   }
 
