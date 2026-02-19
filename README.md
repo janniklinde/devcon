@@ -51,6 +51,12 @@ devcon codex --dry-run
 # Launch Claude Code but keep your home directory out of the container
 devcon claude --no-home
 
+# Force IPv4 inside the container (disable IPv6)
+devcon -ipv4 codex
+
+# Use host networking (helpful with VPNs that block Docker bridge DNS/NAT)
+devcon --network-host codex
+
 # Override the docker image just for this run
 devcon codex --image ghcr.io/my/codex:latest -- --trace
 
@@ -66,7 +72,11 @@ Useful flags (place before `--` that separates devcon flags from tool args):
 - `--with-git` – Unmask `.git` and inject a sandboxed git identity (`devcon-bot <devcon@example.com>`) inside the container.
 - `--temp-git` – Keep host `.git` masked but mount a temporary git repo/worktree in the container (sandboxed identity pre-configured).
 - `--export-patch[=PATH]` – With `--temp-git`, export patches after the run to PATH (or `.devcon/drafts/<timestamp>.patch`).
+- `--network-host` / `-network-host` – Use host networking (often required on VPNs that block Docker bridge DNS/NAT).
+- `--ipv4` / `-ipv4` – Force IPv4-only networking by disabling IPv6 inside the container.
 - `--help` / `--list` – Show usage plus the registered tools.
+- Startup preflight: when bridge networking cannot resolve `api.openai.com` but host networking can, Devcon prompts to switch this run to `--network-host`.
+- Startup preflight timeout defaults to 2500ms per probe and can be adjusted with `DEVCON_NETWORK_PROBE_TIMEOUT_MS`.
 
 Pass tool arguments after `--` so they are not parsed by devcon. Examples:
 

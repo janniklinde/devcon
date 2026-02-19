@@ -43,6 +43,8 @@ interface CliOptions {
   allowGit: boolean;
   tempGit: boolean;
   exportPatchPath?: string;
+  forceIpv4: boolean;
+  networkHost: boolean;
 }
 
 interface AutoBuildConfig {
@@ -60,6 +62,8 @@ const HOME_READONLY_DEFAULT = parseBooleanEnv(process.env.DEVCON_HOME_READONLY);
 const SHARE_HOME_DEFAULT = parseBooleanEnv(process.env.DEVCON_SHARE_HOME);
 const DEFAULT_IMAGE_TAG = 'devcon:latest';
 const DEFAULT_IMAGE_DOCKERFILE = path.resolve(__dirname, '..', 'docker', 'devcon', 'Dockerfile');
+const NETWORK_CHECK_HOST = 'api.openai.com';
+const NETWORK_PROBE_TIMEOUT_MS = parsePositiveIntEnv(process.env.DEVCON_NETWORK_PROBE_TIMEOUT_MS, 2500);
 const DEFAULT_AUTO_BUILD: AutoBuildConfig = {
   dockerfile: DEFAULT_IMAGE_DOCKERFILE,
   tag: DEFAULT_IMAGE_TAG,
@@ -115,6 +119,17 @@ function parseBooleanEnv(value: string | undefined): boolean {
 
   const normalized = value.toLowerCase();
   return normalized === '1' || normalized === 'true' || normalized === 'yes';
+}
+
+function parsePositiveIntEnv(value: string | undefined, fallback: number): number {
+  if (!value) {
+    return fallback;
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return parsed;
 }
 
 function resolveUserPath(input: string, homeDir: string): string {
@@ -257,6 +272,8 @@ function parseArgs(argv: string[]): CliOptions {
   let allowGit = false;
   let tempGit = false;
   let exportPatchPath: string | undefined;
+  let forceIpv4 = false;
+  let networkHost = false;
   let forward = false;
   let helpRequested = false;
 
@@ -300,6 +317,16 @@ function parseArgs(argv: string[]): CliOptions {
 
     if (arg === '--temp-git') {
       tempGit = true;
+      continue;
+    }
+
+    if (arg === '--network-host' || arg === '-network-host') {
+      networkHost = true;
+      continue;
+    }
+
+    if (arg === '--ipv4' || arg === '-ipv4') {
+      forceIpv4 = true;
       continue;
     }
 
@@ -351,6 +378,8 @@ function parseArgs(argv: string[]): CliOptions {
     allowGit,
     tempGit,
     exportPatchPath,
+    forceIpv4,
+    networkHost,
   };
 }
 
@@ -755,6 +784,63 @@ function promptYesNo(question: string): Promise<boolean> {
   });
 }
 
+type NetworkProbeResult = 'reachable' | 'unreachable' | 'unsupported';
+
+function probeContainerHostResolution(image: string, useHostNetwork: boolean): NetworkProbeResult {
+  const networkArgs = useHostNetwork ? ['--network', 'host'] : [];
+  const probeScript = `if command -v getent >/dev/null 2>&1; then getent hosts ${NETWORK_CHECK_HOST} >/dev/null 2>&1; elif command -v nslookup >/dev/null 2>&1; then nslookup ${NETWORK_CHECK_HOST} >/dev/null 2>&1; else exit 42; fi`;
+  const probe = spawnSync(
+    'docker',
+    ['run', '--rm', ...networkArgs, '--entrypoint', '/bin/sh', image, '-lc', probeScript],
+    { stdio: 'ignore', timeout: NETWORK_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' },
+  );
+  if (probe.error) {
+    const code = (probe.error as NodeJS.ErrnoException).code;
+    if (code === 'ETIMEDOUT') {
+      return 'unreachable';
+    }
+    return 'unsupported';
+  }
+  if (probe.status === 0) {
+    return 'reachable';
+  }
+  if (probe.status === 42) {
+    return 'unsupported';
+  }
+  if (probe.status === 126 || probe.status === 127) {
+    return 'unsupported';
+  }
+  return 'unreachable';
+}
+
+async function maybeEnableHostNetwork(
+  image: string,
+  networkHostRequested: boolean,
+  dryRun: boolean,
+): Promise<boolean> {
+  if (networkHostRequested || dryRun) {
+    return networkHostRequested;
+  }
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    return networkHostRequested;
+  }
+
+  const bridgeProbe = probeContainerHostResolution(image, false);
+  if (bridgeProbe === 'reachable' || bridgeProbe === 'unsupported') {
+    return networkHostRequested;
+  }
+
+  const hostProbe = probeContainerHostResolution(image, true);
+  if (hostProbe !== 'reachable') {
+    return networkHostRequested;
+  }
+
+  console.warn(`Container could not resolve "${NETWORK_CHECK_HOST}" on Docker bridge networking.`);
+  console.warn('Host networking works and may avoid VPN/Docker DNS conflicts.');
+  const switchToHost = await promptYesNo('Switch this run to --network-host? [y/N] ');
+  return switchToHost;
+}
+
 function runCommand(
   command: string,
   args: string[],
@@ -948,6 +1034,8 @@ function printHelp(tools: ToolMap): void {
   console.log('  --with-git    Unmask .git and inject a sandboxed git user inside the container');
   console.log('  --temp-git    Mask host .git but provide a temporary git repo/worktree inside the container');
   console.log('  --export-patch[=PATH] Export changes from temp-git repo after run (defaults to .devcon/drafts/<ts>.patch)');
+  console.log('  --network-host, -network-host Use host networking (helps with VPNs that block Docker bridge DNS/NAT)');
+  console.log('  --ipv4, -ipv4 Force IPv4-only networking by disabling IPv6 inside the container');
   console.log('  --help        Show this message');
   console.log('\nCommands:');
   console.log('  update        Refresh Docker images for one or more tools (pull base, rerun npm install)');
@@ -970,6 +1058,8 @@ function buildDockerArgs(options: {
   image: string;
   allowGit: boolean;
   tempGit: boolean;
+  forceIpv4: boolean;
+  networkHost: boolean;
 }): { command: string; args: string[]; cleanup: () => void; tempGitDir?: string } {
   const dockerArgs: string[] = ['run', '--rm', '-it'];
   const cleanupTargets: string[] = [];
@@ -982,6 +1072,19 @@ function buildDockerArgs(options: {
 
   if (typeof process.getuid === 'function' && typeof process.getgid === 'function') {
     dockerArgs.push('-u', `${process.getuid()}:${process.getgid()}`);
+  }
+
+  if (options.networkHost) {
+    dockerArgs.push('--network', 'host');
+    console.log('Host network mode enabled: container will use host DNS/routing stack.');
+  }
+
+  if (options.forceIpv4 && !options.networkHost) {
+    dockerArgs.push('--sysctl', 'net.ipv6.conf.all.disable_ipv6=1');
+    dockerArgs.push('--sysctl', 'net.ipv6.conf.default.disable_ipv6=1');
+    console.log('IPv4-only mode enabled: IPv6 disabled inside container networking.');
+  } else if (options.forceIpv4 && options.networkHost) {
+    console.warn('Ignoring --ipv4 in --network-host mode: the container shares host network settings.');
   }
 
   const workspaceTarget = options.tool.workdir ?? WORKSPACE_TARGET;
@@ -1163,6 +1266,7 @@ async function main(): Promise<void> {
     ensureDockerAvailable();
     const image = options.imageOverride ?? DEFAULT_IMAGE_TAG;
     await ensureImageAvailable(image, image === DEFAULT_IMAGE_TAG ? DEFAULT_AUTO_BUILD : undefined);
+    const networkHost = await maybeEnableHostNetwork(image, options.networkHost, options.dryRun);
 
     const toolDef: ToolDefinition = {
       image,
@@ -1179,6 +1283,8 @@ async function main(): Promise<void> {
       image,
       allowGit: options.allowGit,
       tempGit: options.tempGit,
+      forceIpv4: options.forceIpv4,
+      networkHost,
     });
 
     if (options.dryRun) {
@@ -1221,6 +1327,7 @@ async function main(): Promise<void> {
 
   const image = options.imageOverride ?? tool.image;
   await ensureImageAvailable(image, options.imageOverride ? undefined : tool.autoBuild);
+  const networkHost = await maybeEnableHostNetwork(image, options.networkHost, options.dryRun);
 
   const { command, args, cleanup, tempGitDir } = buildDockerArgs({
     cwd,
@@ -1231,6 +1338,8 @@ async function main(): Promise<void> {
     image,
     allowGit: options.allowGit,
     tempGit: options.tempGit,
+    forceIpv4: options.forceIpv4,
+    networkHost,
   });
 
   if (options.dryRun) {
