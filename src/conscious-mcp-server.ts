@@ -1,0 +1,569 @@
+#!/usr/bin/env node
+import { ConsciousArchiveStore, bootstrapConsciousPaths, resolveConsciousPaths } from './conscious-archive';
+import { appendFileSync } from 'fs';
+
+interface JsonRpcRequest {
+  jsonrpc: '2.0';
+  id?: string | number | null;
+  method: string;
+  params?: unknown;
+}
+
+interface JsonRpcError {
+  code: number;
+  message: string;
+  data?: unknown;
+}
+
+interface JsonRpcResponse {
+  jsonrpc: '2.0';
+  id: string | number | null;
+  result?: unknown;
+  error?: JsonRpcError;
+}
+
+interface RuntimeConfig {
+  stateDir: string;
+  defaultRepo?: string;
+  debugLogPath?: string;
+}
+
+const SUPPORTED_PROTOCOL_VERSIONS = [
+  '2025-06-18',
+  '2024-11-05',
+];
+
+function parseArgs(argv: string[]): RuntimeConfig {
+  let stateDir = process.env.DEVCON_CONSCIOUS_STATE_DIR;
+  let defaultRepo = process.env.DEVCON_CONSCIOUS_REPO;
+  let debugLogPath = process.env.DEVCON_CONSCIOUS_DEBUG_LOG;
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg.startsWith('--state-dir=')) {
+      stateDir = arg.slice('--state-dir='.length);
+      continue;
+    }
+    if (arg === '--state-dir') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--state-dir requires a path.');
+      }
+      stateDir = next;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--repo=')) {
+      defaultRepo = arg.slice('--repo='.length);
+      continue;
+    }
+    if (arg === '--repo') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--repo requires a value.');
+      }
+      defaultRepo = next;
+      i += 1;
+    }
+    if (arg.startsWith('--debug-log=')) {
+      debugLogPath = arg.slice('--debug-log='.length);
+      continue;
+    }
+    if (arg === '--debug-log') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--debug-log requires a path.');
+      }
+      debugLogPath = next;
+      i += 1;
+    }
+  }
+
+  if (!stateDir) {
+    throw new Error('Missing --state-dir (or DEVCON_CONSCIOUS_STATE_DIR).');
+  }
+
+  return {
+    stateDir,
+    defaultRepo,
+    debugLogPath,
+  };
+}
+
+class StdioJsonRpcServer {
+  private readonly archive: ConsciousArchiveStore;
+
+  private readonly config: RuntimeConfig;
+
+  private buffer: Buffer = Buffer.alloc(0);
+  private framingMode: 'unknown' | 'content-length' | 'ndjson' = 'unknown';
+
+  constructor(config: RuntimeConfig) {
+    this.config = config;
+    const paths = resolveConsciousPaths(config.stateDir);
+    this.archive = new ConsciousArchiveStore(paths.dbPath);
+    this.archive.ensureInitialized();
+    this.log(`starting server (repo=${config.defaultRepo ?? 'unset'})`);
+  }
+
+  start(): void {
+    const keepAlive = setInterval(() => undefined, 60_000);
+    process.stdin.resume();
+    process.stdin.on('data', (chunk: Buffer) => {
+      this.buffer = Buffer.concat([this.buffer, chunk]);
+      this.tryProcessBuffer();
+    });
+    process.stdin.on('end', () => {
+      this.log('stdin ended; waiting for process shutdown signal.');
+    });
+
+    process.stdin.on('error', (error) => {
+      this.log(`stdin error: ${error.message}`);
+    });
+
+    process.on('uncaughtException', (error) => {
+      this.log(`uncaughtException: ${error.message}`);
+    });
+
+    process.on('unhandledRejection', (reason) => {
+      this.log(`unhandledRejection: ${String(reason)}`);
+    });
+
+    process.on('SIGTERM', () => {
+      clearInterval(keepAlive);
+      process.exit(0);
+    });
+    process.on('SIGINT', () => {
+      clearInterval(keepAlive);
+      process.exit(0);
+    });
+  }
+
+  private tryProcessBuffer(): void {
+    while (true) {
+      if (this.framingMode !== 'ndjson') {
+        const handledContentLength = this.tryProcessContentLengthFrame();
+        if (handledContentLength === true) {
+          continue;
+        }
+        if (handledContentLength === null && this.framingMode === 'content-length') {
+          return;
+        }
+      }
+
+      if (this.framingMode !== 'content-length') {
+        const handledNdjson = this.tryProcessNdjsonFrame();
+        if (handledNdjson === true) {
+          continue;
+        }
+      }
+
+      return;
+    }
+  }
+
+  private tryProcessContentLengthFrame(): boolean | null {
+    const boundary = this.findHeaderBoundary(this.buffer);
+    if (!boundary) {
+      return false;
+    }
+
+    const headerText = this.buffer.slice(0, boundary.headerEnd).toString('utf8');
+    const contentLength = this.parseContentLength(headerText);
+    if (contentLength <= 0) {
+      if (this.framingMode === 'unknown') {
+        return false;
+      }
+      this.log('Invalid Content-Length header.');
+      this.buffer = Buffer.alloc(0);
+      return null;
+    }
+
+    const bodyStart = boundary.bodyStart;
+    const bodyEnd = bodyStart + contentLength;
+    if (this.buffer.length < bodyEnd) {
+      return null;
+    }
+
+    this.framingMode = 'content-length';
+    const body = this.buffer.slice(bodyStart, bodyEnd).toString('utf8');
+    this.buffer = this.buffer.slice(bodyEnd);
+    this.handleJsonRpcBody(body);
+    return true;
+  }
+
+  private tryProcessNdjsonFrame(): boolean {
+    const newlineIndex = this.buffer.indexOf('\n');
+    if (newlineIndex === -1) {
+      return false;
+    }
+
+    const rawLine = this.buffer.slice(0, newlineIndex).toString('utf8');
+    const line = rawLine.trim();
+
+    if (line.length === 0) {
+      this.buffer = this.buffer.slice(newlineIndex + 1);
+      return true;
+    }
+
+    if (!line.startsWith('{')) {
+      if (this.framingMode === 'unknown') {
+        return false;
+      }
+      this.buffer = this.buffer.slice(newlineIndex + 1);
+      this.log('Invalid NDJSON line; dropping buffer.');
+      this.buffer = Buffer.alloc(0);
+      return false;
+    }
+
+    this.buffer = this.buffer.slice(newlineIndex + 1);
+    this.framingMode = 'ndjson';
+    this.handleJsonRpcBody(line);
+    return true;
+  }
+
+  private handleJsonRpcBody(body: string): void {
+    this.log(`recv: ${this.truncateForLog(body)}`);
+    let message: JsonRpcRequest;
+    try {
+      message = JSON.parse(body) as JsonRpcRequest;
+    } catch (error) {
+      this.log(`Invalid JSON payload: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+
+    void this.handleMessage(message);
+  }
+
+  private findHeaderBoundary(buffer: Buffer): { headerEnd: number; bodyStart: number } | null {
+    const crlfBoundary = buffer.indexOf('\r\n\r\n');
+    const lfBoundary = buffer.indexOf('\n\n');
+
+    if (crlfBoundary === -1 && lfBoundary === -1) {
+      return null;
+    }
+
+    if (crlfBoundary !== -1 && (lfBoundary === -1 || crlfBoundary <= lfBoundary)) {
+      return {
+        headerEnd: crlfBoundary,
+        bodyStart: crlfBoundary + 4,
+      };
+    }
+
+    return {
+      headerEnd: lfBoundary,
+      bodyStart: lfBoundary + 2,
+    };
+  }
+
+  private parseContentLength(headerText: string): number {
+    const lines = headerText.split(/\r?\n/);
+    for (const line of lines) {
+      const idx = line.indexOf(':');
+      if (idx === -1) {
+        continue;
+      }
+      const key = line.slice(0, idx).trim().toLowerCase();
+      const value = line.slice(idx + 1).trim();
+      if (key === 'content-length') {
+        const parsed = Number.parseInt(value, 10);
+        return Number.isFinite(parsed) ? parsed : -1;
+      }
+    }
+    return -1;
+  }
+
+  private async handleMessage(message: JsonRpcRequest): Promise<void> {
+    if (message.jsonrpc !== '2.0' || typeof message.method !== 'string') {
+      if (message.id !== undefined) {
+        this.sendError(message.id, -32600, 'Invalid Request');
+      }
+      return;
+    }
+
+    const isRequest = message.id !== undefined;
+
+    try {
+      const result = await this.dispatch(message.method, message.params);
+      if (isRequest) {
+        this.send({
+          jsonrpc: '2.0',
+          id: message.id ?? null,
+          result,
+        });
+      }
+    } catch (error) {
+      if (isRequest) {
+        this.sendError(
+          message.id ?? null,
+          -32000,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
+  }
+
+  private async dispatch(method: string, params: unknown): Promise<unknown> {
+    if (method === 'initialize') {
+      const requestedVersion = this.parseRequestedProtocolVersion(params);
+      const protocolVersion = requestedVersion ?? SUPPORTED_PROTOCOL_VERSIONS[0];
+      return {
+        protocolVersion,
+        serverInfo: {
+          name: 'devcon-archive',
+          version: '0.1.0',
+        },
+        capabilities: {
+          tools: {
+            listChanged: false,
+          },
+        },
+      };
+    }
+
+    if (method === 'notifications/initialized') {
+      return null;
+    }
+
+    if (method === 'ping') {
+      return {};
+    }
+
+    if (method === 'tools/list') {
+      return {
+        tools: [
+          {
+            name: 'archive_search',
+            description: 'Search historical findings captured from prior sessions.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                query: { type: 'string' },
+                repo: { type: 'string' },
+                top_k: { type: 'integer', minimum: 1, maximum: 25, default: 5 },
+                min_confidence: { type: 'number', minimum: 0, maximum: 1, default: 0.3 },
+              },
+              required: ['query'],
+            },
+          },
+          {
+            name: 'archive_write',
+            description: 'Persist a durable finding (problem -> solution) for future retrieval.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                repo: { type: 'string' },
+                branch: { type: 'string' },
+                commit_sha: { type: 'string' },
+                summary: { type: 'string' },
+                problem: { type: 'string' },
+                solution: { type: 'string' },
+                evidence: {
+                  type: 'array',
+                  items: { type: 'string' },
+                },
+                tags: {
+                  type: 'array',
+                  items: { type: 'string' },
+                },
+                confidence: { type: 'number', minimum: 0, maximum: 1, default: 0.6 },
+                ttl_days: { type: 'integer', minimum: 1, default: 180 },
+                source: { type: 'string' },
+              },
+              required: ['summary', 'problem', 'solution'],
+            },
+          },
+          {
+            name: 'archive_mark_used',
+            description: 'Record whether a retrieved finding helped solve the task.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                id: { type: 'string' },
+                outcome: { type: 'string', enum: ['helpful', 'not_helpful', 'unknown'] },
+              },
+              required: ['id', 'outcome'],
+            },
+          },
+        ],
+      };
+    }
+
+    if (method === 'tools/call') {
+      const payload = (params ?? {}) as {
+        name?: string;
+        arguments?: Record<string, unknown>;
+      };
+      const name = payload.name;
+      const args = payload.arguments ?? {};
+      if (!name) {
+        throw new Error('tools/call missing tool name.');
+      }
+
+      if (name === 'archive_search') {
+        return this.handleArchiveSearch(args);
+      }
+      if (name === 'archive_write') {
+        return this.handleArchiveWrite(args);
+      }
+      if (name === 'archive_mark_used') {
+        return this.handleArchiveMarkUsed(args);
+      }
+
+      throw new Error(`Unknown tool "${name}".`);
+    }
+
+    throw new Error(`Method not found: ${method}`);
+  }
+
+  private parseRequestedProtocolVersion(params: unknown): string | undefined {
+    const candidate = (params as { protocolVersion?: unknown } | undefined)?.protocolVersion;
+    if (typeof candidate !== 'string') {
+      return undefined;
+    }
+    if (SUPPORTED_PROTOCOL_VERSIONS.includes(candidate)) {
+      return candidate;
+    }
+    return SUPPORTED_PROTOCOL_VERSIONS[0];
+  }
+
+  private handleArchiveSearch(args: Record<string, unknown>): unknown {
+    const query = typeof args.query === 'string' ? args.query : '';
+    if (!query.trim()) {
+      throw new Error('archive_search requires a non-empty query.');
+    }
+    const repo = typeof args.repo === 'string' ? args.repo : this.config.defaultRepo;
+    const topK = typeof args.top_k === 'number' ? args.top_k : 5;
+    const minConfidence = typeof args.min_confidence === 'number' ? args.min_confidence : 0.3;
+
+    const hits = this.archive.search({
+      query,
+      repo,
+      topK,
+      minConfidence,
+    });
+
+    const text = hits.length === 0
+      ? 'No prior findings matched the query.'
+      : hits
+        .map((hit, index) => `${index + 1}. [${hit.id}] ${hit.summary} (confidence=${hit.confidence.toFixed(2)}, score=${hit.score.toFixed(2)})`)
+        .join('\n');
+
+    return {
+      content: [{ type: 'text', text }],
+      structuredContent: {
+        query,
+        repo,
+        results: hits,
+      },
+      isError: false,
+    };
+  }
+
+  private handleArchiveWrite(args: Record<string, unknown>): unknown {
+    const repo = typeof args.repo === 'string' ? args.repo : this.config.defaultRepo;
+    if (!repo) {
+      throw new Error('archive_write requires repo (or server default repo).');
+    }
+
+    const summary = typeof args.summary === 'string' ? args.summary : '';
+    const problem = typeof args.problem === 'string' ? args.problem : '';
+    const solution = typeof args.solution === 'string' ? args.solution : '';
+    if (!summary.trim() || !problem.trim() || !solution.trim()) {
+      throw new Error('archive_write requires summary, problem, and solution.');
+    }
+
+    const record = this.archive.write({
+      repo,
+      branch: typeof args.branch === 'string' ? args.branch : undefined,
+      commitSha: typeof args.commit_sha === 'string' ? args.commit_sha : undefined,
+      summary,
+      problem,
+      solution,
+      evidence: Array.isArray(args.evidence) ? args.evidence.filter((entry): entry is string => typeof entry === 'string') : [],
+      tags: Array.isArray(args.tags) ? args.tags.filter((entry): entry is string => typeof entry === 'string') : [],
+      confidence: typeof args.confidence === 'number' ? args.confidence : 0.6,
+      ttlDays: typeof args.ttl_days === 'number' ? args.ttl_days : 180,
+      source: typeof args.source === 'string' ? args.source : 'mcp',
+    });
+
+    return {
+      content: [{ type: 'text', text: `Stored finding ${record.id}` }],
+      structuredContent: record,
+      isError: false,
+    };
+  }
+
+  private handleArchiveMarkUsed(args: Record<string, unknown>): unknown {
+    const id = typeof args.id === 'string' ? args.id : '';
+    const outcome = typeof args.outcome === 'string' ? args.outcome : '';
+    if (!id) {
+      throw new Error('archive_mark_used requires id.');
+    }
+    if (outcome !== 'helpful' && outcome !== 'not_helpful' && outcome !== 'unknown') {
+      throw new Error('archive_mark_used requires outcome in {helpful, not_helpful, unknown}.');
+    }
+
+    const record = this.archive.markUsed(id, outcome);
+    return {
+      content: [{ type: 'text', text: `Marked ${id} as ${outcome}` }],
+      structuredContent: {
+        id: record.id,
+        useCount: record.useCount,
+        successCount: record.successCount,
+        lastUsedAt: record.lastUsedAt,
+      },
+      isError: false,
+    };
+  }
+
+  private send(payload: JsonRpcResponse): void {
+    const body = JSON.stringify(payload);
+    this.log(`send: ${this.truncateForLog(body)}`);
+    if (this.framingMode === 'ndjson') {
+      process.stdout.write(`${body}\n`);
+      return;
+    }
+    const header = `Content-Length: ${Buffer.byteLength(body, 'utf8')}\r\n\r\n`;
+    process.stdout.write(header + body);
+  }
+
+  private sendError(id: string | number | null, code: number, message: string): void {
+    this.send({
+      jsonrpc: '2.0',
+      id,
+      error: {
+        code,
+        message,
+      },
+    });
+  }
+
+  private log(message: string): void {
+    const line = `[devcon-archive-mcp] ${message}\n`;
+    process.stderr.write(line);
+    if (this.config.debugLogPath) {
+      try {
+        appendFileSync(this.config.debugLogPath, line, 'utf8');
+      } catch {
+        // Ignore debug log write failures; stderr already contains context.
+      }
+    }
+  }
+
+  private truncateForLog(value: string, maxLen = 400): string {
+    if (value.length <= maxLen) {
+      return value;
+    }
+    return `${value.slice(0, maxLen)}...`;
+  }
+}
+
+function main(): void {
+  const config = parseArgs(process.argv.slice(2));
+  bootstrapConsciousPaths(config.stateDir);
+  const server = new StdioJsonRpcServer(config);
+  server.start();
+}
+
+main();

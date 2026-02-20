@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn, spawnSync, SpawnOptionsWithoutStdio } from 'child_process';
+import { randomBytes } from 'crypto';
 import {
   existsSync,
   mkdtempSync,
@@ -16,6 +17,12 @@ import {
 import * as os from 'os';
 import * as path from 'path';
 import * as readline from 'readline';
+import {
+  bootstrapConsciousPaths,
+  ConsciousArchiveStore,
+  ArchiveSearchHit,
+  ArchiveRecord,
+} from './conscious-archive';
 
 interface ToolDefinition {
   image: string;
@@ -45,6 +52,8 @@ interface CliOptions {
   exportPatchPath?: string;
   forceIpv4: boolean;
   networkHost: boolean;
+  conscious: boolean;
+  consciousStatePath?: string;
 }
 
 interface AutoBuildConfig {
@@ -57,6 +66,11 @@ const CONFIG_PATH = process.env.DEVCON_TOOLS_FILE
   || path.join(os.homedir(), '.config', 'devcon', 'tools.json');
 const SENSITIVE_CONFIG_PATH = path.join(os.homedir(), '.config', 'devcon', 'sensitive.json');
 const SKIP_SCAN_CONFIG_PATH = path.join(os.homedir(), '.config', 'devcon', 'skip-scan.json');
+const CONSCIOUS_ROOT_PATH = path.join(os.homedir(), '.config', 'devcon', 'conscious');
+const CONSCIOUS_CONTAINER_STATE_DIR = '/tmp/devcon/conscious';
+const CONSCIOUS_CONTAINER_MCP_SERVER = '/tmp/devcon/conscious-mcp-server.js';
+const CONSCIOUS_CONTAINER_ARCHIVE_MODULE = '/tmp/devcon/conscious-archive.js';
+const CONSCIOUS_MCP_NAME = 'devcon-archive';
 const WORKSPACE_TARGET = '/workspace';
 const HOME_READONLY_DEFAULT = parseBooleanEnv(process.env.DEVCON_HOME_READONLY);
 const SHARE_HOME_DEFAULT = parseBooleanEnv(process.env.DEVCON_SHARE_HOME);
@@ -274,6 +288,8 @@ function parseArgs(argv: string[]): CliOptions {
   let exportPatchPath: string | undefined;
   let forceIpv4 = false;
   let networkHost = false;
+  let conscious = false;
+  let consciousStatePath: string | undefined;
   let forward = false;
   let helpRequested = false;
 
@@ -322,6 +338,33 @@ function parseArgs(argv: string[]): CliOptions {
 
     if (arg === '--network-host' || arg === '-network-host') {
       networkHost = true;
+      continue;
+    }
+
+    if (arg === '--conscious' || arg === '-conscious') {
+      conscious = true;
+      continue;
+    }
+
+    if (arg === '--no-conscious') {
+      conscious = false;
+      continue;
+    }
+
+    if (arg.startsWith('--conscious-path=')) {
+      consciousStatePath = arg.substring('--conscious-path='.length);
+      conscious = true;
+      continue;
+    }
+
+    if (arg === '--conscious-path') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--conscious-path flag requires an argument, e.g. --conscious-path ~/.config/devcon/conscious');
+      }
+      consciousStatePath = next;
+      conscious = true;
+      i += 1;
       continue;
     }
 
@@ -380,6 +423,8 @@ function parseArgs(argv: string[]): CliOptions {
     exportPatchPath,
     forceIpv4,
     networkHost,
+    conscious,
+    consciousStatePath,
   };
 }
 
@@ -517,6 +562,284 @@ interface SensitivePattern {
 
 interface SkipScanConfig {
   skipDirs: string[];
+}
+
+interface GitRepoContext {
+  isRepo: boolean;
+  repoId: string;
+  branch?: string;
+  commitSha?: string;
+  cleanAtStart: boolean;
+}
+
+interface ConsciousRuntime {
+  sessionId: string;
+  stateDir: string;
+  dbPath: string;
+  sessionsDir: string;
+  repo: GitRepoContext;
+  containerStateDir: string;
+  containerServerScriptPath: string;
+  containerArchiveModulePath: string;
+  hostServerScriptPath: string;
+  hostArchiveModulePath: string;
+  retrievalHostPath: string;
+  retrievalContainerPath: string;
+  mcpLogHostPath: string;
+  mcpLogContainerPath: string;
+  captureSource: string;
+  seedQuery: string;
+}
+
+function getConsciousStateDir(explicitPath: string | undefined, homeDir: string): string {
+  if (!explicitPath || explicitPath.trim().length === 0) {
+    return CONSCIOUS_ROOT_PATH;
+  }
+  if (explicitPath === '~') {
+    return homeDir;
+  }
+  if (explicitPath.startsWith('~/')) {
+    return path.join(homeDir, explicitPath.slice(2));
+  }
+  return path.resolve(explicitPath);
+}
+
+function generateSessionId(): string {
+  return `session_${Date.now().toString(36)}_${randomBytes(4).toString('hex')}`;
+}
+
+function getGitRepoContext(cwd: string): GitRepoContext {
+  const repoCheck = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  if (repoCheck.status !== 0 || repoCheck.stdout.trim() !== 'true') {
+    return {
+      isRepo: false,
+      repoId: path.resolve(cwd),
+      cleanAtStart: false,
+    };
+  }
+
+  const remoteUrl = spawnSync('git', ['config', '--get', 'remote.origin.url'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  const repoRoot = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  const branch = spawnSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  const commit = spawnSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  const status = spawnSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+
+  const repoIdCandidate = remoteUrl.status === 0 && remoteUrl.stdout.trim().length > 0
+    ? remoteUrl.stdout.trim()
+    : repoRoot.status === 0 && repoRoot.stdout.trim().length > 0
+      ? repoRoot.stdout.trim()
+      : path.resolve(cwd);
+
+  return {
+    isRepo: true,
+    repoId: repoIdCandidate,
+    branch: branch.status === 0 ? branch.stdout.trim() : undefined,
+    commitSha: commit.status === 0 ? commit.stdout.trim() : undefined,
+    cleanAtStart: status.status === 0 && status.stdout.trim().length === 0,
+  };
+}
+
+function deriveConsciousQuery(toolArgs: string[], cwd: string): string {
+  const joined = toolArgs.join(' ').trim();
+  if (joined.length > 0) {
+    return joined;
+  }
+  return `working in ${path.basename(cwd)}`;
+}
+
+function formatRetrievalMarkdown(hits: ArchiveSearchHit[]): string {
+  if (hits.length === 0) {
+    return '# Relevant prior findings\n\nNo prior findings matched this launch context.\n';
+  }
+  const lines: string[] = ['# Relevant prior findings', ''];
+  hits.forEach((hit, index) => {
+    lines.push(`${index + 1}. ${hit.summary}`);
+    lines.push(`   - id: ${hit.id}`);
+    lines.push(`   - confidence: ${hit.confidence.toFixed(2)} | score: ${hit.score.toFixed(2)}`);
+    if (hit.tags.length > 0) {
+      lines.push(`   - tags: ${hit.tags.join(', ')}`);
+    }
+    lines.push(`   - problem: ${hit.problem}`);
+    lines.push(`   - solution: ${hit.solution}`);
+  });
+  lines.push('');
+  return `${lines.join('\n')}\n`;
+}
+
+function getConsciousServerScriptPath(): string {
+  const distPath = path.resolve(__dirname, 'conscious-mcp-server.js');
+  if (existsSync(distPath)) {
+    return distPath;
+  }
+  throw new Error(`Conscious mode requires ${distPath}. Build devcon first (npm run build).`);
+}
+
+function getConsciousArchiveModulePath(): string {
+  const distPath = path.resolve(__dirname, 'conscious-archive.js');
+  if (existsSync(distPath)) {
+    return distPath;
+  }
+  throw new Error(`Conscious mode requires ${distPath}. Build devcon first (npm run build).`);
+}
+
+function prepareConsciousRuntime(
+  cwd: string,
+  toolArgs: string[],
+  explicitStatePath: string | undefined,
+): ConsciousRuntime {
+  const stateDir = getConsciousStateDir(explicitStatePath, os.homedir());
+  const paths = bootstrapConsciousPaths(stateDir);
+  const archive = new ConsciousArchiveStore(paths.dbPath);
+  archive.ensureInitialized();
+
+  const repo = getGitRepoContext(cwd);
+  const seedQuery = deriveConsciousQuery(toolArgs, cwd);
+  const retrievalHits = archive.search({
+    query: seedQuery,
+    repo: repo.repoId,
+    topK: 5,
+    minConfidence: 0.35,
+  });
+
+  const sessionId = generateSessionId();
+  const retrievalHostPath = path.join(paths.sessionsDir, `${sessionId}.retrieval.md`);
+  writeFileSync(retrievalHostPath, formatRetrievalMarkdown(retrievalHits), 'utf8');
+  const mcpLogHostPath = path.join(paths.sessionsDir, `${sessionId}.mcp.log`);
+
+  const metadataPath = path.join(paths.sessionsDir, `${sessionId}.json`);
+  const metadata = {
+    sessionId,
+    createdAt: new Date().toISOString(),
+    seedQuery,
+    retrievalCount: retrievalHits.length,
+    repo: repo.repoId,
+    branch: repo.branch,
+    commitSha: repo.commitSha,
+    cleanAtStart: repo.cleanAtStart,
+  };
+  writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
+
+  return {
+    sessionId,
+    stateDir: paths.rootDir,
+    dbPath: paths.dbPath,
+    sessionsDir: paths.sessionsDir,
+    repo,
+    containerStateDir: CONSCIOUS_CONTAINER_STATE_DIR,
+    containerServerScriptPath: CONSCIOUS_CONTAINER_MCP_SERVER,
+    containerArchiveModulePath: CONSCIOUS_CONTAINER_ARCHIVE_MODULE,
+    hostServerScriptPath: getConsciousServerScriptPath(),
+    hostArchiveModulePath: getConsciousArchiveModulePath(),
+    retrievalHostPath,
+    retrievalContainerPath: path.join(CONSCIOUS_CONTAINER_STATE_DIR, 'sessions', `${sessionId}.retrieval.md`),
+    mcpLogHostPath,
+    mcpLogContainerPath: path.join(CONSCIOUS_CONTAINER_STATE_DIR, 'sessions', `${sessionId}.mcp.log`),
+    captureSource: `devcon:auto:${sessionId}`,
+    seedQuery,
+  };
+}
+
+function parseChangedFiles(statusOutput: string): string[] {
+  const files: string[] = [];
+  for (const line of statusOutput.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.length < 4) {
+      continue;
+    }
+    const pathPart = trimmed.slice(3).trim();
+    if (pathPart.length > 0) {
+      files.push(pathPart);
+    }
+  }
+  return files;
+}
+
+function countDiffHunkLines(diffOutput: string): number {
+  let total = 0;
+  for (const line of diffOutput.split('\n')) {
+    if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')) {
+      continue;
+    }
+    if (line.startsWith('+') || line.startsWith('-')) {
+      total += 1;
+    }
+  }
+  return total;
+}
+
+function truncateEvidence(diffOutput: string, maxLines = 80): string[] {
+  return diffOutput
+    .split('\n')
+    .filter((line) => line.length > 0)
+    .slice(0, maxLines);
+}
+
+function inferTagsFromFiles(files: string[]): string[] {
+  const tags = new Set<string>();
+  for (const filePath of files) {
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext) {
+      tags.add(ext.replace('.', ''));
+    }
+    if (filePath.includes('test')) {
+      tags.add('test');
+    }
+    if (filePath.includes('docker')) {
+      tags.add('docker');
+    }
+    if (filePath.includes('config')) {
+      tags.add('config');
+    }
+  }
+  return [...tags].slice(0, 10);
+}
+
+function maybeCaptureConsciousLearning(runtime: ConsciousRuntime | undefined, cwd: string, exitCode: number | null): ArchiveRecord | undefined {
+  if (!runtime || exitCode !== 0) {
+    return undefined;
+  }
+
+  if (!runtime.repo.isRepo || !runtime.repo.cleanAtStart) {
+    return undefined;
+  }
+
+  const statusAfter = spawnSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  if (statusAfter.status !== 0 || statusAfter.stdout.trim().length === 0) {
+    return undefined;
+  }
+
+  const diff = spawnSync('git', ['diff', '--no-color', '--unified=1'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  if (diff.status !== 0 || diff.stdout.trim().length === 0) {
+    return undefined;
+  }
+
+  const changedFiles = parseChangedFiles(statusAfter.stdout);
+  const changedLineCount = countDiffHunkLines(diff.stdout);
+  if (changedFiles.length === 0 || changedLineCount < 6) {
+    return undefined;
+  }
+
+  const archive = new ConsciousArchiveStore(runtime.dbPath);
+  archive.ensureInitialized();
+
+  const summary = `Session ${runtime.sessionId} changed ${changedFiles.length} file(s) and ${changedLineCount} diff line(s).`;
+  const problem = `Similar task context: ${runtime.seedQuery}`;
+  const solution = `Inspect changes in ${changedFiles.slice(0, 5).join(', ')} and reuse the same edit pattern.`;
+  const evidence = truncateEvidence(diff.stdout);
+  const tags = inferTagsFromFiles(changedFiles);
+  return archive.write({
+    repo: runtime.repo.repoId,
+    branch: runtime.repo.branch,
+    commitSha: runtime.repo.commitSha,
+    summary,
+    problem,
+    solution,
+    evidence,
+    tags,
+    confidence: 0.45,
+    ttlDays: 120,
+    source: runtime.captureSource,
+  });
 }
 
 function getCurrentWorkingDirectory(): string {
@@ -1036,6 +1359,8 @@ function printHelp(tools: ToolMap): void {
   console.log('  --export-patch[=PATH] Export changes from temp-git repo after run (defaults to .devcon/drafts/<ts>.patch)');
   console.log('  --network-host, -network-host Use host networking (helps with VPNs that block Docker bridge DNS/NAT)');
   console.log('  --ipv4, -ipv4 Force IPv4-only networking by disabling IPv6 inside the container');
+  console.log('  --conscious, -conscious Enable persistent archive memory and auto-mount MCP tools');
+  console.log('  --conscious-path PATH Override where conscious state is stored (default: ~/.config/devcon/conscious)');
   console.log('  --help        Show this message');
   console.log('\nCommands:');
   console.log('  update        Refresh Docker images for one or more tools (pull base, rerun npm install)');
@@ -1060,6 +1385,7 @@ function buildDockerArgs(options: {
   tempGit: boolean;
   forceIpv4: boolean;
   networkHost: boolean;
+  conscious?: ConsciousRuntime;
 }): { command: string; args: string[]; cleanup: () => void; tempGitDir?: string } {
   const dockerArgs: string[] = ['run', '--rm', '-it'];
   const cleanupTargets: string[] = [];
@@ -1137,7 +1463,8 @@ function buildDockerArgs(options: {
   }
 
   let initScriptPath: string | undefined;
-
+  const initScriptLines: string[] = [];
+  const postRunCleanupLines: string[] = [];
   let tempGitDir: string | undefined;
 
   if (options.tempGit) {
@@ -1149,18 +1476,12 @@ function buildDockerArgs(options: {
     dockerArgs.push('-e', `GIT_WORK_TREE=${workspaceTarget}`);
     console.log('Temporary git repo enabled: host .git remains masked.');
 
-    const initDir = mkdtempSync(path.join(os.tmpdir(), 'devcon-temp-git-init-'));
-    cleanupTargets.push(initDir);
-    initScriptPath = path.join(initDir, 'init.sh');
-    const initScript = `#!/bin/bash
-set -e
-if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
-  git add -A >/dev/null 2>&1 || true
-  git commit -m "devcon baseline" >/dev/null 2>&1 || true
-fi
-`;
-    writeFileSync(initScriptPath, initScript, { encoding: 'utf8', mode: 0o755 });
-    dockerArgs.push('--mount', `type=bind,source=${initScriptPath},target=/tmp/devcon/init.sh,readonly`);
+    initScriptLines.push(
+      'if ! git rev-parse --verify HEAD >/dev/null 2>&1; then',
+      '  git add -A >/dev/null 2>&1 || true',
+      '  git commit -m "devcon baseline" >/dev/null 2>&1 || true',
+      'fi',
+    );
   }
 
   if (options.allowGit) {
@@ -1174,6 +1495,59 @@ fi
     console.log('Git access enabled: .git unmasked and sandboxed identity configured (devcon-bot).');
   }
 
+  if (options.conscious) {
+    dockerArgs.push('--mount', `type=bind,source=${options.conscious.stateDir},target=${options.conscious.containerStateDir}`);
+    dockerArgs.push('--mount', `type=bind,source=${options.conscious.hostServerScriptPath},target=${options.conscious.containerServerScriptPath},readonly`);
+    dockerArgs.push('--mount', `type=bind,source=${options.conscious.hostArchiveModulePath},target=${options.conscious.containerArchiveModulePath},readonly`);
+    dockerArgs.push('-e', 'DEVCON_CONSCIOUS=1');
+    dockerArgs.push('-e', `DEVCON_CONSCIOUS_STATE_DIR=${options.conscious.containerStateDir}`);
+    dockerArgs.push('-e', `DEVCON_CONSCIOUS_REPO=${options.conscious.repo.repoId}`);
+    dockerArgs.push('-e', `DEVCON_CONSCIOUS_SESSION_ID=${options.conscious.sessionId}`);
+    dockerArgs.push('-e', `DEVCON_CONSCIOUS_RETRIEVAL_FILE=${options.conscious.retrievalContainerPath}`);
+    dockerArgs.push('-e', `DEVCON_CONSCIOUS_DEBUG_LOG=${options.conscious.mcpLogContainerPath}`);
+
+    const serverArgs = [
+      'node',
+      options.conscious.containerServerScriptPath,
+      '--state-dir',
+      options.conscious.containerStateDir,
+      '--repo',
+      options.conscious.repo.repoId,
+      '--debug-log',
+      options.conscious.mcpLogContainerPath,
+    ].map(shellQuote).join(' ');
+
+    if (options.toolName === 'codex') {
+      initScriptLines.push(
+        `if command -v codex >/dev/null 2>&1; then`,
+        `  codex mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`,
+        `  codex mcp add ${CONSCIOUS_MCP_NAME} -- ${serverArgs} >/dev/null 2>&1 || true`,
+        'fi',
+      );
+      postRunCleanupLines.push(`codex mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`);
+    } else if (options.toolName === 'claude') {
+      initScriptLines.push(
+        'if command -v claude >/dev/null 2>&1; then',
+        `  claude mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`,
+        `  claude mcp add --transport stdio ${CONSCIOUS_MCP_NAME} -- ${serverArgs} >/dev/null 2>&1 || true`,
+        'fi',
+      );
+      postRunCleanupLines.push(`claude mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`);
+    }
+  }
+
+  if (initScriptLines.length > 0) {
+    const initDir = mkdtempSync(path.join(os.tmpdir(), 'devcon-init-'));
+    cleanupTargets.push(initDir);
+    initScriptPath = path.join(initDir, 'init.sh');
+    const initScript = `#!/bin/bash
+set -e
+${initScriptLines.join('\n')}
+`;
+    writeFileSync(initScriptPath, initScript, { encoding: 'utf8', mode: 0o755 });
+    dockerArgs.push('--mount', `type=bind,source=${initScriptPath},target=/tmp/devcon/init.sh,readonly`);
+  }
+
   dockerArgs.push(options.image);
 
   const toolCommand = options.tool.command ?? [];
@@ -1183,7 +1557,12 @@ fi
     const commandString = commandArgs.length > 0
       ? commandArgs.map(shellQuote).join(' ')
       : '/bin/bash';
-    dockerArgs.push('/bin/bash', '-lc', `source /tmp/devcon/init.sh && exec ${commandString}`);
+    if (postRunCleanupLines.length > 0) {
+      const cleanupCommand = postRunCleanupLines.join('\n');
+      dockerArgs.push('/bin/bash', '-lc', `source /tmp/devcon/init.sh && ${commandString}; status=$?; ${cleanupCommand}; exit $status`);
+    } else {
+      dockerArgs.push('/bin/bash', '-lc', `source /tmp/devcon/init.sh && exec ${commandString}`);
+    }
   } else {
     dockerArgs.push(...commandArgs);
   }
@@ -1264,6 +1643,14 @@ async function main(): Promise<void> {
 
   if (options.toolName === 'run') {
     ensureDockerAvailable();
+    const consciousRuntime = options.conscious
+      ? prepareConsciousRuntime(cwd, options.toolArgs, options.consciousStatePath)
+      : undefined;
+    if (consciousRuntime) {
+      console.log(`Conscious mode enabled (state: ${consciousRuntime.stateDir})`);
+      console.log(`Seed retrieval query: "${consciousRuntime.seedQuery}"`);
+      console.log(`MCP debug log: ${consciousRuntime.mcpLogHostPath}`);
+    }
     const image = options.imageOverride ?? DEFAULT_IMAGE_TAG;
     await ensureImageAvailable(image, image === DEFAULT_IMAGE_TAG ? DEFAULT_AUTO_BUILD : undefined);
     const networkHost = await maybeEnableHostNetwork(image, options.networkHost, options.dryRun);
@@ -1285,6 +1672,7 @@ async function main(): Promise<void> {
       tempGit: options.tempGit,
       forceIpv4: options.forceIpv4,
       networkHost,
+      conscious: consciousRuntime,
     });
 
     if (options.dryRun) {
@@ -1302,6 +1690,10 @@ async function main(): Promise<void> {
     process.on('SIGTERM', terminate);
 
     child.on('exit', (code) => {
+      const captured = maybeCaptureConsciousLearning(consciousRuntime, cwd, code);
+      if (captured) {
+        console.log(`Conscious mode captured finding ${captured.id}`);
+      }
       cleanup();
       process.exit(code ?? 1);
     });
@@ -1323,6 +1715,15 @@ async function main(): Promise<void> {
 
   ensureDockerAvailable();
 
+  const consciousRuntime = options.conscious
+    ? prepareConsciousRuntime(cwd, options.toolArgs, options.consciousStatePath)
+    : undefined;
+  if (consciousRuntime) {
+    console.log(`Conscious mode enabled (state: ${consciousRuntime.stateDir})`);
+    console.log(`Seed retrieval query: "${consciousRuntime.seedQuery}"`);
+    console.log(`MCP debug log: ${consciousRuntime.mcpLogHostPath}`);
+  }
+
   console.log(`Preparing to launch tool "${options.toolName}" using image "${tool.image}"...`);
 
   const image = options.imageOverride ?? tool.image;
@@ -1340,6 +1741,7 @@ async function main(): Promise<void> {
     tempGit: options.tempGit,
     forceIpv4: options.forceIpv4,
     networkHost,
+    conscious: consciousRuntime,
   });
 
   if (options.dryRun) {
@@ -1363,6 +1765,10 @@ async function main(): Promise<void> {
       } catch (error) {
         console.warn('Failed to export patch from temp git repo:', error instanceof Error ? error.message : error);
       }
+    }
+    const captured = maybeCaptureConsciousLearning(consciousRuntime, cwd, code);
+    if (captured) {
+      console.log(`Conscious mode captured finding ${captured.id}`);
     }
     cleanup();
     process.exit(code ?? 1);

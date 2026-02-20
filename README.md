@@ -10,6 +10,7 @@
 - Hide `.env*`, `.git-credentials`, and other critical Git metadata from the container by overlaying empty bind mounts before the container starts.
 - Detect when the default `devcon:latest` docker image is missing and (after a `y` confirmation) build it automatically from `docker/devcon/Dockerfile`.
 - Provide a simple tool registry (`codex`, `claude` by default) allowing you to define which Docker image and command should run for each agent.
+- Optional `--conscious` mode that boots a persistent local archive and wires memory tools into Codex/Claude via MCP.
 
 ## Installation
 
@@ -40,6 +41,7 @@ devcon skip-scan list          # show skip-scan directories (defaults + custom)
 devcon skip-scan add .cache    # add a directory name to skip during scans
 devcon skip-scan remove .cache
 devcon run --with-git -- ls    # open an interactive shell (default image) and run a command
+devcon --conscious codex       # enable persistent archive memory for this run
 ```
 
 Examples:
@@ -47,6 +49,9 @@ Examples:
 ```bash
 # Show the docker command without running it
 devcon codex --dry-run
+
+# Enable conscious mode (archive memory + MCP tools)
+devcon --conscious codex
 
 # Launch Claude Code but keep your home directory out of the container
 devcon claude --no-home
@@ -74,6 +79,8 @@ Useful flags (place before `--` that separates devcon flags from tool args):
 - `--export-patch[=PATH]` – With `--temp-git`, export patches after the run to PATH (or `.devcon/drafts/<timestamp>.patch`).
 - `--network-host` / `-network-host` – Use host networking (often required on VPNs that block Docker bridge DNS/NAT).
 - `--ipv4` / `-ipv4` – Force IPv4-only networking by disabling IPv6 inside the container.
+- `--conscious` / `-conscious` – Enable conscious mode (persistent archive + MCP memory tools).
+- `--conscious-path PATH` – Override conscious state directory (defaults to `~/.config/devcon/conscious`).
 - `--help` / `--list` – Show usage plus the registered tools.
 - Startup preflight: when bridge networking cannot resolve `api.openai.com` but host networking can, Devcon prompts to switch this run to `--network-host`.
 - Startup preflight timeout defaults to 2500ms per probe and can be adjusted with `DEVCON_NETWORK_PROBE_TIMEOUT_MS`.
@@ -84,6 +91,27 @@ Pass tool arguments after `--` so they are not parsed by devcon. Examples:
 devcon codex --with-git -- git status
 devcon codex -- --dry-run "my prompt"
 ```
+
+## Conscious mode (`--conscious`)
+
+`devcon --conscious <tool>` performs an idempotent bootstrap on startup:
+
+- Creates state under `~/.config/devcon/conscious` (or `--conscious-path`).
+- Initializes archive storage (`archive-db.json`) if missing.
+- Generates a per-session retrieval snapshot under `sessions/`.
+- Mounts a local MCP server into the container and auto-registers it for Codex/Claude as `devcon-archive`.
+- Removes that MCP registration again when the CLI process exits to avoid stale config drift.
+
+MCP tools exposed in conscious mode:
+
+- `archive_search`
+- `archive_write`
+- `archive_mark_used`
+
+Automatic behavior:
+
+- Pre-launch retrieval seed runs automatically from the current task args/repo context.
+- On successful runs, if the workspace started clean and now contains git changes, Devcon auto-captures a low-confidence finding into the archive (heuristic learning capture).
 
 ## Default image (`devcon:latest`)
 
