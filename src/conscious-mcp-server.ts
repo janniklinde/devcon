@@ -1,6 +1,11 @@
 #!/usr/bin/env node
-import { ConsciousArchiveStore, bootstrapConsciousPaths, resolveConsciousPaths } from './conscious-archive';
 import { appendFileSync } from 'fs';
+import { randomBytes } from 'crypto';
+import {
+  ConsciousArchiveStore,
+  bootstrapConsciousPaths,
+  resolveConsciousPaths,
+} from './conscious-archive';
 
 interface JsonRpcRequest {
   jsonrpc: '2.0';
@@ -25,6 +30,8 @@ interface JsonRpcResponse {
 interface RuntimeConfig {
   stateDir: string;
   defaultRepo?: string;
+  projectId?: string;
+  projectName?: string;
   debugLogPath?: string;
 }
 
@@ -33,9 +40,13 @@ const SUPPORTED_PROTOCOL_VERSIONS = [
   '2024-11-05',
 ];
 
+const OVERVIEW_TOKEN_TTL_MS = 10 * 60 * 1000;
+
 function parseArgs(argv: string[]): RuntimeConfig {
   let stateDir = process.env.DEVCON_CONSCIOUS_STATE_DIR;
   let defaultRepo = process.env.DEVCON_CONSCIOUS_REPO;
+  let projectId = process.env.DEVCON_CONSCIOUS_PROJECT_ID;
+  let projectName = process.env.DEVCON_CONSCIOUS_PROJECT_NAME;
   let debugLogPath = process.env.DEVCON_CONSCIOUS_DEBUG_LOG;
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -64,6 +75,33 @@ function parseArgs(argv: string[]): RuntimeConfig {
       }
       defaultRepo = next;
       i += 1;
+      continue;
+    }
+    if (arg.startsWith('--project-id=')) {
+      projectId = arg.slice('--project-id='.length);
+      continue;
+    }
+    if (arg === '--project-id') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--project-id requires a value.');
+      }
+      projectId = next;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--project-name=')) {
+      projectName = arg.slice('--project-name='.length);
+      continue;
+    }
+    if (arg === '--project-name') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--project-name requires a value.');
+      }
+      projectName = next;
+      i += 1;
+      continue;
     }
     if (arg.startsWith('--debug-log=')) {
       debugLogPath = arg.slice('--debug-log='.length);
@@ -76,6 +114,7 @@ function parseArgs(argv: string[]): RuntimeConfig {
       }
       debugLogPath = next;
       i += 1;
+      continue;
     }
   }
 
@@ -86,6 +125,8 @@ function parseArgs(argv: string[]): RuntimeConfig {
   return {
     stateDir,
     defaultRepo,
+    projectId,
+    projectName,
     debugLogPath,
   };
 }
@@ -96,14 +137,21 @@ class StdioJsonRpcServer {
   private readonly config: RuntimeConfig;
 
   private buffer: Buffer = Buffer.alloc(0);
+
   private framingMode: 'unknown' | 'content-length' | 'ndjson' = 'unknown';
+
+  private activeOverviewToken?: {
+    token: string;
+    taxonomyVersion: number;
+    issuedAt: number;
+  };
 
   constructor(config: RuntimeConfig) {
     this.config = config;
     const paths = resolveConsciousPaths(config.stateDir);
     this.archive = new ConsciousArchiveStore(paths.dbPath);
     this.archive.ensureInitialized();
-    this.log(`starting server (repo=${config.defaultRepo ?? 'unset'})`);
+    this.log(`starting server (repo=${config.defaultRepo ?? 'unset'}, project=${this.projectScopeLabel()})`);
   }
 
   start(): void {
@@ -311,7 +359,7 @@ class StdioJsonRpcServer {
         protocolVersion,
         serverInfo: {
           name: 'devcon-archive',
-          version: '0.1.0',
+          version: '0.3.0',
         },
         capabilities: {
           tools: {
@@ -333,8 +381,32 @@ class StdioJsonRpcServer {
       return {
         tools: [
           {
+            name: 'archive_overview',
+            description: 'Session bootstrap tool. Call this first (before archive_search/archive_write/archive_create_path) to fetch current folder/label taxonomy and an overview token. Storage is already scoped to this project, so do not create project-name wrapper folders.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                depth: { type: 'integer', minimum: 1, maximum: 8, default: 4 },
+              },
+            },
+          },
+          {
+            name: 'archive_create_path',
+            description: 'Create a new folder path under an existing parent after archive_overview. Use only when no existing path matches. Storage is project-local; avoid redundant project-name path segments.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                overview_token: { type: 'string' },
+                parent_path_id: { type: 'string' },
+                name: { type: 'string' },
+                description: { type: 'string' },
+              },
+              required: ['overview_token', 'name'],
+            },
+          },
+          {
             name: 'archive_search',
-            description: 'Search historical findings captured from prior sessions.',
+            description: 'Search historical findings by text, path prefix, and labels. Requires archive_overview once per session first so path/label choices follow current taxonomy.',
             inputSchema: {
               type: 'object',
               properties: {
@@ -342,19 +414,30 @@ class StdioJsonRpcServer {
                 repo: { type: 'string' },
                 top_k: { type: 'integer', minimum: 1, maximum: 25, default: 5 },
                 min_confidence: { type: 'number', minimum: 0, maximum: 1, default: 0.3 },
+                path_prefix: { type: 'string' },
+                labels_any: {
+                  type: 'array',
+                  items: { type: 'string' },
+                },
+                labels_all: {
+                  type: 'array',
+                  items: { type: 'string' },
+                },
               },
               required: ['query'],
             },
           },
           {
             name: 'archive_write',
-            description: 'Persist a durable finding (problem -> solution) for future retrieval.',
+            description: 'Persist a durable finding in the existing taxonomy. Call archive_overview first, then pass overview_token + path_id. Storage is project-local; do not add project-name wrapper folders. Store user preferences under /user/preferences with label user-preference.',
             inputSchema: {
               type: 'object',
               properties: {
+                overview_token: { type: 'string' },
                 repo: { type: 'string' },
                 branch: { type: 'string' },
                 commit_sha: { type: 'string' },
+                path_id: { type: 'string' },
                 summary: { type: 'string' },
                 problem: { type: 'string' },
                 solution: { type: 'string' },
@@ -362,7 +445,7 @@ class StdioJsonRpcServer {
                   type: 'array',
                   items: { type: 'string' },
                 },
-                tags: {
+                labels: {
                   type: 'array',
                   items: { type: 'string' },
                 },
@@ -370,7 +453,7 @@ class StdioJsonRpcServer {
                 ttl_days: { type: 'integer', minimum: 1, default: 180 },
                 source: { type: 'string' },
               },
-              required: ['summary', 'problem', 'solution'],
+              required: ['overview_token', 'path_id', 'summary', 'problem', 'solution'],
             },
           },
           {
@@ -400,6 +483,12 @@ class StdioJsonRpcServer {
         throw new Error('tools/call missing tool name.');
       }
 
+      if (name === 'archive_overview') {
+        return this.handleArchiveOverview();
+      }
+      if (name === 'archive_create_path') {
+        return this.handleArchiveCreatePath(args);
+      }
       if (name === 'archive_search') {
         return this.handleArchiveSearch(args);
       }
@@ -416,37 +505,92 @@ class StdioJsonRpcServer {
     throw new Error(`Method not found: ${method}`);
   }
 
-  private parseRequestedProtocolVersion(params: unknown): string | undefined {
-    const candidate = (params as { protocolVersion?: unknown } | undefined)?.protocolVersion;
-    if (typeof candidate !== 'string') {
-      return undefined;
+  private handleArchiveOverview(): unknown {
+    const overview = this.archive.getOverviewSnapshot();
+    const overviewToken = this.issueOverviewToken(overview.taxonomyVersion);
+
+    const topLabels = overview.labels.slice(0, 8).map((entry) => `${entry.label}(${entry.count})`).join(', ');
+    const pathCount = overview.paths.length;
+    const labelText = topLabels.length > 0 ? topLabels : '(none yet)';
+    const text = `Overview ready for ${this.projectScopeLabel()}. paths=${pathCount}, taxonomy_version=${overview.taxonomyVersion}, labels=${labelText}. Storage is project-local; avoid project-name wrapper folders. Use overview_token with archive_write/archive_create_path.`;
+
+    return {
+      content: [{ type: 'text', text }],
+      structuredContent: {
+        overview_token: overviewToken,
+        taxonomy_version: overview.taxonomyVersion,
+        project_scope: {
+          project_id: this.config.projectId,
+          project_name: this.config.projectName,
+        },
+        paths: overview.paths,
+        path_tree: overview.pathTree,
+        labels: overview.labels,
+      },
+      isError: false,
+    };
+  }
+
+  private handleArchiveCreatePath(args: Record<string, unknown>): unknown {
+    const token = this.readString(args.overview_token, 'archive_create_path requires overview_token.');
+    const tokenState = this.validateOverviewToken(token);
+    const name = this.readString(args.name, 'archive_create_path requires name.');
+    const parentPathId = typeof args.parent_path_id === 'string' ? args.parent_path_id : undefined;
+
+    const result = this.archive.createPath({
+      name,
+      parentPathId,
+      description: typeof args.description === 'string' ? args.description : undefined,
+    });
+
+    let nextToken = token;
+    if (result.taxonomyVersion !== tokenState.taxonomyVersion) {
+      nextToken = this.issueOverviewToken(result.taxonomyVersion);
     }
-    if (SUPPORTED_PROTOCOL_VERSIONS.includes(candidate)) {
-      return candidate;
-    }
-    return SUPPORTED_PROTOCOL_VERSIONS[0];
+
+    return {
+      content: [{ type: 'text', text: result.created ? `Created path ${result.path.fullPath}` : `Path already exists: ${result.path.fullPath}` }],
+      structuredContent: {
+        created: result.created,
+        path: result.path,
+        taxonomy_version: result.taxonomyVersion,
+        overview_token: nextToken,
+      },
+      isError: false,
+    };
   }
 
   private handleArchiveSearch(args: Record<string, unknown>): unknown {
+    if (!this.activeOverviewToken) {
+      throw new Error('Call archive_overview once at session start before archive_search.');
+    }
+
     const query = typeof args.query === 'string' ? args.query : '';
     if (!query.trim()) {
       throw new Error('archive_search requires a non-empty query.');
     }
+
     const repo = typeof args.repo === 'string' ? args.repo : this.config.defaultRepo;
     const topK = typeof args.top_k === 'number' ? args.top_k : 5;
     const minConfidence = typeof args.min_confidence === 'number' ? args.min_confidence : 0.3;
+    const pathPrefix = typeof args.path_prefix === 'string' ? args.path_prefix : undefined;
+    const labelsAny = Array.isArray(args.labels_any) ? args.labels_any.filter((entry): entry is string => typeof entry === 'string') : [];
+    const labelsAll = Array.isArray(args.labels_all) ? args.labels_all.filter((entry): entry is string => typeof entry === 'string') : [];
 
     const hits = this.archive.search({
       query,
       repo,
       topK,
       minConfidence,
+      pathPrefix,
+      labelsAny,
+      labelsAll,
     });
 
     const text = hits.length === 0
       ? 'No prior findings matched the query.'
       : hits
-        .map((hit, index) => `${index + 1}. [${hit.id}] ${hit.summary} (confidence=${hit.confidence.toFixed(2)}, score=${hit.score.toFixed(2)})`)
+        .map((hit, index) => `${index + 1}. [${hit.id}] ${hit.summary} (path=${hit.path}, confidence=${hit.confidence.toFixed(2)}, score=${hit.score.toFixed(2)})`)
         .join('\n');
 
     return {
@@ -454,6 +598,11 @@ class StdioJsonRpcServer {
       structuredContent: {
         query,
         repo,
+        project_id: this.config.projectId,
+        project_name: this.config.projectName,
+        path_prefix: pathPrefix,
+        labels_any: labelsAny,
+        labels_all: labelsAll,
         results: hits,
       },
       isError: false,
@@ -461,45 +610,48 @@ class StdioJsonRpcServer {
   }
 
   private handleArchiveWrite(args: Record<string, unknown>): unknown {
+    const token = this.readString(args.overview_token, 'archive_write requires overview_token from archive_overview.');
+    this.validateOverviewToken(token);
+
     const repo = typeof args.repo === 'string' ? args.repo : this.config.defaultRepo;
     if (!repo) {
       throw new Error('archive_write requires repo (or server default repo).');
     }
 
-    const summary = typeof args.summary === 'string' ? args.summary : '';
-    const problem = typeof args.problem === 'string' ? args.problem : '';
-    const solution = typeof args.solution === 'string' ? args.solution : '';
-    if (!summary.trim() || !problem.trim() || !solution.trim()) {
-      throw new Error('archive_write requires summary, problem, and solution.');
-    }
+    const pathId = this.readString(args.path_id, 'archive_write requires path_id from archive_overview.');
+    const summary = this.readString(args.summary, 'archive_write requires summary.');
+    const problem = this.readString(args.problem, 'archive_write requires problem.');
+    const solution = this.readString(args.solution, 'archive_write requires solution.');
+
+    const labels = Array.isArray(args.labels)
+      ? args.labels.filter((entry): entry is string => typeof entry === 'string')
+      : [];
 
     const record = this.archive.write({
       repo,
       branch: typeof args.branch === 'string' ? args.branch : undefined,
       commitSha: typeof args.commit_sha === 'string' ? args.commit_sha : undefined,
+      pathId,
       summary,
       problem,
       solution,
       evidence: Array.isArray(args.evidence) ? args.evidence.filter((entry): entry is string => typeof entry === 'string') : [],
-      tags: Array.isArray(args.tags) ? args.tags.filter((entry): entry is string => typeof entry === 'string') : [],
+      labels,
       confidence: typeof args.confidence === 'number' ? args.confidence : 0.6,
       ttlDays: typeof args.ttl_days === 'number' ? args.ttl_days : 180,
       source: typeof args.source === 'string' ? args.source : 'mcp',
     });
 
     return {
-      content: [{ type: 'text', text: `Stored finding ${record.id}` }],
+      content: [{ type: 'text', text: `Stored finding ${record.id} in ${record.path}` }],
       structuredContent: record,
       isError: false,
     };
   }
 
   private handleArchiveMarkUsed(args: Record<string, unknown>): unknown {
-    const id = typeof args.id === 'string' ? args.id : '';
+    const id = this.readString(args.id, 'archive_mark_used requires id.');
     const outcome = typeof args.outcome === 'string' ? args.outcome : '';
-    if (!id) {
-      throw new Error('archive_mark_used requires id.');
-    }
     if (outcome !== 'helpful' && outcome !== 'not_helpful' && outcome !== 'unknown') {
       throw new Error('archive_mark_used requires outcome in {helpful, not_helpful, unknown}.');
     }
@@ -515,6 +667,55 @@ class StdioJsonRpcServer {
       },
       isError: false,
     };
+  }
+
+  private parseRequestedProtocolVersion(params: unknown): string | undefined {
+    const candidate = (params as { protocolVersion?: unknown } | undefined)?.protocolVersion;
+    if (typeof candidate !== 'string') {
+      return undefined;
+    }
+    if (SUPPORTED_PROTOCOL_VERSIONS.includes(candidate)) {
+      return candidate;
+    }
+    return SUPPORTED_PROTOCOL_VERSIONS[0];
+  }
+
+  private issueOverviewToken(taxonomyVersion: number): string {
+    const token = `ov_${Date.now().toString(36)}_${randomBytes(4).toString('hex')}`;
+    this.activeOverviewToken = {
+      token,
+      taxonomyVersion,
+      issuedAt: Date.now(),
+    };
+    return token;
+  }
+
+  private validateOverviewToken(token: string): { token: string; taxonomyVersion: number; issuedAt: number } {
+    if (!this.activeOverviewToken) {
+      throw new Error('Call archive_overview before archive_write or archive_create_path.');
+    }
+
+    if (this.activeOverviewToken.token !== token) {
+      throw new Error('Stale overview_token. Call archive_overview again.');
+    }
+
+    if ((Date.now() - this.activeOverviewToken.issuedAt) > OVERVIEW_TOKEN_TTL_MS) {
+      throw new Error('overview_token expired. Call archive_overview again.');
+    }
+
+    const currentTaxonomyVersion = this.archive.getTaxonomyVersion();
+    if (currentTaxonomyVersion !== this.activeOverviewToken.taxonomyVersion) {
+      throw new Error('Taxonomy changed since overview fetch. Call archive_overview again.');
+    }
+
+    return this.activeOverviewToken;
+  }
+
+  private readString(value: unknown, message: string): string {
+    if (typeof value !== 'string' || value.trim().length === 0) {
+      throw new Error(message);
+    }
+    return value.trim();
   }
 
   private send(payload: JsonRpcResponse): void {
@@ -539,6 +740,21 @@ class StdioJsonRpcServer {
     });
   }
 
+  private projectScopeLabel(): string {
+    const name = this.config.projectName?.trim();
+    const id = this.config.projectId?.trim();
+    if (name && id) {
+      return `${name} [${id}]`;
+    }
+    if (name) {
+      return name;
+    }
+    if (id) {
+      return id;
+    }
+    return 'project-local scope';
+  }
+
   private log(message: string): void {
     const line = `[devcon-archive-mcp] ${message}\n`;
     process.stderr.write(line);
@@ -546,7 +762,7 @@ class StdioJsonRpcServer {
       try {
         appendFileSync(this.config.debugLogPath, line, 'utf8');
       } catch {
-        // Ignore debug log write failures; stderr already contains context.
+        // ignore debug log write failures
       }
     }
   }

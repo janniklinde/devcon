@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn, spawnSync, SpawnOptionsWithoutStdio } from 'child_process';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import {
   existsSync,
   mkdtempSync,
@@ -13,12 +13,14 @@ import {
   readFileSync,
   Dirent,
   mkdirSync,
+  cpSync,
 } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as readline from 'readline';
 import {
   bootstrapConsciousPaths,
+  resolveConsciousPaths,
   ConsciousArchiveStore,
   ArchiveSearchHit,
   ArchiveRecord,
@@ -67,10 +69,17 @@ const CONFIG_PATH = process.env.DEVCON_TOOLS_FILE
 const SENSITIVE_CONFIG_PATH = path.join(os.homedir(), '.config', 'devcon', 'sensitive.json');
 const SKIP_SCAN_CONFIG_PATH = path.join(os.homedir(), '.config', 'devcon', 'skip-scan.json');
 const CONSCIOUS_ROOT_PATH = path.join(os.homedir(), '.config', 'devcon', 'conscious');
-const CONSCIOUS_CONTAINER_STATE_DIR = '/tmp/devcon/conscious';
-const CONSCIOUS_CONTAINER_MCP_SERVER = '/tmp/devcon/conscious-mcp-server.js';
-const CONSCIOUS_CONTAINER_ARCHIVE_MODULE = '/tmp/devcon/conscious-archive.js';
+const CONSCIOUS_CONTAINER_MCP_CLIENT = '/tmp/devcon/conscious-mcp-tcp-client.js';
+const CONSCIOUS_SIDECAR_SERVER_SCRIPT = '/opt/devcon/conscious-mcp-tcp-server.js';
+const CONSCIOUS_SIDECAR_MCP_SERVER_SCRIPT = '/opt/devcon/conscious-mcp-server.js';
+const CONSCIOUS_SIDECAR_ARCHIVE_MODULE = '/opt/devcon/conscious-archive.js';
+const CONSCIOUS_SIDECAR_STATE_DIR = '/state';
+const CONSCIOUS_SIDECAR_NETWORK = 'devcon-conscious-net';
+const CONSCIOUS_SIDECAR_PORT = parsePositiveIntEnv(process.env.DEVCON_CONSCIOUS_TCP_PORT, 8765);
 const CONSCIOUS_MCP_NAME = 'devcon-archive';
+const CONSCIOUS_PROJECT_ID_RELATIVE_PATH = 'devcon/project-id';
+const CONSCIOUS_PROJECTS_DIRNAME = 'projects';
+const CONSCIOUS_PROJECT_REGISTRY_FILENAME = 'projects.json';
 const WORKSPACE_TARGET = '/workspace';
 const HOME_READONLY_DEFAULT = parseBooleanEnv(process.env.DEVCON_HOME_READONLY);
 const SHARE_HOME_DEFAULT = parseBooleanEnv(process.env.DEVCON_SHARE_HOME);
@@ -279,7 +288,7 @@ function saveSensitivePatterns(patterns: string[]): void {
 
 function parseArgs(argv: string[]): CliOptions {
   const toolArgs: string[] = [];
-  const positional: string[] = [];
+  let toolName: string | undefined;
   let dryRun = false;
   let imageOverride: string | undefined;
   let shareHome = SHARE_HOME_DEFAULT;
@@ -403,12 +412,11 @@ function parseArgs(argv: string[]): CliOptions {
       continue;
     }
 
-    positional.push(arg);
-  }
-
-  const toolName = positional.shift();
-  for (const extra of positional) {
-    toolArgs.push(extra);
+    if (!toolName) {
+      toolName = arg;
+      continue;
+    }
+    toolArgs.push(arg);
   }
 
   return {
@@ -573,22 +581,38 @@ interface GitRepoContext {
 }
 
 interface ConsciousRuntime {
+  projectId: string;
+  projectName: string;
   sessionId: string;
   stateDir: string;
   dbPath: string;
   sessionsDir: string;
   repo: GitRepoContext;
-  containerStateDir: string;
-  containerServerScriptPath: string;
-  containerArchiveModulePath: string;
   hostServerScriptPath: string;
   hostArchiveModulePath: string;
+  hostTcpServerScriptPath: string;
+  hostTcpClientScriptPath: string;
+  containerTcpClientPath: string;
   retrievalHostPath: string;
-  retrievalContainerPath: string;
   mcpLogHostPath: string;
-  mcpLogContainerPath: string;
+  sidecarContainerName: string;
+  sidecarNetworkName: string;
+  sidecarHost: string;
+  sidecarPort: number;
   captureSource: string;
   seedQuery: string;
+}
+
+interface ConsciousProjectRegistryEntry {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  linkedRepos: string[];
+}
+
+interface ConsciousProjectRegistry {
+  projects: ConsciousProjectRegistryEntry[];
 }
 
 function getConsciousStateDir(explicitPath: string | undefined, homeDir: string): string {
@@ -602,6 +626,283 @@ function getConsciousStateDir(explicitPath: string | undefined, homeDir: string)
     return path.join(homeDir, explicitPath.slice(2));
   }
   return path.resolve(explicitPath);
+}
+
+function getConsciousRegistryPath(consciousRootDir: string): string {
+  return path.join(consciousRootDir, CONSCIOUS_PROJECT_REGISTRY_FILENAME);
+}
+
+function getConsciousProjectsRoot(consciousRootDir: string): string {
+  return path.join(consciousRootDir, CONSCIOUS_PROJECTS_DIRNAME);
+}
+
+function getConsciousProjectStateDir(consciousRootDir: string, projectId: string): string {
+  return path.join(getConsciousProjectsRoot(consciousRootDir), projectId);
+}
+
+function loadConsciousProjectRegistry(consciousRootDir: string): ConsciousProjectRegistry {
+  const registryPath = getConsciousRegistryPath(consciousRootDir);
+  if (!existsSync(registryPath)) {
+    return { projects: [] };
+  }
+
+  try {
+    const data = JSON.parse(readFileSync(registryPath, 'utf8')) as ConsciousProjectRegistry;
+    if (!data || !Array.isArray(data.projects)) {
+      return { projects: [] };
+    }
+    const projects = data.projects
+      .filter((entry) => entry && typeof entry.id === 'string' && typeof entry.name === 'string')
+      .map((entry) => ({
+        id: entry.id,
+        name: entry.name,
+        createdAt: typeof entry.createdAt === 'string' ? entry.createdAt : new Date().toISOString(),
+        updatedAt: typeof entry.updatedAt === 'string' ? entry.updatedAt : new Date().toISOString(),
+        linkedRepos: Array.isArray(entry.linkedRepos)
+          ? entry.linkedRepos.filter((repo): repo is string => typeof repo === 'string')
+          : [],
+      }));
+    return { projects };
+  } catch {
+    return { projects: [] };
+  }
+}
+
+function saveConsciousProjectRegistry(consciousRootDir: string, registry: ConsciousProjectRegistry): void {
+  mkdirSync(consciousRootDir, { recursive: true });
+  mkdirSync(getConsciousProjectsRoot(consciousRootDir), { recursive: true });
+  const registryPath = getConsciousRegistryPath(consciousRootDir);
+  writeFileSync(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+}
+
+function generateConsciousProjectId(): string {
+  return `proj_${Date.now().toString(36)}_${randomBytes(4).toString('hex')}`;
+}
+
+function upsertConsciousProjectRegistryEntry(
+  consciousRootDir: string,
+  projectId: string,
+  projectName: string,
+  repoHint: string,
+): ConsciousProjectRegistryEntry {
+  const registry = loadConsciousProjectRegistry(consciousRootDir);
+  const now = new Date().toISOString();
+  const existing = registry.projects.find((entry) => entry.id === projectId);
+  if (existing) {
+    existing.name = projectName || existing.name;
+    existing.updatedAt = now;
+    if (!existing.linkedRepos.includes(repoHint)) {
+      existing.linkedRepos.push(repoHint);
+    }
+    saveConsciousProjectRegistry(consciousRootDir, registry);
+    return existing;
+  }
+
+  const created: ConsciousProjectRegistryEntry = {
+    id: projectId,
+    name: projectName,
+    createdAt: now,
+    updatedAt: now,
+    linkedRepos: repoHint ? [repoHint] : [],
+  };
+  registry.projects.push(created);
+  saveConsciousProjectRegistry(consciousRootDir, registry);
+  return created;
+}
+
+function resolveGitPath(cwd: string, relativePath: string): string {
+  const result = spawnSync('git', ['rev-parse', '--git-path', relativePath], {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  if (result.status !== 0 || !result.stdout.trim()) {
+    throw new Error('Unable to resolve git metadata path for conscious project ID.');
+  }
+  return path.resolve(cwd, result.stdout.trim());
+}
+
+function readConsciousProjectIdFromGit(cwd: string): string | undefined {
+  try {
+    const projectIdPath = resolveGitPath(cwd, CONSCIOUS_PROJECT_ID_RELATIVE_PATH);
+    if (!existsSync(projectIdPath)) {
+      return undefined;
+    }
+    const value = readFileSync(projectIdPath, 'utf8').trim();
+    return value.length > 0 ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeConsciousProjectIdToGit(cwd: string, projectId: string): void {
+  const projectIdPath = resolveGitPath(cwd, CONSCIOUS_PROJECT_ID_RELATIVE_PATH);
+  mkdirSync(path.dirname(projectIdPath), { recursive: true });
+  writeFileSync(projectIdPath, `${projectId}\n`, 'utf8');
+}
+
+function inferDefaultProjectName(cwd: string): string {
+  const base = path.basename(cwd).trim();
+  return base.length > 0 ? base : 'project';
+}
+
+async function promptLine(question: string): Promise<string> {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
+async function chooseExistingProject(
+  projects: ConsciousProjectRegistryEntry[],
+  prompt: string,
+): Promise<ConsciousProjectRegistryEntry> {
+  if (projects.length === 0) {
+    throw new Error('No existing conscious projects are available.');
+  }
+  while (true) {
+    const answer = await promptLine(prompt);
+    const parsed = Number.parseInt(answer, 10);
+    if (Number.isFinite(parsed) && parsed >= 1 && parsed <= projects.length) {
+      return projects[parsed - 1];
+    }
+    console.log(`Please enter a number between 1 and ${projects.length}.`);
+  }
+}
+
+function printExistingConsciousProjects(projects: ConsciousProjectRegistryEntry[]): void {
+  console.log('Existing conscious projects:');
+  if (projects.length === 0) {
+    console.log('  (none)');
+    return;
+  }
+  projects.forEach((entry, index) => {
+    const linkedRepo = entry.linkedRepos[0] ?? '(no repo hint)';
+    console.log(`  ${index + 1}. ${entry.name} [${entry.id}] (${linkedRepo})`);
+  });
+}
+
+function cloneConsciousProjectState(
+  consciousRootDir: string,
+  sourceProjectId: string,
+  targetProjectId: string,
+): void {
+  const sourceDir = getConsciousProjectStateDir(consciousRootDir, sourceProjectId);
+  const targetDir = getConsciousProjectStateDir(consciousRootDir, targetProjectId);
+  if (!existsSync(sourceDir)) {
+    mkdirSync(targetDir, { recursive: true });
+    return;
+  }
+  mkdirSync(path.dirname(targetDir), { recursive: true });
+  cpSync(sourceDir, targetDir, { recursive: true, errorOnExist: true });
+}
+
+function createNewConsciousProject(
+  consciousRootDir: string,
+  cwd: string,
+  repo: GitRepoContext,
+  projectName: string,
+): { projectId: string; projectName: string; projectStateDir: string } {
+  const projectId = generateConsciousProjectId();
+  upsertConsciousProjectRegistryEntry(consciousRootDir, projectId, projectName, repo.repoId);
+  if (repo.isRepo) {
+    writeConsciousProjectIdToGit(cwd, projectId);
+  }
+  return {
+    projectId,
+    projectName,
+    projectStateDir: getConsciousProjectStateDir(consciousRootDir, projectId),
+  };
+}
+
+async function resolveConsciousProject(
+  cwd: string,
+  repo: GitRepoContext,
+  consciousRootDir: string,
+): Promise<{ projectId: string; projectName: string; projectStateDir: string }> {
+  if (!repo.isRepo) {
+    const existingProjectId = `adhoc_${buildStableSuffix(path.resolve(cwd), 16)}`;
+    const projectName = inferDefaultProjectName(cwd);
+    upsertConsciousProjectRegistryEntry(consciousRootDir, existingProjectId, projectName, repo.repoId);
+    return {
+      projectId: existingProjectId,
+      projectName,
+      projectStateDir: getConsciousProjectStateDir(consciousRootDir, existingProjectId),
+    };
+  }
+
+  const existingProjectId = readConsciousProjectIdFromGit(cwd);
+  if (existingProjectId) {
+    const registry = loadConsciousProjectRegistry(consciousRootDir);
+    const existing = registry.projects.find((entry) => entry.id === existingProjectId);
+    const projectName = existing?.name ?? inferDefaultProjectName(cwd);
+    upsertConsciousProjectRegistryEntry(consciousRootDir, existingProjectId, projectName, repo.repoId);
+    return {
+      projectId: existingProjectId,
+      projectName,
+      projectStateDir: getConsciousProjectStateDir(consciousRootDir, existingProjectId),
+    };
+  }
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error('Conscious mode needs an interactive terminal the first time in a repository to choose a project identity.');
+  }
+
+  const registry = loadConsciousProjectRegistry(consciousRootDir);
+  const existingProjects = registry.projects.slice().sort((a, b) => a.name.localeCompare(b.name));
+  const defaultName = inferDefaultProjectName(cwd);
+
+  console.log('\nNo conscious project identifier found for this repository.');
+  printExistingConsciousProjects(existingProjects);
+  if (existingProjects.length === 0) {
+    const nameInput = await promptLine(`Project name [${defaultName}]: `);
+    return createNewConsciousProject(consciousRootDir, cwd, repo, nameInput || defaultName);
+  }
+
+  console.log('\nChoose how to initialize conscious memory:');
+  console.log('  1) Create new project');
+  console.log('  2) Link to existing project');
+  console.log('  3) Clone existing project into a new project');
+
+  let mode = '';
+  while (!['1', '2', '3'].includes(mode)) {
+    mode = await promptLine('Selection [1-3]: ');
+  }
+
+  if (mode === '1') {
+    const nameInput = await promptLine(`Project name [${defaultName}]: `);
+    return createNewConsciousProject(consciousRootDir, cwd, repo, nameInput || defaultName);
+  }
+
+  if (mode === '2') {
+    const selected = await chooseExistingProject(existingProjects, 'Existing project number: ');
+    upsertConsciousProjectRegistryEntry(consciousRootDir, selected.id, selected.name, repo.repoId);
+    writeConsciousProjectIdToGit(cwd, selected.id);
+    return {
+      projectId: selected.id,
+      projectName: selected.name,
+      projectStateDir: getConsciousProjectStateDir(consciousRootDir, selected.id),
+    };
+  }
+
+  const source = await chooseExistingProject(existingProjects, 'Project number to clone: ');
+  const nameInput = await promptLine(`New project name [${defaultName}]: `);
+  const projectName = nameInput || `${defaultName}-fork`;
+  const projectId = generateConsciousProjectId();
+  cloneConsciousProjectState(consciousRootDir, source.id, projectId);
+  upsertConsciousProjectRegistryEntry(consciousRootDir, projectId, projectName, repo.repoId);
+  writeConsciousProjectIdToGit(cwd, projectId);
+  return {
+    projectId,
+    projectName,
+    projectStateDir: getConsciousProjectStateDir(consciousRootDir, projectId),
+  };
 }
 
 function generateSessionId(): string {
@@ -647,21 +948,46 @@ function deriveConsciousQuery(toolArgs: string[], cwd: string): string {
   return `working in ${path.basename(cwd)}`;
 }
 
-function formatRetrievalMarkdown(hits: ArchiveSearchHit[]): string {
-  if (hits.length === 0) {
-    return '# Relevant prior findings\n\nNo prior findings matched this launch context.\n';
-  }
+function formatRetrievalMarkdown(
+  hits: ArchiveSearchHit[],
+  taxonomy: { paths: { fullPath: string }[]; labels: { label: string; count: number }[] },
+): string {
   const lines: string[] = ['# Relevant prior findings', ''];
-  hits.forEach((hit, index) => {
-    lines.push(`${index + 1}. ${hit.summary}`);
-    lines.push(`   - id: ${hit.id}`);
-    lines.push(`   - confidence: ${hit.confidence.toFixed(2)} | score: ${hit.score.toFixed(2)}`);
-    if (hit.tags.length > 0) {
-      lines.push(`   - tags: ${hit.tags.join(', ')}`);
-    }
-    lines.push(`   - problem: ${hit.problem}`);
-    lines.push(`   - solution: ${hit.solution}`);
-  });
+  if (hits.length === 0) {
+    lines.push('No prior findings matched this launch context.');
+  } else {
+    hits.forEach((hit, index) => {
+      lines.push(`${index + 1}. ${hit.summary}`);
+      lines.push(`   - id: ${hit.id}`);
+      lines.push(`   - path: ${hit.path}`);
+      lines.push(`   - confidence: ${hit.confidence.toFixed(2)} | score: ${hit.score.toFixed(2)}`);
+      if (hit.labels.length > 0) {
+        lines.push(`   - labels: ${hit.labels.join(', ')}`);
+      }
+      lines.push(`   - problem: ${hit.problem}`);
+      lines.push(`   - solution: ${hit.solution}`);
+    });
+  }
+
+  lines.push('');
+  lines.push('# Memory taxonomy');
+  lines.push('');
+  lines.push('Session bootstrap: call `archive_overview` before other archive tools so path/label choices match current taxonomy.');
+  lines.push('Storage is already project-local for this repo. Do not create project-name wrapper folders like `engineering/<project-name>`.');
+  lines.push('Use existing `path_id` values whenever possible; only create new paths when no existing one fits.');
+  lines.push('');
+  lines.push('Known paths:');
+  taxonomy.paths
+    .slice()
+    .sort((a, b) => a.fullPath.localeCompare(b.fullPath))
+    .forEach((entry) => lines.push(`- ${entry.fullPath}`));
+  lines.push('');
+  lines.push('Top labels:');
+  if (taxonomy.labels.length === 0) {
+    lines.push('- (none)');
+  } else {
+    taxonomy.labels.slice(0, 12).forEach((entry) => lines.push(`- ${entry.label} (${entry.count})`));
+  }
   lines.push('');
   return `${lines.join('\n')}\n`;
 }
@@ -682,17 +1008,126 @@ function getConsciousArchiveModulePath(): string {
   throw new Error(`Conscious mode requires ${distPath}. Build devcon first (npm run build).`);
 }
 
-function prepareConsciousRuntime(
+function getConsciousTcpServerPath(): string {
+  const distPath = path.resolve(__dirname, 'conscious-mcp-tcp-server.js');
+  if (existsSync(distPath)) {
+    return distPath;
+  }
+  throw new Error(`Conscious mode requires ${distPath}. Build devcon first (npm run build).`);
+}
+
+function getConsciousTcpClientPath(): string {
+  const distPath = path.resolve(__dirname, 'conscious-mcp-tcp-client.js');
+  if (existsSync(distPath)) {
+    return distPath;
+  }
+  throw new Error(`Conscious mode requires ${distPath}. Build devcon first (npm run build).`);
+}
+
+function buildStableSuffix(input: string, length = 12): string {
+  return createHash('sha1').update(input).digest('hex').slice(0, length);
+}
+
+function getConsciousSidecarImage(): string {
+  return process.env.DEVCON_CONSCIOUS_SIDECAR_IMAGE || DEFAULT_IMAGE_TAG;
+}
+
+function ensureDockerNetwork(name: string): void {
+  const inspect = spawnSync('docker', ['network', 'inspect', name], { stdio: 'ignore' });
+  if (inspect.status === 0) {
+    return;
+  }
+  const create = spawnSync('docker', ['network', 'create', name], { stdio: 'ignore' });
+  if (create.status !== 0) {
+    throw new Error(`Failed to create Docker network "${name}" for conscious sidecar.`);
+  }
+}
+
+function isContainerRunning(name: string): boolean {
+  const ps = spawnSync('docker', ['ps', '--filter', `name=^/${name}$`, '--format', '{{.Names}}'], { encoding: 'utf8' });
+  if (ps.status !== 0) {
+    return false;
+  }
+  return ps.stdout.split('\n').some((line) => line.trim() === name);
+}
+
+function doesContainerExist(name: string): boolean {
+  const ps = spawnSync('docker', ['ps', '-a', '--filter', `name=^/${name}$`, '--format', '{{.Names}}'], { encoding: 'utf8' });
+  if (ps.status !== 0) {
+    return false;
+  }
+  return ps.stdout.split('\n').some((line) => line.trim() === name);
+}
+
+function ensureConsciousSidecar(runtime: ConsciousRuntime, image: string, dryRun: boolean): void {
+  if (dryRun) {
+    return;
+  }
+
+  ensureDockerNetwork(runtime.sidecarNetworkName);
+  if (isContainerRunning(runtime.sidecarContainerName)) {
+    return;
+  }
+
+  if (doesContainerExist(runtime.sidecarContainerName)) {
+    spawnSync('docker', ['rm', '-f', runtime.sidecarContainerName], { stdio: 'ignore' });
+  }
+
+  const sidecarDebugLog = path.join(CONSCIOUS_SIDECAR_STATE_DIR, 'sessions', 'sidecar.log');
+  const runArgs = [
+    'run',
+    '-d',
+    '--name',
+    runtime.sidecarContainerName,
+    '--network',
+    runtime.sidecarNetworkName,
+    '--network-alias',
+    runtime.sidecarHost,
+    '--mount',
+    `type=bind,source=${runtime.stateDir},target=${CONSCIOUS_SIDECAR_STATE_DIR}`,
+    '--mount',
+    `type=bind,source=${runtime.hostServerScriptPath},target=${CONSCIOUS_SIDECAR_MCP_SERVER_SCRIPT},readonly`,
+    '--mount',
+    `type=bind,source=${runtime.hostArchiveModulePath},target=${CONSCIOUS_SIDECAR_ARCHIVE_MODULE},readonly`,
+    '--mount',
+    `type=bind,source=${runtime.hostTcpServerScriptPath},target=${CONSCIOUS_SIDECAR_SERVER_SCRIPT},readonly`,
+    image,
+    'node',
+    CONSCIOUS_SIDECAR_SERVER_SCRIPT,
+    '--state-dir',
+    CONSCIOUS_SIDECAR_STATE_DIR,
+    '--server-script',
+    CONSCIOUS_SIDECAR_MCP_SERVER_SCRIPT,
+    '--port',
+    String(runtime.sidecarPort),
+    '--debug-log',
+    sidecarDebugLog,
+    '--repo',
+    runtime.repo.repoId,
+    '--project-id',
+    runtime.projectId,
+    '--project-name',
+    runtime.projectName,
+  ];
+
+  const run = spawnSync('docker', runArgs, { encoding: 'utf8' });
+  if (run.status !== 0) {
+    throw new Error(`Failed to start conscious sidecar ${runtime.sidecarContainerName}: ${run.stderr || run.stdout || 'unknown docker error'}`);
+  }
+}
+
+async function prepareConsciousRuntime(
   cwd: string,
   toolArgs: string[],
   explicitStatePath: string | undefined,
-): ConsciousRuntime {
-  const stateDir = getConsciousStateDir(explicitStatePath, os.homedir());
-  const paths = bootstrapConsciousPaths(stateDir);
+): Promise<ConsciousRuntime> {
+  const consciousRootDir = getConsciousStateDir(explicitStatePath, os.homedir());
+  const repo = getGitRepoContext(cwd);
+  const project = await resolveConsciousProject(cwd, repo, consciousRootDir);
+  const paths = bootstrapConsciousPaths(project.projectStateDir);
   const archive = new ConsciousArchiveStore(paths.dbPath);
   archive.ensureInitialized();
 
-  const repo = getGitRepoContext(cwd);
   const seedQuery = deriveConsciousQuery(toolArgs, cwd);
   const retrievalHits = archive.search({
     query: seedQuery,
@@ -700,11 +1135,15 @@ function prepareConsciousRuntime(
     topK: 5,
     minConfidence: 0.35,
   });
+  const overview = archive.getOverviewSnapshot();
 
   const sessionId = generateSessionId();
   const retrievalHostPath = path.join(paths.sessionsDir, `${sessionId}.retrieval.md`);
-  writeFileSync(retrievalHostPath, formatRetrievalMarkdown(retrievalHits), 'utf8');
-  const mcpLogHostPath = path.join(paths.sessionsDir, `${sessionId}.mcp.log`);
+  writeFileSync(retrievalHostPath, formatRetrievalMarkdown(retrievalHits, overview), 'utf8');
+  const mcpLogHostPath = path.join(paths.sessionsDir, 'sidecar.log');
+  const sidecarIdentity = buildStableSuffix(`${consciousRootDir}::${project.projectId}`);
+  const sidecarContainerName = `devcon-conscious-${sidecarIdentity}`;
+  const sidecarHost = `devcon-conscious-${sidecarIdentity}`;
 
   const metadataPath = path.join(paths.sessionsDir, `${sessionId}.json`);
   const metadata = {
@@ -712,6 +1151,8 @@ function prepareConsciousRuntime(
     createdAt: new Date().toISOString(),
     seedQuery,
     retrievalCount: retrievalHits.length,
+    projectId: project.projectId,
+    projectName: project.projectName,
     repo: repo.repoId,
     branch: repo.branch,
     commitSha: repo.commitSha,
@@ -720,20 +1161,24 @@ function prepareConsciousRuntime(
   writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
 
   return {
+    projectId: project.projectId,
+    projectName: project.projectName,
     sessionId,
     stateDir: paths.rootDir,
     dbPath: paths.dbPath,
     sessionsDir: paths.sessionsDir,
     repo,
-    containerStateDir: CONSCIOUS_CONTAINER_STATE_DIR,
-    containerServerScriptPath: CONSCIOUS_CONTAINER_MCP_SERVER,
-    containerArchiveModulePath: CONSCIOUS_CONTAINER_ARCHIVE_MODULE,
     hostServerScriptPath: getConsciousServerScriptPath(),
     hostArchiveModulePath: getConsciousArchiveModulePath(),
+    hostTcpServerScriptPath: getConsciousTcpServerPath(),
+    hostTcpClientScriptPath: getConsciousTcpClientPath(),
+    containerTcpClientPath: CONSCIOUS_CONTAINER_MCP_CLIENT,
     retrievalHostPath,
-    retrievalContainerPath: path.join(CONSCIOUS_CONTAINER_STATE_DIR, 'sessions', `${sessionId}.retrieval.md`),
     mcpLogHostPath,
-    mcpLogContainerPath: path.join(CONSCIOUS_CONTAINER_STATE_DIR, 'sessions', `${sessionId}.mcp.log`),
+    sidecarContainerName,
+    sidecarNetworkName: CONSCIOUS_SIDECAR_NETWORK,
+    sidecarHost,
+    sidecarPort: CONSCIOUS_SIDECAR_PORT,
     captureSource: `devcon:auto:${sessionId}`,
     seedQuery,
   };
@@ -831,11 +1276,12 @@ function maybeCaptureConsciousLearning(runtime: ConsciousRuntime | undefined, cw
     repo: runtime.repo.repoId,
     branch: runtime.repo.branch,
     commitSha: runtime.repo.commitSha,
+    pathId: 'path_debugging',
     summary,
     problem,
     solution,
     evidence,
-    tags,
+    labels: [...tags, 'auto-capture'],
     confidence: 0.45,
     ttlDays: 120,
     source: runtime.captureSource,
@@ -984,6 +1430,465 @@ function handleSkipScanCommand(args: string[]): void {
   }
 
   throw new Error(`Unknown "skip-scan" subcommand "${subcommand}". Use list, add, or remove.`);
+}
+
+interface ConsciousProjectStats {
+  dbExists: boolean;
+  findingCount: number;
+  pathCount: number;
+  usageCount: number;
+  sessionCount: number;
+}
+
+interface ConsciousProjectSelector {
+  projectRef?: string;
+  useCurrent: boolean;
+  yes: boolean;
+}
+
+type PathTreeNode = {
+  fullPath: string;
+  children: PathTreeNode[];
+};
+
+function parseConsciousProjectSelector(args: string[]): ConsciousProjectSelector {
+  let projectRef: string | undefined;
+  let positionalProjectRef: string | undefined;
+  let useCurrent = false;
+  let yes = false;
+
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--current') {
+      useCurrent = true;
+      continue;
+    }
+    if (arg === '--yes') {
+      yes = true;
+      continue;
+    }
+    if (arg.startsWith('--project=')) {
+      projectRef = arg.slice('--project='.length);
+      continue;
+    }
+    if (arg.startsWith('--project-id=')) {
+      projectRef = arg.slice('--project-id='.length);
+      continue;
+    }
+    if (arg.startsWith('--project-name=')) {
+      projectRef = arg.slice('--project-name='.length);
+      continue;
+    }
+    if (arg === '--project' || arg === '--project-id') {
+      const next = args[i + 1];
+      if (!next || next.startsWith('-')) {
+        throw new Error(`${arg} requires a project name or identifier value.`);
+      }
+      projectRef = next;
+      i += 1;
+      continue;
+    }
+    if (arg === '--project-name') {
+      const next = args[i + 1];
+      if (!next || next.startsWith('-')) {
+        throw new Error(`${arg} requires a project name value.`);
+      }
+      projectRef = next;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('-')) {
+      throw new Error(`Unknown flag "${arg}" for conscious management command.`);
+    }
+    if (positionalProjectRef) {
+      throw new Error('Only one project reference may be provided.');
+    }
+    positionalProjectRef = arg;
+  }
+
+  if (!projectRef && positionalProjectRef) {
+    projectRef = positionalProjectRef;
+  }
+
+  if (projectRef && useCurrent) {
+    throw new Error('Use either --current or --project, not both.');
+  }
+
+  return {
+    projectRef: projectRef?.trim() || undefined,
+    useCurrent,
+    yes,
+  };
+}
+
+function resolveConsciousProjectReference(
+  registry: ConsciousProjectRegistry,
+  reference: string,
+): ConsciousProjectRegistryEntry | undefined {
+  const ref = reference.trim();
+  if (!ref) {
+    return undefined;
+  }
+
+  const directId = registry.projects.find((entry) => entry.id === ref);
+  if (directId) {
+    return directId;
+  }
+
+  const exactName = registry.projects.filter((entry) => entry.name === ref);
+  if (exactName.length === 1) {
+    return exactName[0];
+  }
+  if (exactName.length > 1) {
+    throw new Error(`Project name "${ref}" is ambiguous. Use an explicit project id.`);
+  }
+
+  const lower = ref.toLowerCase();
+  const caseInsensitiveName = registry.projects.filter((entry) => entry.name.toLowerCase() === lower);
+  if (caseInsensitiveName.length === 1) {
+    return caseInsensitiveName[0];
+  }
+  if (caseInsensitiveName.length > 1) {
+    throw new Error(`Project name "${ref}" is ambiguous. Use an explicit project id.`);
+  }
+
+  const idPrefix = registry.projects.filter((entry) => entry.id.startsWith(ref));
+  if (idPrefix.length === 1) {
+    return idPrefix[0];
+  }
+  if (idPrefix.length > 1) {
+    throw new Error(`Project id prefix "${ref}" is ambiguous. Use a longer id or full project name.`);
+  }
+
+  return undefined;
+}
+
+function readConsciousProjectStats(projectStateDir: string): ConsciousProjectStats {
+  const paths = resolveConsciousPaths(projectStateDir);
+  let findingCount = 0;
+  let pathCount = 0;
+  let usageCount = 0;
+  let sessionCount = 0;
+  const dbExists = existsSync(paths.dbPath);
+
+  if (dbExists) {
+    try {
+      const raw = JSON.parse(readFileSync(paths.dbPath, 'utf8')) as {
+        records?: unknown;
+        paths?: unknown;
+        usage?: unknown;
+      };
+      findingCount = Array.isArray(raw.records) ? raw.records.length : 0;
+      pathCount = Array.isArray(raw.paths) ? raw.paths.length : 0;
+      usageCount = Array.isArray(raw.usage) ? raw.usage.length : 0;
+    } catch {
+      // Ignore malformed db for listing output.
+    }
+  }
+
+  if (existsSync(paths.sessionsDir)) {
+    try {
+      sessionCount = readdirSync(paths.sessionsDir, { withFileTypes: true })
+        .filter((entry) => entry.isFile())
+        .length;
+    } catch {
+      // Ignore unreadable sessions directory.
+    }
+  }
+
+  return {
+    dbExists,
+    findingCount,
+    pathCount,
+    usageCount,
+    sessionCount,
+  };
+}
+
+function printConsciousPathTree(nodes: PathTreeNode[], indent = ''): void {
+  const sorted = [...nodes].sort((a, b) => a.fullPath.localeCompare(b.fullPath));
+  for (const node of sorted) {
+    console.log(`${indent}- ${node.fullPath}`);
+    if (node.children.length > 0) {
+      printConsciousPathTree(node.children, `${indent}  `);
+    }
+  }
+}
+
+function stopConsciousSidecarForProject(consciousRootDir: string, projectId: string): boolean {
+  const sidecarIdentity = buildStableSuffix(`${consciousRootDir}::${projectId}`);
+  const sidecarContainerName = `devcon-conscious-${sidecarIdentity}`;
+  if (!doesContainerExist(sidecarContainerName)) {
+    return false;
+  }
+  spawnSync('docker', ['rm', '-f', sidecarContainerName], { stdio: 'ignore' });
+  return true;
+}
+
+function stopAllConsciousSidecars(): number {
+  const list = spawnSync(
+    'docker',
+    ['ps', '-a', '--filter', 'name=^/devcon-conscious-', '--format', '{{.Names}}'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+  );
+  if (list.status !== 0) {
+    return 0;
+  }
+  const names = list.stdout
+    .split('\n')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  for (const name of names) {
+    spawnSync('docker', ['rm', '-f', name], { stdio: 'ignore' });
+  }
+  return names.length;
+}
+
+async function confirmConsciousDestructiveAction(message: string, yes: boolean): Promise<boolean> {
+  if (yes) {
+    return true;
+  }
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error(`${message} Refusing to continue without --yes in non-interactive mode.`);
+  }
+  return promptYesNo(`${message} Continue? [y/N] `);
+}
+
+function printConsciousProjectList(cwd: string, consciousRootDir: string): void {
+  const registry = loadConsciousProjectRegistry(consciousRootDir);
+  const currentProjectId = readConsciousProjectIdFromGit(cwd);
+
+  console.log(`Conscious root: ${consciousRootDir}`);
+  if (currentProjectId) {
+    console.log(`Current repository project id: ${currentProjectId}`);
+  } else {
+    console.log('Current repository project id: (not set)');
+  }
+
+  if (registry.projects.length === 0) {
+    console.log('\nRegistered projects: (none)');
+    return;
+  }
+
+  console.log('\nRegistered projects:');
+  const sorted = registry.projects.slice().sort((a, b) => a.name.localeCompare(b.name));
+  for (const entry of sorted) {
+    const stateDir = getConsciousProjectStateDir(consciousRootDir, entry.id);
+    const stats = readConsciousProjectStats(stateDir);
+    const marker = entry.id === currentProjectId ? '*' : ' ';
+    console.log(`${marker} ${entry.name} [${entry.id}]`);
+    console.log(`    state=${stateDir}`);
+    console.log(`    findings=${stats.findingCount} paths=${stats.pathCount} usage=${stats.usageCount} session_files=${stats.sessionCount}`);
+    if (entry.linkedRepos.length > 0) {
+      console.log(`    repos=${entry.linkedRepos.join(', ')}`);
+    }
+  }
+}
+
+function resolveProjectForInspection(
+  cwd: string,
+  consciousRootDir: string,
+  selector: ConsciousProjectSelector,
+): { projectId: string; projectName: string; stateDir: string } {
+  const registry = loadConsciousProjectRegistry(consciousRootDir);
+  const currentProjectId = readConsciousProjectIdFromGit(cwd);
+
+  if (selector.projectRef) {
+    const matched = resolveConsciousProjectReference(registry, selector.projectRef);
+    if (matched) {
+      return {
+        projectId: matched.id,
+        projectName: matched.name,
+        stateDir: getConsciousProjectStateDir(consciousRootDir, matched.id),
+      };
+    }
+    const fallbackStateDir = getConsciousProjectStateDir(consciousRootDir, selector.projectRef);
+    if (existsSync(fallbackStateDir)) {
+      return {
+        projectId: selector.projectRef,
+        projectName: selector.projectRef,
+        stateDir: fallbackStateDir,
+      };
+    }
+    throw new Error(`Unknown project "${selector.projectRef}". Run "devcon conscious list" to see valid project names/ids.`);
+  }
+
+  let projectId = selector.useCurrent ? currentProjectId : undefined;
+  if (!projectId && currentProjectId) {
+    projectId = currentProjectId;
+  }
+  if (!projectId && registry.projects.length === 1) {
+    projectId = registry.projects[0].id;
+  }
+  if (!projectId) {
+    throw new Error('Unable to resolve target project. Use --project <name-or-id> or --current.');
+  }
+
+  const known = resolveConsciousProjectReference(registry, projectId);
+  return {
+    projectId,
+    projectName: known?.name ?? projectId,
+    stateDir: getConsciousProjectStateDir(consciousRootDir, projectId),
+  };
+}
+
+function resolveProjectForWipe(
+  cwd: string,
+  consciousRootDir: string,
+  selector: ConsciousProjectSelector,
+): { projectId: string; projectName: string; stateDir: string } {
+  const registry = loadConsciousProjectRegistry(consciousRootDir);
+  const currentProjectId = readConsciousProjectIdFromGit(cwd);
+
+  if (selector.projectRef) {
+    const matched = resolveConsciousProjectReference(registry, selector.projectRef);
+    if (matched) {
+      return {
+        projectId: matched.id,
+        projectName: matched.name,
+        stateDir: getConsciousProjectStateDir(consciousRootDir, matched.id),
+      };
+    }
+    throw new Error(`Unknown project "${selector.projectRef}". Run "devcon conscious list" to see valid project names/ids.`);
+  }
+
+  let projectId: string | undefined;
+  if (!projectId) {
+    projectId = currentProjectId;
+  }
+  if (!projectId) {
+    throw new Error('No current project identifier found. Use --project <name-or-id>.');
+  }
+
+  const known = resolveConsciousProjectReference(registry, projectId);
+  return {
+    projectId,
+    projectName: known?.name ?? projectId,
+    stateDir: getConsciousProjectStateDir(consciousRootDir, projectId),
+  };
+}
+
+function printConsciousProjectStructure(
+  cwd: string,
+  consciousRootDir: string,
+  selector: ConsciousProjectSelector,
+): void {
+  const target = resolveProjectForInspection(cwd, consciousRootDir, selector);
+  const stats = readConsciousProjectStats(target.stateDir);
+  const paths = resolveConsciousPaths(target.stateDir);
+
+  console.log(`Project: ${target.projectName} [${target.projectId}]`);
+  console.log(`State directory: ${target.stateDir}`);
+  console.log(`Archive DB: ${paths.dbPath} (${stats.dbExists ? 'present' : 'missing'})`);
+  console.log(`Sessions directory: ${paths.sessionsDir} (${existsSync(paths.sessionsDir) ? 'present' : 'missing'})`);
+  console.log(`Counts: findings=${stats.findingCount}, paths=${stats.pathCount}, usage=${stats.usageCount}, session_files=${stats.sessionCount}`);
+
+  if (!stats.dbExists) {
+    console.log('\nNo archive database found for this project yet.');
+    return;
+  }
+
+  const store = new ConsciousArchiveStore(paths.dbPath);
+  store.ensureInitialized();
+  const overview = store.getOverviewSnapshot();
+
+  console.log('\nTaxonomy paths:');
+  printConsciousPathTree(overview.pathTree as PathTreeNode[]);
+
+  console.log('\nTop labels:');
+  if (overview.labels.length === 0) {
+    console.log('- (none)');
+  } else {
+    for (const entry of overview.labels.slice(0, 20)) {
+      console.log(`- ${entry.label} (${entry.count})`);
+    }
+  }
+}
+
+async function wipeConsciousProject(
+  cwd: string,
+  consciousRootDir: string,
+  selector: ConsciousProjectSelector,
+): Promise<void> {
+  const target = resolveProjectForWipe(cwd, consciousRootDir, selector);
+  const confirmed = await confirmConsciousDestructiveAction(
+    `This will wipe all conscious memory for project ${target.projectName} [${target.projectId}] at ${target.stateDir}.`,
+    selector.yes,
+  );
+  if (!confirmed) {
+    console.log('Cancelled.');
+    return;
+  }
+
+  const sidecarStopped = stopConsciousSidecarForProject(consciousRootDir, target.projectId);
+  rmSync(target.stateDir, { recursive: true, force: true });
+  console.log(`Wiped project memory: ${target.projectName} [${target.projectId}]`);
+  if (sidecarStopped) {
+    console.log('Stopped related conscious sidecar container.');
+  }
+}
+
+async function wipeConsciousAll(consciousRootDir: string, yes: boolean): Promise<void> {
+  const confirmed = await confirmConsciousDestructiveAction(
+    `This will wipe all conscious memory under ${consciousRootDir}.`,
+    yes,
+  );
+  if (!confirmed) {
+    console.log('Cancelled.');
+    return;
+  }
+
+  const stopped = stopAllConsciousSidecars();
+  rmSync(consciousRootDir, { recursive: true, force: true });
+  console.log(`Wiped all conscious memory under ${consciousRootDir}`);
+  if (stopped > 0) {
+    console.log(`Stopped ${stopped} conscious sidecar container(s).`);
+  }
+}
+
+async function handleConsciousCommand(
+  args: string[],
+  cwd: string,
+  explicitStatePath: string | undefined,
+): Promise<void> {
+  const knownSubcommands = new Set(['list', 'inspect', 'tree', 'wipe-project', 'wipe', 'wipe-all']);
+  const subcommandIndex = args.findIndex((arg) => knownSubcommands.has(arg));
+  const subcommand = subcommandIndex >= 0 ? args[subcommandIndex] : 'list';
+  const subArgs = subcommandIndex >= 0
+    ? [...args.slice(0, subcommandIndex), ...args.slice(subcommandIndex + 1)]
+    : args;
+  const consciousRootDir = getConsciousStateDir(explicitStatePath, os.homedir());
+
+  if (subcommand === 'list') {
+    if (subArgs.length > 0) {
+      throw new Error(`Unknown arguments for "conscious list": ${subArgs.join(' ')}`);
+    }
+    printConsciousProjectList(cwd, consciousRootDir);
+    return;
+  }
+
+  if (subcommand === 'inspect' || subcommand === 'tree') {
+    const selector = parseConsciousProjectSelector(subArgs);
+    printConsciousProjectStructure(cwd, consciousRootDir, selector);
+    return;
+  }
+
+  if (subcommand === 'wipe-project' || subcommand === 'wipe') {
+    const selector = parseConsciousProjectSelector(subArgs);
+    await wipeConsciousProject(cwd, consciousRootDir, selector);
+    return;
+  }
+
+  if (subcommand === 'wipe-all') {
+    const selector = parseConsciousProjectSelector(subArgs);
+    if (selector.projectRef || selector.useCurrent) {
+      throw new Error('wipe-all does not accept --project or --current. Use --yes to confirm non-interactively.');
+    }
+    await wipeConsciousAll(consciousRootDir, selector.yes);
+    return;
+  }
+
+  throw new Error(`Unknown "conscious" subcommand "${subcommand}". Use list, inspect, tree, wipe-project, or wipe-all.`);
 }
 
 function prepareTempGitRepo(workspaceTarget: string): { hostDir: string; containerDir: string } {
@@ -1349,6 +2254,7 @@ function printHelp(tools: ToolMap): void {
   console.log('  devcon rebuild [tool ...]');
   console.log('  devcon sensitive <list|add|remove> [pattern]');
   console.log('  devcon skip-scan <list|add|remove> [dir]\n');
+  console.log('  devcon conscious <list|inspect|tree|wipe-project|wipe-all> [options]\n');
   console.log('Flags:');
   console.log('  --dry-run     Print the docker command without executing it');
   console.log('  --home        Share your host home directory with the container (disabled by default)');
@@ -1359,7 +2265,7 @@ function printHelp(tools: ToolMap): void {
   console.log('  --export-patch[=PATH] Export changes from temp-git repo after run (defaults to .devcon/drafts/<ts>.patch)');
   console.log('  --network-host, -network-host Use host networking (helps with VPNs that block Docker bridge DNS/NAT)');
   console.log('  --ipv4, -ipv4 Force IPv4-only networking by disabling IPv6 inside the container');
-  console.log('  --conscious, -conscious Enable persistent archive memory and auto-mount MCP tools');
+  console.log('  --conscious, -conscious Enable persistent archive memory via sidecar and auto-mount MCP tools');
   console.log('  --conscious-path PATH Override where conscious state is stored (default: ~/.config/devcon/conscious)');
   console.log('  --help        Show this message');
   console.log('\nCommands:');
@@ -1367,6 +2273,7 @@ function printHelp(tools: ToolMap): void {
   console.log('  rebuild       Fully rebuild Docker images for one or more tools (no cache)');
   console.log('  sensitive     List/add/remove sensitive-path patterns that get masked in containers');
   console.log('  skip-scan     List/add/remove directory names skipped during sensitive-pattern scanning');
+  console.log('  conscious     Inspect or wipe conscious memory storage (project or global scope)');
   console.log('  run           Launch an interactive container shell (default image)');
   console.log('\nTools:');
   for (const [name, tool] of Object.entries(tools)) {
@@ -1496,25 +2403,24 @@ function buildDockerArgs(options: {
   }
 
   if (options.conscious) {
-    dockerArgs.push('--mount', `type=bind,source=${options.conscious.stateDir},target=${options.conscious.containerStateDir}`);
-    dockerArgs.push('--mount', `type=bind,source=${options.conscious.hostServerScriptPath},target=${options.conscious.containerServerScriptPath},readonly`);
-    dockerArgs.push('--mount', `type=bind,source=${options.conscious.hostArchiveModulePath},target=${options.conscious.containerArchiveModulePath},readonly`);
+    if (options.networkHost) {
+      throw new Error('Conscious sidecar mode does not support --network-host. Disable --network-host for conscious runs.');
+    }
+    dockerArgs.push('--network', options.conscious.sidecarNetworkName);
+    dockerArgs.push('--mount', `type=bind,source=${options.conscious.hostTcpClientScriptPath},target=${options.conscious.containerTcpClientPath},readonly`);
     dockerArgs.push('-e', 'DEVCON_CONSCIOUS=1');
-    dockerArgs.push('-e', `DEVCON_CONSCIOUS_STATE_DIR=${options.conscious.containerStateDir}`);
     dockerArgs.push('-e', `DEVCON_CONSCIOUS_REPO=${options.conscious.repo.repoId}`);
+    dockerArgs.push('-e', `DEVCON_CONSCIOUS_PROJECT_ID=${options.conscious.projectId}`);
+    dockerArgs.push('-e', `DEVCON_CONSCIOUS_PROJECT_NAME=${options.conscious.projectName}`);
     dockerArgs.push('-e', `DEVCON_CONSCIOUS_SESSION_ID=${options.conscious.sessionId}`);
-    dockerArgs.push('-e', `DEVCON_CONSCIOUS_RETRIEVAL_FILE=${options.conscious.retrievalContainerPath}`);
-    dockerArgs.push('-e', `DEVCON_CONSCIOUS_DEBUG_LOG=${options.conscious.mcpLogContainerPath}`);
 
     const serverArgs = [
       'node',
-      options.conscious.containerServerScriptPath,
-      '--state-dir',
-      options.conscious.containerStateDir,
-      '--repo',
-      options.conscious.repo.repoId,
-      '--debug-log',
-      options.conscious.mcpLogContainerPath,
+      options.conscious.containerTcpClientPath,
+      '--host',
+      options.conscious.sidecarHost,
+      '--port',
+      String(options.conscious.sidecarPort),
     ].map(shellQuote).join(' ');
 
     if (options.toolName === 'codex') {
@@ -1639,21 +2545,39 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (options.toolName === 'conscious') {
+    if (options.imageOverride) {
+      throw new Error('The --image flag cannot be used with "devcon conscious". This command manages conscious storage only.');
+    }
+    await handleConsciousCommand(options.toolArgs, cwd, options.consciousStatePath);
+    return;
+  }
+
   const tool = tools[options.toolName];
 
   if (options.toolName === 'run') {
     ensureDockerAvailable();
     const consciousRuntime = options.conscious
-      ? prepareConsciousRuntime(cwd, options.toolArgs, options.consciousStatePath)
+      ? await prepareConsciousRuntime(cwd, options.toolArgs, options.consciousStatePath)
       : undefined;
     if (consciousRuntime) {
       console.log(`Conscious mode enabled (state: ${consciousRuntime.stateDir})`);
+      console.log(`Conscious project: ${consciousRuntime.projectName} [${consciousRuntime.projectId}]`);
       console.log(`Seed retrieval query: "${consciousRuntime.seedQuery}"`);
       console.log(`MCP debug log: ${consciousRuntime.mcpLogHostPath}`);
     }
     const image = options.imageOverride ?? DEFAULT_IMAGE_TAG;
     await ensureImageAvailable(image, image === DEFAULT_IMAGE_TAG ? DEFAULT_AUTO_BUILD : undefined);
     const networkHost = await maybeEnableHostNetwork(image, options.networkHost, options.dryRun);
+    if (consciousRuntime) {
+      if (networkHost) {
+        throw new Error('Conscious sidecar mode is not compatible with --network-host.');
+      }
+      const sidecarImage = getConsciousSidecarImage();
+      await ensureImageAvailable(sidecarImage, sidecarImage === DEFAULT_IMAGE_TAG ? DEFAULT_AUTO_BUILD : undefined);
+      ensureConsciousSidecar(consciousRuntime, sidecarImage, options.dryRun);
+      console.log(`Conscious sidecar ready: ${consciousRuntime.sidecarContainerName} (${consciousRuntime.sidecarHost}:${consciousRuntime.sidecarPort})`);
+    }
 
     const toolDef: ToolDefinition = {
       image,
@@ -1716,10 +2640,11 @@ async function main(): Promise<void> {
   ensureDockerAvailable();
 
   const consciousRuntime = options.conscious
-    ? prepareConsciousRuntime(cwd, options.toolArgs, options.consciousStatePath)
+    ? await prepareConsciousRuntime(cwd, options.toolArgs, options.consciousStatePath)
     : undefined;
   if (consciousRuntime) {
     console.log(`Conscious mode enabled (state: ${consciousRuntime.stateDir})`);
+    console.log(`Conscious project: ${consciousRuntime.projectName} [${consciousRuntime.projectId}]`);
     console.log(`Seed retrieval query: "${consciousRuntime.seedQuery}"`);
     console.log(`MCP debug log: ${consciousRuntime.mcpLogHostPath}`);
   }
@@ -1729,6 +2654,15 @@ async function main(): Promise<void> {
   const image = options.imageOverride ?? tool.image;
   await ensureImageAvailable(image, options.imageOverride ? undefined : tool.autoBuild);
   const networkHost = await maybeEnableHostNetwork(image, options.networkHost, options.dryRun);
+  if (consciousRuntime) {
+    if (networkHost) {
+      throw new Error('Conscious sidecar mode is not compatible with --network-host.');
+    }
+    const sidecarImage = getConsciousSidecarImage();
+    await ensureImageAvailable(sidecarImage, sidecarImage === DEFAULT_IMAGE_TAG ? DEFAULT_AUTO_BUILD : undefined);
+    ensureConsciousSidecar(consciousRuntime, sidecarImage, options.dryRun);
+    console.log(`Conscious sidecar ready: ${consciousRuntime.sidecarContainerName} (${consciousRuntime.sidecarHost}:${consciousRuntime.sidecarPort})`);
+  }
 
   const { command, args, cleanup, tempGitDir } = buildDockerArgs({
     cwd,

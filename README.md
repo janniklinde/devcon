@@ -96,22 +96,63 @@ devcon codex -- --dry-run "my prompt"
 
 `devcon --conscious <tool>` performs an idempotent bootstrap on startup:
 
-- Creates state under `~/.config/devcon/conscious` (or `--conscious-path`).
-- Initializes archive storage (`archive-db.json`) if missing.
+- Creates state under `~/.config/devcon/conscious` (or `--conscious-path`), namespaced per conscious project at `projects/<project-id>/`.
+- On first run in a git repo, prompts for project setup if no `.git/devcon/project-id` exists:
+  - create new project (asks for project name),
+  - link this repo to an existing conscious project,
+  - clone an existing conscious project into a new one (fork memory, then diverge).
+- Persists the chosen project identifier under `.git/devcon/project-id` (git-internal, not tracked).
+- Initializes archive storage (`archive-db.json`) for that project if missing.
 - Generates a per-session retrieval snapshot under `sessions/`.
-- Mounts a local MCP server into the container and auto-registers it for Codex/Claude as `devcon-archive`.
+- Starts (or reuses) a persistent per-project memory sidecar container and auto-registers MCP access for Codex/Claude as `devcon-archive`.
 - Removes that MCP registration again when the CLI process exits to avoid stale config drift.
+
+Container isolation notes:
+
+- The tool container does not mount the persistent archive directly in conscious mode.
+- Persistent archive storage is mounted into the sidecar only (`~/.config/devcon/conscious` -> `/state`).
+- Conscious sidecar mode is not compatible with `--network-host`.
+- Override sidecar image via `DEVCON_CONSCIOUS_SIDECAR_IMAGE` (defaults to `devcon:latest`).
 
 MCP tools exposed in conscious mode:
 
+- `archive_overview` (session bootstrap: fetch taxonomy + labels + `overview_token`; call this before other archive tools)
+- `archive_create_path` (create a new folder path when no existing path matches)
 - `archive_search`
 - `archive_write`
 - `archive_mark_used`
+
+Write flow constraints:
+
+- `archive_search` expects that `archive_overview` has been called once in the current MCP session.
+- `archive_write` now requires both `overview_token` and `path_id`.
+- Tokens are short-lived and tied to taxonomy version; if stale, call `archive_overview` again.
+- For durable user preferences, write entries under `/user/preferences` with label `user-preference`.
+- Storage is already scoped to the current conscious project. Avoid redundant folders like `engineering/<project-name>`.
 
 Automatic behavior:
 
 - Pre-launch retrieval seed runs automatically from the current task args/repo context.
 - On successful runs, if the workspace started clean and now contains git changes, Devcon auto-captures a low-confidence finding into the archive (heuristic learning capture).
+
+Conscious storage management commands:
+
+```bash
+devcon conscious list
+devcon conscious inspect --current
+devcon conscious tree --project <project-name-or-id>
+devcon conscious wipe-project --current          # asks for confirmation
+devcon conscious wipe-project --project <project-name-or-id> --yes
+devcon conscious wipe-all                        # asks for confirmation
+devcon conscious wipe-all --yes
+```
+
+Notes:
+
+- `wipe-project` clears stored memory data for that project and stops its sidecar container if present.
+- `--project` accepts either the human project name or the generated project id.
+- `wipe-all` clears the full conscious root and stops all `devcon-conscious-*` sidecar containers.
+- Both wipe commands require interactive confirmation unless `--yes` is provided.
 
 ## Default image (`devcon:latest`)
 

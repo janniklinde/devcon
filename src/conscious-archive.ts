@@ -2,7 +2,30 @@ import { createHash, randomBytes } from 'crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import * as path from 'path';
 
-const ARCHIVE_DB_VERSION = 1;
+const ARCHIVE_DB_VERSION = 2;
+const ROOT_PATH_ID = 'path_root';
+
+export interface ArchivePath {
+  id: string;
+  parentId?: string;
+  name: string;
+  fullPath: string;
+  description?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ArchivePathNode {
+  id: string;
+  name: string;
+  fullPath: string;
+  children: ArchivePathNode[];
+}
+
+export interface ArchiveLabelCount {
+  label: string;
+  count: number;
+}
 
 export interface ArchiveRecord {
   id: string;
@@ -12,8 +35,10 @@ export interface ArchiveRecord {
   summary: string;
   problem: string;
   solution: string;
+  pathId: string;
+  path: string;
+  labels: string[];
   evidence: string[];
-  tags: string[];
   confidence: number;
   createdAt: string;
   updatedAt: string;
@@ -34,6 +59,8 @@ export interface ArchiveUsage {
 
 interface ArchiveDatabase {
   version: number;
+  taxonomyVersion: number;
+  paths: ArchivePath[];
   records: ArchiveRecord[];
   usage: ArchiveUsage[];
 }
@@ -43,6 +70,9 @@ export interface ArchiveSearchInput {
   repo?: string;
   topK?: number;
   minConfidence?: number;
+  pathPrefix?: string;
+  labelsAny?: string[];
+  labelsAll?: string[];
 }
 
 export interface ArchiveSearchHit {
@@ -51,7 +81,9 @@ export interface ArchiveSearchHit {
   summary: string;
   problem: string;
   solution: string;
-  tags: string[];
+  pathId: string;
+  path: string;
+  labels: string[];
   confidence: number;
   createdAt: string;
   updatedAt: string;
@@ -67,11 +99,26 @@ export interface ArchiveWriteInput {
   summary: string;
   problem: string;
   solution: string;
-  evidence?: string[];
+  pathId?: string;
+  labels?: string[];
   tags?: string[];
+  evidence?: string[];
   confidence?: number;
   ttlDays?: number;
   source?: string;
+}
+
+export interface ArchiveCreatePathInput {
+  name: string;
+  parentPathId?: string;
+  description?: string;
+}
+
+export interface ArchiveOverviewSnapshot {
+  taxonomyVersion: number;
+  paths: ArchivePath[];
+  pathTree: ArchivePathNode[];
+  labels: ArchiveLabelCount[];
 }
 
 export interface ArchivePaths {
@@ -88,20 +135,29 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function tokenize(value: string): string[] {
+function normalizeWhitespace(value: string): string {
   return value
     .toLowerCase()
-    .replace(/[^a-z0-9_\-/\s]/g, ' ')
-    .split(/\s+/)
-    .filter((token) => token.length >= 2);
+    .replace(/[-_]+/g, ' ')
+    .replace(/[^a-z0-9\s/]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function tokenize(value: string): string[] {
+  const normalized = normalizeWhitespace(value);
+  if (!normalized) {
+    return [];
+  }
+  return normalized.split(' ').filter((token) => token.length >= 2);
 }
 
 function hashKey(value: string): string {
   return createHash('sha256').update(value).digest('hex').slice(0, 24);
 }
 
-function stableHashForRecord(input: ArchiveWriteInput): string {
-  const data = `${input.repo}\n${input.problem}\n${input.solution}`;
+function stableHashForRecord(input: ArchiveWriteInput, resolvedPathId: string): string {
+  const data = `${input.repo}\n${resolvedPathId}\n${normalizeWhitespace(input.problem)}\n${normalizeWhitespace(input.solution)}`;
   return hashKey(data.trim());
 }
 
@@ -109,6 +165,12 @@ function makeRecordId(): string {
   const ts = Date.now().toString(36);
   const suffix = randomBytes(4).toString('hex');
   return `finding_${ts}_${suffix}`;
+}
+
+function makePathId(): string {
+  const ts = Date.now().toString(36);
+  const suffix = randomBytes(3).toString('hex');
+  return `path_${ts}_${suffix}`;
 }
 
 function recencyScore(createdAt: string): number {
@@ -153,9 +215,93 @@ function dedupeStrings(values: string[]): string[] {
   return [...set.values()];
 }
 
+function normalizeLabel(value: string): string {
+  return normalizeWhitespace(value).replace(/\s+/g, '-');
+}
+
+function normalizePathName(name: string): string {
+  return normalizeWhitespace(name).replace(/\s+/g, '-');
+}
+
+function joinPath(parentPath: string, name: string): string {
+  if (parentPath === '/' || parentPath.length === 0) {
+    return `/${name}`;
+  }
+  return `${parentPath}/${name}`.replace(/\/+/g, '/');
+}
+
+function buildPathTree(paths: ArchivePath[]): ArchivePathNode[] {
+  const byParent = new Map<string, ArchivePath[]>();
+  for (const item of paths) {
+    const parent = item.parentId ?? '__root__';
+    const existing = byParent.get(parent) ?? [];
+    existing.push(item);
+    byParent.set(parent, existing);
+  }
+
+  const buildNodes = (parentId: string): ArchivePathNode[] => {
+    const children = (byParent.get(parentId) ?? []).slice().sort((a, b) => a.fullPath.localeCompare(b.fullPath));
+    return children.map((child) => ({
+      id: child.id,
+      name: child.name,
+      fullPath: child.fullPath,
+      children: buildNodes(child.id),
+    }));
+  };
+
+  return buildNodes('__root__');
+}
+
+function defaultPaths(): ArchivePath[] {
+  const now = nowIso();
+  const root: ArchivePath = {
+    id: ROOT_PATH_ID,
+    name: 'root',
+    fullPath: '/',
+    createdAt: now,
+    updatedAt: now,
+  };
+  const engineering: ArchivePath = {
+    id: 'path_engineering',
+    parentId: ROOT_PATH_ID,
+    name: 'engineering',
+    fullPath: '/engineering',
+    createdAt: now,
+    updatedAt: now,
+  };
+  const debugging: ArchivePath = {
+    id: 'path_debugging',
+    parentId: engineering.id,
+    name: 'debugging',
+    fullPath: '/engineering/debugging',
+    createdAt: now,
+    updatedAt: now,
+  };
+  const user: ArchivePath = {
+    id: 'path_user',
+    parentId: ROOT_PATH_ID,
+    name: 'user',
+    fullPath: '/user',
+    createdAt: now,
+    updatedAt: now,
+  };
+  const preferences: ArchivePath = {
+    id: 'path_user_preferences',
+    parentId: user.id,
+    name: 'preferences',
+    fullPath: '/user/preferences',
+    description: 'Durable user preferences and communication style decisions.',
+    createdAt: now,
+    updatedAt: now,
+  };
+  return [root, engineering, debugging, user, preferences];
+}
+
 function defaultDb(): ArchiveDatabase {
   return {
     version: ARCHIVE_DB_VERSION,
+    taxonomyVersion: 1,
+    paths: defaultPaths(),
     records: [],
     usage: [],
   };
@@ -194,11 +340,85 @@ export class ConsciousArchiveStore {
       return;
     }
 
+    const raw = this.readRawDb();
+    const normalized = this.normalizeDb(raw);
+    this.writeDb(normalized);
+  }
+
+  getRootPathId(): string {
+    return ROOT_PATH_ID;
+  }
+
+  getTaxonomyVersion(): number {
     const db = this.readDb();
-    if (db.version !== ARCHIVE_DB_VERSION) {
-      db.version = ARCHIVE_DB_VERSION;
-      this.writeDb(db);
+    return db.taxonomyVersion;
+  }
+
+  getOverviewSnapshot(): ArchiveOverviewSnapshot {
+    this.ensureInitialized();
+    const db = this.readDb();
+    const labelCounts = new Map<string, number>();
+    for (const record of db.records) {
+      for (const label of record.labels) {
+        labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
+      }
     }
+
+    const labels: ArchiveLabelCount[] = [...labelCounts.entries()]
+      .map(([label, count]) => ({ label, count }))
+      .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+
+    return {
+      taxonomyVersion: db.taxonomyVersion,
+      paths: db.paths.slice().sort((a, b) => a.fullPath.localeCompare(b.fullPath)),
+      pathTree: buildPathTree(db.paths),
+      labels,
+    };
+  }
+
+  createPath(input: ArchiveCreatePathInput): { created: boolean; path: ArchivePath; taxonomyVersion: number } {
+    this.ensureInitialized();
+    const db = this.readDb();
+    const parentPathId = input.parentPathId ?? ROOT_PATH_ID;
+    const parent = db.paths.find((item) => item.id === parentPathId);
+    if (!parent) {
+      throw new Error(`Parent path ${parentPathId} was not found.`);
+    }
+
+    const normalizedName = normalizePathName(input.name);
+    if (!normalizedName) {
+      throw new Error('Path name is required.');
+    }
+
+    const existing = db.paths.find((item) => item.parentId === parentPathId && item.name === normalizedName);
+    if (existing) {
+      return {
+        created: false,
+        path: existing,
+        taxonomyVersion: db.taxonomyVersion,
+      };
+    }
+
+    const now = nowIso();
+    const createdPath: ArchivePath = {
+      id: makePathId(),
+      parentId: parentPathId,
+      name: normalizedName,
+      fullPath: joinPath(parent.fullPath, normalizedName),
+      description: input.description?.trim() || undefined,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    db.paths.push(createdPath);
+    db.taxonomyVersion += 1;
+    this.writeDb(db);
+
+    return {
+      created: true,
+      path: createdPath,
+      taxonomyVersion: db.taxonomyVersion,
+    };
   }
 
   search(input: ArchiveSearchInput): ArchiveSearchHit[] {
@@ -208,6 +428,10 @@ export class ConsciousArchiveStore {
     const topK = clamp(input.topK ?? 5, 1, 25);
     const minConfidence = clamp(input.minConfidence ?? 0.3, 0, 1);
     const queryTokens = tokenize(query);
+    const pathPrefix = input.pathPrefix ? normalizePathName(input.pathPrefix).replace(/^\/+/, '') : '';
+    const normalizedPathPrefix = pathPrefix ? `/${pathPrefix}` : '';
+    const labelsAny = (input.labelsAny ?? []).map(normalizeLabel).filter((entry) => entry.length > 0);
+    const labelsAll = (input.labelsAll ?? []).map(normalizeLabel).filter((entry) => entry.length > 0);
 
     const activeRecords = db.records.filter((record) => !isExpired(record));
     if (activeRecords.length !== db.records.length) {
@@ -224,8 +448,17 @@ export class ConsciousArchiveStore {
       if (input.repo && input.repo !== record.repo) {
         continue;
       }
+      if (normalizedPathPrefix && !record.path.startsWith(normalizedPathPrefix)) {
+        continue;
+      }
+      if (labelsAny.length > 0 && !labelsAny.some((label) => record.labels.includes(label))) {
+        continue;
+      }
+      if (labelsAll.length > 0 && !labelsAll.every((label) => record.labels.includes(label))) {
+        continue;
+      }
 
-      const haystack = `${record.summary} ${record.problem} ${record.solution} ${record.tags.join(' ')}`;
+      const haystack = `${record.summary} ${record.problem} ${record.solution} ${record.labels.join(' ')} ${record.path}`;
       const hayTokens = new Set(tokenize(haystack));
       const overlap = queryTokens.reduce((acc, token) => (hayTokens.has(token) ? acc + 1 : acc), 0);
       const tokenScore = queryTokens.length === 0 ? 0.4 : overlap / queryTokens.length;
@@ -244,7 +477,9 @@ export class ConsciousArchiveStore {
         summary: record.summary,
         problem: record.problem,
         solution: record.solution,
-        tags: record.tags,
+        pathId: record.pathId,
+        path: record.path,
+        labels: record.labels,
         confidence: record.confidence,
         createdAt: record.createdAt,
         updatedAt: record.updatedAt,
@@ -261,15 +496,27 @@ export class ConsciousArchiveStore {
   write(input: ArchiveWriteInput): ArchiveRecord {
     this.ensureInitialized();
     const db = this.readDb();
+    const pathId = input.pathId ?? ROOT_PATH_ID;
+    const pathEntry = db.paths.find((item) => item.id === pathId);
+    if (!pathEntry) {
+      throw new Error(`Unknown pathId ${pathId}. Fetch archive_overview first and use an existing path_id.`);
+    }
+
+    const mergedLabels = dedupeStrings([
+      ...(input.labels ?? []),
+      ...(input.tags ?? []),
+    ]).map(normalizeLabel).filter((entry) => entry.length > 0);
+
     const normalized: ArchiveWriteInput = {
       ...input,
+      pathId,
       summary: input.summary.trim(),
       problem: input.problem.trim(),
       solution: input.solution.trim(),
       confidence: clamp(input.confidence ?? 0.6, 0, 1),
       ttlDays: Math.max(1, Math.floor(input.ttlDays ?? 180)),
       evidence: dedupeStrings((input.evidence ?? []).slice(0, 32)),
-      tags: dedupeStrings((input.tags ?? []).slice(0, 32)).map((tag) => tag.toLowerCase()),
+      labels: mergedLabels,
       source: input.source?.trim(),
     };
 
@@ -277,7 +524,7 @@ export class ConsciousArchiveStore {
       throw new Error('archive_write requires repo, summary, problem, and solution.');
     }
 
-    const hash = stableHashForRecord(normalized);
+    const hash = stableHashForRecord(normalized, pathId);
     const now = nowIso();
     const existing = db.records.find((record) => record.hash === hash && record.repo === normalized.repo);
 
@@ -291,7 +538,9 @@ export class ConsciousArchiveStore {
       existing.ttlDays = normalized.ttlDays as number;
       existing.confidence = Math.max(existing.confidence, normalized.confidence as number);
       existing.evidence = dedupeStrings([...existing.evidence, ...(normalized.evidence ?? [])]).slice(0, 64);
-      existing.tags = dedupeStrings([...existing.tags, ...(normalized.tags ?? [])]).slice(0, 32);
+      existing.labels = dedupeStrings([...existing.labels, ...(normalized.labels ?? [])]).slice(0, 32);
+      existing.pathId = pathEntry.id;
+      existing.path = pathEntry.fullPath;
       existing.updatedAt = now;
       this.writeDb(db);
       return existing;
@@ -305,8 +554,10 @@ export class ConsciousArchiveStore {
       summary: normalized.summary,
       problem: normalized.problem,
       solution: normalized.solution,
+      pathId: pathEntry.id,
+      path: pathEntry.fullPath,
+      labels: normalized.labels ?? [],
       evidence: normalized.evidence ?? [],
-      tags: normalized.tags ?? [],
       confidence: normalized.confidence as number,
       createdAt: now,
       updatedAt: now,
@@ -348,17 +599,125 @@ export class ConsciousArchiveStore {
     return record;
   }
 
-  private readDb(): ArchiveDatabase {
+  private readRawDb(): unknown {
     try {
       const raw = readFileSync(this.dbPath, 'utf8');
-      const parsed = JSON.parse(raw) as ArchiveDatabase;
-      if (!parsed || !Array.isArray(parsed.records) || !Array.isArray(parsed.usage)) {
-        throw new Error('Malformed archive database file.');
-      }
-      return parsed;
+      return JSON.parse(raw);
     } catch (error) {
       throw new Error(`Unable to read archive database at ${this.dbPath}: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  private readDb(): ArchiveDatabase {
+    return this.normalizeDb(this.readRawDb());
+  }
+
+  private normalizeDb(raw: unknown): ArchiveDatabase {
+    const parsed = raw as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object') {
+      return defaultDb();
+    }
+
+    const version = typeof parsed.version === 'number' ? parsed.version : 1;
+    const recordsRaw = Array.isArray(parsed.records) ? parsed.records : [];
+    const usageRaw = Array.isArray(parsed.usage) ? parsed.usage : [];
+    const now = nowIso();
+
+    const pathsRaw = Array.isArray(parsed.paths) ? parsed.paths : defaultPaths();
+    const normalizedPaths = dedupePaths(pathsRaw as ArchivePath[]);
+    if (!normalizedPaths.some((entry) => entry.id === ROOT_PATH_ID)) {
+      normalizedPaths.unshift({
+        id: ROOT_PATH_ID,
+        name: 'root',
+        fullPath: '/',
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
+    const pathMap = new Map<string, ArchivePath>();
+    for (const item of normalizedPaths) {
+      pathMap.set(item.id, item);
+    }
+
+    const normalizedRecords: ArchiveRecord[] = recordsRaw
+      .filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === 'object')
+      .map((entry) => {
+        const pathId = typeof entry.pathId === 'string' && pathMap.has(entry.pathId) ? entry.pathId : ROOT_PATH_ID;
+        const resolvedPath = pathMap.get(pathId)?.fullPath ?? '/';
+        const oldTags = Array.isArray(entry.tags) ? entry.tags.filter((v): v is string => typeof v === 'string') : [];
+        const labels = Array.isArray(entry.labels) ? entry.labels.filter((v): v is string => typeof v === 'string') : [];
+        const mergedLabels = dedupeStrings([...labels, ...oldTags]).map(normalizeLabel).filter((v) => v.length > 0);
+
+        const repo = typeof entry.repo === 'string' ? entry.repo : '';
+        const summary = typeof entry.summary === 'string' ? entry.summary : '';
+        const problem = typeof entry.problem === 'string' ? entry.problem : '';
+        const solution = typeof entry.solution === 'string' ? entry.solution : '';
+
+        const fallbackHash = stableHashForRecord(
+          {
+            repo,
+            summary,
+            problem,
+            solution,
+            pathId,
+          },
+          pathId,
+        );
+
+        return {
+          id: typeof entry.id === 'string' ? entry.id : makeRecordId(),
+          repo,
+          branch: typeof entry.branch === 'string' ? entry.branch : undefined,
+          commitSha: typeof entry.commitSha === 'string' ? entry.commitSha : undefined,
+          summary,
+          problem,
+          solution,
+          pathId,
+          path: typeof entry.path === 'string' && entry.path.length > 0 ? entry.path : resolvedPath,
+          labels: mergedLabels,
+          evidence: Array.isArray(entry.evidence) ? entry.evidence.filter((v): v is string => typeof v === 'string') : [],
+          confidence: typeof entry.confidence === 'number' ? clamp(entry.confidence, 0, 1) : 0.6,
+          createdAt: typeof entry.createdAt === 'string' ? entry.createdAt : now,
+          updatedAt: typeof entry.updatedAt === 'string' ? entry.updatedAt : now,
+          ttlDays: typeof entry.ttlDays === 'number' ? Math.max(1, Math.floor(entry.ttlDays)) : 180,
+          useCount: typeof entry.useCount === 'number' ? Math.max(0, Math.floor(entry.useCount)) : 0,
+          successCount: typeof entry.successCount === 'number' ? Math.max(0, Math.floor(entry.successCount)) : 0,
+          lastUsedAt: typeof entry.lastUsedAt === 'string' ? entry.lastUsedAt : undefined,
+          hash: typeof entry.hash === 'string' ? entry.hash : fallbackHash,
+          source: typeof entry.source === 'string' ? entry.source : undefined,
+        };
+      })
+      .filter((entry) => entry.repo.length > 0 && entry.summary.length > 0 && entry.problem.length > 0 && entry.solution.length > 0);
+
+    const normalizedUsage: ArchiveUsage[] = usageRaw
+      .filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === 'object')
+      .map((entry) => {
+        const outcome: ArchiveUsage['outcome'] = entry.outcome === 'helpful' || entry.outcome === 'not_helpful' || entry.outcome === 'unknown'
+          ? entry.outcome
+          : 'unknown';
+        return {
+          id: typeof entry.id === 'string' ? entry.id : `usage_${Date.now().toString(36)}_${randomBytes(3).toString('hex')}`,
+          findingId: typeof entry.findingId === 'string' ? entry.findingId : '',
+          outcome,
+          usedAt: typeof entry.usedAt === 'string' ? entry.usedAt : now,
+        };
+      })
+      .filter((entry) => entry.findingId.length > 0);
+
+    const taxonomyVersion = typeof parsed.taxonomyVersion === 'number'
+      ? Math.max(1, Math.floor(parsed.taxonomyVersion))
+      : version >= 2
+        ? 1
+        : 1;
+
+    return {
+      version: ARCHIVE_DB_VERSION,
+      taxonomyVersion,
+      paths: normalizedPaths,
+      records: normalizedRecords,
+      usage: normalizedUsage,
+    };
   }
 
   private writeDb(db: ArchiveDatabase): void {
@@ -366,4 +725,38 @@ export class ConsciousArchiveStore {
     writeFileSync(tmpPath, `${JSON.stringify(db, null, 2)}\n`, 'utf8');
     renameSync(tmpPath, this.dbPath);
   }
+}
+
+function dedupePaths(paths: ArchivePath[]): ArchivePath[] {
+  const now = nowIso();
+  const deduped = new Map<string, ArchivePath>();
+  for (const raw of paths) {
+    if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string') {
+      continue;
+    }
+
+    const existing = deduped.get(raw.id);
+    if (existing) {
+      continue;
+    }
+
+    const name = typeof raw.name === 'string' && raw.name.trim().length > 0
+      ? normalizePathName(raw.name)
+      : 'path';
+    const fullPath = typeof raw.fullPath === 'string' && raw.fullPath.trim().length > 0
+      ? raw.fullPath
+      : `/${name}`;
+
+    deduped.set(raw.id, {
+      id: raw.id,
+      parentId: typeof raw.parentId === 'string' ? raw.parentId : undefined,
+      name,
+      fullPath,
+      description: typeof raw.description === 'string' ? raw.description : undefined,
+      createdAt: typeof raw.createdAt === 'string' ? raw.createdAt : now,
+      updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : now,
+    });
+  }
+
+  return [...deduped.values()];
 }
