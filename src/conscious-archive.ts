@@ -518,6 +518,9 @@ export class ConsciousArchiveStore {
     const topK = clamp(input.topK ?? 5, 1, 25);
     const minConfidence = clamp(input.minConfidence ?? 0.3, 0, 1);
     const queryTokens = tokenize(query);
+    if (query.length > 0 && queryTokens.length === 0) {
+      return [];
+    }
     const pathPrefix = input.pathPrefix ? normalizePathName(input.pathPrefix).replace(/^\/+/, '') : '';
     const normalizedPathPrefix = pathPrefix ? `/${pathPrefix}` : '';
     const labelsAny = (input.labelsAny ?? []).map(normalizeLabel).filter((entry) => entry.length > 0);

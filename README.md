@@ -117,6 +117,7 @@ Container isolation notes:
 MCP tools exposed in conscious mode:
 
 - `archive_overview` (session bootstrap: fetch taxonomy + labels + `overview_token`; call this before other archive tools)
+- `archive_bootstrap` (recommended first call in a fresh chat: overview + concrete initial findings, including user preferences when present)
 - `archive_create_path` (create a new folder path when no existing path matches)
 - `archive_search` (fast index search; returns summary + previews)
 - `archive_get` (fetch full stored details for a specific finding id)
@@ -126,11 +127,13 @@ MCP tools exposed in conscious mode:
 Write flow constraints:
 
 - `archive_search` expects that `archive_overview` has been called once in the current MCP session.
+- `archive_bootstrap` can satisfy that same session bootstrap requirement.
 - `archive_write` now requires both `overview_token` and `path_id`.
 - Tokens are short-lived and tied to taxonomy version; if stale, call `archive_overview` again.
 - For durable user preferences, write entries under `/user/preferences` with label `user-preference`.
 - Storage is already scoped to the current conscious project. Avoid redundant folders like `engineering/<project-name>`.
 - Internally, `archive-db.json` is a hot index and full per-finding details are stored in `records/*.json`.
+- `archive_search` can automatically fall back to cross-repo matches when strict repo scope returns none (`repo_fallback`).
 
 Automatic behavior:
 

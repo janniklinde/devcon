@@ -75,7 +75,9 @@ const CONSCIOUS_SIDECAR_MCP_SERVER_SCRIPT = '/opt/devcon/conscious-mcp-server.js
 const CONSCIOUS_SIDECAR_ARCHIVE_MODULE = '/opt/devcon/conscious-archive.js';
 const CONSCIOUS_SIDECAR_STATE_DIR = '/state';
 const CONSCIOUS_SIDECAR_NETWORK = 'devcon-conscious-net';
+const CONSCIOUS_SIDECAR_REV = '3';
 const CONSCIOUS_SIDECAR_PORT = parsePositiveIntEnv(process.env.DEVCON_CONSCIOUS_TCP_PORT, 8765);
+const CONSCIOUS_SIDECAR_READY_TIMEOUT_MS = parsePositiveIntEnv(process.env.DEVCON_CONSCIOUS_READY_TIMEOUT_MS, 15_000);
 const CONSCIOUS_MCP_NAME = 'devcon-archive';
 const CONSCIOUS_PROJECT_ID_RELATIVE_PATH = 'devcon/project-id';
 const CONSCIOUS_PROJECTS_DIRNAME = 'projects';
@@ -972,7 +974,7 @@ function formatRetrievalMarkdown(
   lines.push('');
   lines.push('# Memory taxonomy');
   lines.push('');
-  lines.push('Session bootstrap: call `archive_overview` before other archive tools so path/label choices match current taxonomy.');
+  lines.push('Session bootstrap: call `archive_bootstrap` (or `archive_overview`) before other archive tools so path/label choices match current taxonomy.');
   lines.push('Storage is already project-local for this repo. Do not create project-name wrapper folders like `engineering/<project-name>`.');
   lines.push('`archive_search` returns fast index previews; call `archive_get` for full stored details of a hit.');
   lines.push('Use existing `path_id` values whenever possible; only create new paths when no existing one fits.');
@@ -1060,14 +1062,84 @@ function doesContainerExist(name: string): boolean {
   return ps.stdout.split('\n').some((line) => line.trim() === name);
 }
 
+function getConsciousWarmupFrames(): string[] {
+  return [
+    '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}',
+    '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+    '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+  ];
+}
+
+function buildConsciousWarmupCommand(serverArgs: string, connectTimeoutMs: number): string {
+  const lines = getConsciousWarmupFrames().map((line) => `'${line}'`).join(' ');
+  const timeout = Math.max(1_000, connectTimeoutMs);
+  return `printf '%s\\n' ${lines} | DEVCON_CONSCIOUS_TCP_CONNECT_TIMEOUT_MS=${timeout} ${serverArgs} >/dev/null 2>&1`;
+}
+
+function probeConsciousSidecar(runtime: ConsciousRuntime, timeoutMs: number): { ok: boolean; reason?: string } {
+  const script = [
+    "const net=require('net');",
+    "const port=Number(process.argv[1]);",
+    "const timeout=Number(process.argv[2]);",
+    "let buffer='';",
+    "const req=JSON.stringify({jsonrpc:'2.0',id:0,method:'initialize',params:{protocolVersion:'2025-06-18'}})+'\\n';",
+    "const hasInit=()=>buffer.includes('\"id\":0')&&buffer.includes('\"result\"');",
+    "const fail=(code,msg)=>{if(msg){process.stderr.write(String(msg)+'\\n');}process.exit(code);};",
+    "const socket=net.createConnection({host:'127.0.0.1',port});",
+    "socket.setTimeout(timeout);",
+    "socket.on('connect',()=>socket.write(req));",
+    "socket.on('data',(chunk)=>{buffer+=chunk.toString('utf8');if(hasInit()){process.exit(0);}});",
+    "socket.on('timeout',()=>{socket.destroy();fail(2,'timeout waiting for initialize response');});",
+    "socket.on('error',(error)=>fail(3,error.message));",
+    "socket.on('close',()=>{if(hasInit()){process.exit(0);}fail(4,'closed before initialize response');});",
+  ].join('');
+
+  const timeout = Math.max(1_000, timeoutMs);
+  const probe = spawnSync(
+    'docker',
+    [
+      'exec',
+      runtime.sidecarContainerName,
+      'node',
+      '-e',
+      script,
+      String(runtime.sidecarPort),
+      String(timeout),
+    ],
+    {
+      encoding: 'utf8',
+      timeout: timeout + 2_000,
+    },
+  );
+
+  if (probe.status === 0) {
+    return { ok: true };
+  }
+
+  if (probe.error) {
+    return { ok: false, reason: probe.error.message };
+  }
+
+  const stderr = probe.stderr?.trim();
+  const stdout = probe.stdout?.trim();
+  const reason = stderr || stdout || `exit status ${probe.status ?? 'unknown'}`;
+  return { ok: false, reason };
+}
+
 function ensureConsciousSidecar(runtime: ConsciousRuntime, image: string, dryRun: boolean): void {
   if (dryRun) {
     return;
   }
 
+  const readyTimeoutMs = CONSCIOUS_SIDECAR_READY_TIMEOUT_MS;
   ensureDockerNetwork(runtime.sidecarNetworkName);
   if (isContainerRunning(runtime.sidecarContainerName)) {
-    return;
+    const ready = probeConsciousSidecar(runtime, readyTimeoutMs);
+    if (ready.ok) {
+      return;
+    }
+    console.warn(`Conscious sidecar ${runtime.sidecarContainerName} was running but not ready (${ready.reason ?? 'unknown reason'}). Restarting...`);
+    spawnSync('docker', ['rm', '-f', runtime.sidecarContainerName], { stdio: 'ignore' });
   }
 
   if (doesContainerExist(runtime.sidecarContainerName)) {
@@ -1075,6 +1147,7 @@ function ensureConsciousSidecar(runtime: ConsciousRuntime, image: string, dryRun
   }
 
   const sidecarDebugLog = path.join(CONSCIOUS_SIDECAR_STATE_DIR, 'sessions', 'sidecar.log');
+  const hostConsciousDistDir = path.dirname(runtime.hostServerScriptPath);
   const runArgs = [
     'run',
     '-d',
@@ -1087,11 +1160,7 @@ function ensureConsciousSidecar(runtime: ConsciousRuntime, image: string, dryRun
     '--mount',
     `type=bind,source=${runtime.stateDir},target=${CONSCIOUS_SIDECAR_STATE_DIR}`,
     '--mount',
-    `type=bind,source=${runtime.hostServerScriptPath},target=${CONSCIOUS_SIDECAR_MCP_SERVER_SCRIPT},readonly`,
-    '--mount',
-    `type=bind,source=${runtime.hostArchiveModulePath},target=${CONSCIOUS_SIDECAR_ARCHIVE_MODULE},readonly`,
-    '--mount',
-    `type=bind,source=${runtime.hostTcpServerScriptPath},target=${CONSCIOUS_SIDECAR_SERVER_SCRIPT},readonly`,
+    `type=bind,source=${hostConsciousDistDir},target=/opt/devcon,readonly`,
     image,
     'node',
     CONSCIOUS_SIDECAR_SERVER_SCRIPT,
@@ -1109,11 +1178,28 @@ function ensureConsciousSidecar(runtime: ConsciousRuntime, image: string, dryRun
     runtime.projectId,
     '--project-name',
     runtime.projectName,
+    '--seed-query',
+    runtime.seedQuery,
   ];
 
-  const run = spawnSync('docker', runArgs, { encoding: 'utf8' });
-  if (run.status !== 0) {
-    throw new Error(`Failed to start conscious sidecar ${runtime.sidecarContainerName}: ${run.stderr || run.stdout || 'unknown docker error'}`);
+  const startSidecar = (): void => {
+    const run = spawnSync('docker', runArgs, { encoding: 'utf8' });
+    if (run.status !== 0) {
+      throw new Error(`Failed to start conscious sidecar ${runtime.sidecarContainerName}: ${run.stderr || run.stdout || 'unknown docker error'}`);
+    }
+  };
+
+  startSidecar();
+  let ready = probeConsciousSidecar(runtime, readyTimeoutMs);
+  if (ready.ok) {
+    return;
+  }
+
+  spawnSync('docker', ['rm', '-f', runtime.sidecarContainerName], { stdio: 'ignore' });
+  startSidecar();
+  ready = probeConsciousSidecar(runtime, readyTimeoutMs);
+  if (!ready.ok) {
+    throw new Error(`Conscious sidecar ${runtime.sidecarContainerName} started but did not answer MCP initialize (${ready.reason ?? 'unknown reason'}).`);
   }
 }
 
@@ -1142,7 +1228,7 @@ async function prepareConsciousRuntime(
   const retrievalHostPath = path.join(paths.sessionsDir, `${sessionId}.retrieval.md`);
   writeFileSync(retrievalHostPath, formatRetrievalMarkdown(retrievalHits, overview), 'utf8');
   const mcpLogHostPath = path.join(paths.sessionsDir, 'sidecar.log');
-  const sidecarIdentity = buildStableSuffix(`${consciousRootDir}::${project.projectId}`);
+  const sidecarIdentity = buildStableSuffix(`${CONSCIOUS_SIDECAR_REV}::${consciousRootDir}::${project.projectId}`);
   const sidecarContainerName = `devcon-conscious-${sidecarIdentity}`;
   const sidecarHost = `devcon-conscious-${sidecarIdentity}`;
 
@@ -1617,13 +1703,20 @@ function printConsciousPathTree(nodes: PathTreeNode[], indent = ''): void {
 }
 
 function stopConsciousSidecarForProject(consciousRootDir: string, projectId: string): boolean {
-  const sidecarIdentity = buildStableSuffix(`${consciousRootDir}::${projectId}`);
-  const sidecarContainerName = `devcon-conscious-${sidecarIdentity}`;
-  if (!doesContainerExist(sidecarContainerName)) {
-    return false;
+  const identities = [
+    buildStableSuffix(`${CONSCIOUS_SIDECAR_REV}::${consciousRootDir}::${projectId}`),
+    buildStableSuffix(`${consciousRootDir}::${projectId}`), // legacy sidecar naming
+  ];
+  let stopped = false;
+  for (const identity of identities) {
+    const sidecarContainerName = `devcon-conscious-${identity}`;
+    if (!doesContainerExist(sidecarContainerName)) {
+      continue;
+    }
+    spawnSync('docker', ['rm', '-f', sidecarContainerName], { stdio: 'ignore' });
+    stopped = true;
   }
-  spawnSync('docker', ['rm', '-f', sidecarContainerName], { stdio: 'ignore' });
-  return true;
+  return stopped;
 }
 
 function stopAllConsciousSidecars(): number {
@@ -2423,12 +2516,15 @@ function buildDockerArgs(options: {
       '--port',
       String(options.conscious.sidecarPort),
     ].map(shellQuote).join(' ');
+    const warmupCommand = buildConsciousWarmupCommand(serverArgs, CONSCIOUS_SIDECAR_READY_TIMEOUT_MS);
+    const warmupGuard = `if ! ${warmupCommand}; then echo "devcon conscious: MCP sidecar warmup failed for ${CONSCIOUS_MCP_NAME}." >&2; exit 86; fi`;
 
     if (options.toolName === 'codex') {
       initScriptLines.push(
         `if command -v codex >/dev/null 2>&1; then`,
         `  codex mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`,
         `  codex mcp add ${CONSCIOUS_MCP_NAME} -- ${serverArgs} >/dev/null 2>&1 || true`,
+        `  ${warmupGuard}`,
         'fi',
       );
       postRunCleanupLines.push(`codex mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`);
@@ -2437,6 +2533,7 @@ function buildDockerArgs(options: {
         'if command -v claude >/dev/null 2>&1; then',
         `  claude mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`,
         `  claude mcp add --transport stdio ${CONSCIOUS_MCP_NAME} -- ${serverArgs} >/dev/null 2>&1 || true`,
+        `  ${warmupGuard}`,
         'fi',
       );
       postRunCleanupLines.push(`claude mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`);

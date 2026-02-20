@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from 'child_process';
+import { appendFileSync } from 'fs';
 import * as net from 'net';
 
 interface ServerConfig {
@@ -7,6 +8,7 @@ interface ServerConfig {
   repo?: string;
   projectId?: string;
   projectName?: string;
+  seedQuery?: string;
   debugLogPath?: string;
   serverScript: string;
   host: string;
@@ -18,6 +20,7 @@ function parseArgs(argv: string[]): ServerConfig {
   let repo = process.env.DEVCON_CONSCIOUS_REPO;
   let projectId = process.env.DEVCON_CONSCIOUS_PROJECT_ID;
   let projectName = process.env.DEVCON_CONSCIOUS_PROJECT_NAME;
+  let seedQuery = process.env.DEVCON_CONSCIOUS_SEED_QUERY;
   let debugLogPath = process.env.DEVCON_CONSCIOUS_DEBUG_LOG;
   let serverScript = process.env.DEVCON_CONSCIOUS_SERVER_SCRIPT ?? '/opt/devcon/conscious-mcp-server.js';
   let host = process.env.DEVCON_CONSCIOUS_TCP_BIND_HOST ?? '0.0.0.0';
@@ -74,6 +77,19 @@ function parseArgs(argv: string[]): ServerConfig {
         throw new Error('--project-name requires a value.');
       }
       projectName = next;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--seed-query=')) {
+      seedQuery = arg.slice('--seed-query='.length);
+      continue;
+    }
+    if (arg === '--seed-query') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--seed-query requires a value.');
+      }
+      seedQuery = next;
       i += 1;
       continue;
     }
@@ -152,6 +168,7 @@ function parseArgs(argv: string[]): ServerConfig {
     repo,
     projectId,
     projectName,
+    seedQuery,
     debugLogPath,
     serverScript,
     host,
@@ -161,8 +178,21 @@ function parseArgs(argv: string[]): ServerConfig {
 
 function main(): void {
   const config = parseArgs(process.argv.slice(2));
+  const log = (message: string): void => {
+    const line = `[devcon-conscious-tcp-server] ${message}\n`;
+    process.stderr.write(line);
+    if (config.debugLogPath) {
+      try {
+        appendFileSync(config.debugLogPath, line, 'utf8');
+      } catch {
+        // ignore debug log write failures
+      }
+    }
+  };
 
   const server = net.createServer((socket) => {
+    const remote = `${socket.remoteAddress ?? 'unknown'}:${socket.remotePort ?? 'unknown'}`;
+    log(`client connected from ${remote}`);
     const args = [
       config.serverScript,
       '--state-dir', config.stateDir,
@@ -176,11 +206,15 @@ function main(): void {
     if (config.projectName) {
       args.push('--project-name', config.projectName);
     }
+    if (config.seedQuery) {
+      args.push('--seed-query', config.seedQuery);
+    }
     if (config.debugLogPath) {
       args.push('--debug-log', config.debugLogPath);
     }
 
     const child = spawn('node', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    log(`spawned MCP child pid=${child.pid ?? 'unknown'} for ${remote}`);
 
     socket.pipe(child.stdin);
     child.stdout.pipe(socket);
@@ -189,31 +223,34 @@ function main(): void {
       process.stderr.write(chunk);
     });
 
-    socket.on('error', () => {
+    socket.on('error', (error) => {
+      log(`socket error from ${remote}: ${error.message}`);
       child.kill('SIGTERM');
     });
 
-    socket.on('close', () => {
+    socket.on('close', (hadError) => {
+      log(`socket closed from ${remote} (hadError=${hadError ? 'true' : 'false'})`);
       child.kill('SIGTERM');
     });
 
     child.on('error', (error) => {
-      process.stderr.write(`[devcon-conscious-tcp-server] child error: ${error.message}\n`);
+      log(`child error for ${remote}: ${error.message}`);
       socket.destroy();
     });
 
-    child.on('exit', () => {
+    child.on('exit', (code, signal) => {
+      log(`MCP child exited for ${remote} (code=${code ?? 'null'}, signal=${signal ?? 'null'})`);
       socket.end();
     });
   });
 
   server.on('error', (error) => {
-    process.stderr.write(`[devcon-conscious-tcp-server] ${error.message}\n`);
+    log(error.message);
     process.exit(1);
   });
 
   server.listen(config.port, config.host, () => {
-    process.stderr.write(`[devcon-conscious-tcp-server] listening on ${config.host}:${config.port}\n`);
+    log(`listening on ${config.host}:${config.port}`);
   });
 
   const shutdown = (): void => {

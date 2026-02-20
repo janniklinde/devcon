@@ -32,6 +32,7 @@ interface RuntimeConfig {
   defaultRepo?: string;
   projectId?: string;
   projectName?: string;
+  seedQuery?: string;
   debugLogPath?: string;
 }
 
@@ -47,6 +48,7 @@ function parseArgs(argv: string[]): RuntimeConfig {
   let defaultRepo = process.env.DEVCON_CONSCIOUS_REPO;
   let projectId = process.env.DEVCON_CONSCIOUS_PROJECT_ID;
   let projectName = process.env.DEVCON_CONSCIOUS_PROJECT_NAME;
+  let seedQuery = process.env.DEVCON_CONSCIOUS_SEED_QUERY;
   let debugLogPath = process.env.DEVCON_CONSCIOUS_DEBUG_LOG;
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -103,6 +105,19 @@ function parseArgs(argv: string[]): RuntimeConfig {
       i += 1;
       continue;
     }
+    if (arg.startsWith('--seed-query=')) {
+      seedQuery = arg.slice('--seed-query='.length);
+      continue;
+    }
+    if (arg === '--seed-query') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--seed-query requires a value.');
+      }
+      seedQuery = next;
+      i += 1;
+      continue;
+    }
     if (arg.startsWith('--debug-log=')) {
       debugLogPath = arg.slice('--debug-log='.length);
       continue;
@@ -127,6 +142,7 @@ function parseArgs(argv: string[]): RuntimeConfig {
     defaultRepo,
     projectId,
     projectName,
+    seedQuery,
     debugLogPath,
   };
 }
@@ -359,7 +375,7 @@ class StdioJsonRpcServer {
         protocolVersion,
         serverInfo: {
           name: 'devcon-archive',
-          version: '0.4.0',
+          version: '0.6.0',
         },
         capabilities: {
           tools: {
@@ -381,8 +397,30 @@ class StdioJsonRpcServer {
       return {
         tools: [
           {
+            name: 'archive_bootstrap',
+            description: 'MANDATORY FIRST CALL in each new chat. Returns project-local taxonomy, overview_token, and concrete initial findings (including user preferences) so you can answer context questions before broad workspace scans.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                query: { type: 'string' },
+                top_k: { type: 'integer', minimum: 1, maximum: 25, default: 5 },
+                min_confidence: { type: 'number', minimum: 0, maximum: 1, default: 0.3 },
+                path_prefix: { type: 'string' },
+                labels_any: {
+                  type: 'array',
+                  items: { type: 'string' },
+                },
+                labels_all: {
+                  type: 'array',
+                  items: { type: 'string' },
+                },
+                repo_fallback: { type: 'boolean', default: true },
+              },
+            },
+          },
+          {
             name: 'archive_overview',
-            description: 'Session bootstrap tool. Call this first (before archive_search/archive_write/archive_create_path) to fetch current folder/label taxonomy and an overview token. Storage is already scoped to this project, so do not create project-name wrapper folders.',
+            description: 'Session bootstrap tool. Call this before archive_search/archive_write/archive_create_path to fetch current folder/label taxonomy and an overview token. Storage is already scoped to this project, so do not create project-name wrapper folders.',
             inputSchema: {
               type: 'object',
               properties: {
@@ -406,7 +444,7 @@ class StdioJsonRpcServer {
           },
           {
             name: 'archive_search',
-            description: 'Search historical findings by text, path prefix, and labels. Returns summary + previews from the hot index. Call archive_get for full stored details. Requires archive_overview once per session first so path/label choices follow current taxonomy.',
+            description: 'Search historical findings by text, path prefix, and labels. Returns summary + previews from the hot index. Call archive_get for full stored details. Requires archive_overview or archive_bootstrap once per session first so path/label choices follow current taxonomy.',
             inputSchema: {
               type: 'object',
               properties: {
@@ -415,6 +453,7 @@ class StdioJsonRpcServer {
                 top_k: { type: 'integer', minimum: 1, maximum: 25, default: 5 },
                 min_confidence: { type: 'number', minimum: 0, maximum: 1, default: 0.3 },
                 path_prefix: { type: 'string' },
+                repo_fallback: { type: 'boolean', default: true },
                 labels_any: {
                   type: 'array',
                   items: { type: 'string' },
@@ -497,6 +536,9 @@ class StdioJsonRpcServer {
       if (name === 'archive_overview') {
         return this.handleArchiveOverview();
       }
+      if (name === 'archive_bootstrap') {
+        return this.handleArchiveBootstrap(args);
+      }
       if (name === 'archive_create_path') {
         return this.handleArchiveCreatePath(args);
       }
@@ -545,6 +587,85 @@ class StdioJsonRpcServer {
     };
   }
 
+  private handleArchiveBootstrap(args: Record<string, unknown>): unknown {
+    const overview = this.handleArchiveOverview() as {
+      structuredContent: {
+        overview_token: string;
+        taxonomy_version: number;
+        project_scope: { project_id?: string; project_name?: string };
+        paths: unknown[];
+        path_tree: unknown[];
+        labels: unknown[];
+      };
+    };
+
+    const seed = typeof this.config.seedQuery === 'string' && this.config.seedQuery.trim().length > 0
+      ? this.config.seedQuery.trim()
+      : `working in ${this.config.projectName?.trim() || this.config.projectId?.trim() || 'project'}`;
+    const query = typeof args.query === 'string' && args.query.trim().length > 0
+      ? args.query.trim()
+      : seed;
+    const topK = typeof args.top_k === 'number' ? args.top_k : 5;
+    const minConfidence = typeof args.min_confidence === 'number' ? args.min_confidence : 0.3;
+    const pathPrefix = typeof args.path_prefix === 'string' ? args.path_prefix : undefined;
+    const labelsAny = Array.isArray(args.labels_any) ? args.labels_any.filter((entry): entry is string => typeof entry === 'string') : [];
+    const labelsAll = Array.isArray(args.labels_all) ? args.labels_all.filter((entry): entry is string => typeof entry === 'string') : [];
+    const repoFallback = typeof args.repo_fallback === 'boolean' ? args.repo_fallback : true;
+
+    const searchResult = this.runSearch({
+      query,
+      repo: this.config.defaultRepo,
+      topK,
+      minConfidence,
+      pathPrefix,
+      labelsAny,
+      labelsAll,
+      allowRepoFallback: repoFallback,
+    });
+    const preferenceResult = this.runSearch({
+      query: 'preference workflow communication style',
+      repo: this.config.defaultRepo,
+      topK: 5,
+      minConfidence: 0.3,
+      pathPrefix: '/user/preferences',
+      labelsAny: ['user-preference'],
+      labelsAll: [],
+      allowRepoFallback: true,
+    });
+
+    const previewLines: string[] = [];
+    const pushHitLine = (prefix: string, hit: { id: string; summary: string; path: string; confidence: number }): void => {
+      previewLines.push(`${prefix} [${hit.id}] ${hit.summary} (path=${hit.path}, confidence=${hit.confidence.toFixed(2)})`);
+    };
+    for (const hit of preferenceResult.hits.slice(0, 3)) {
+      pushHitLine('pref', hit);
+    }
+    for (const hit of searchResult.hits.slice(0, 4)) {
+      if (previewLines.some((line) => line.includes(`[${hit.id}]`))) {
+        continue;
+      }
+      pushHitLine('ctx', hit);
+    }
+
+    const text = previewLines.length === 0
+      ? `Bootstrap complete for ${this.projectScopeLabel()}. No initial findings matched query "${query}".`
+      : `Bootstrap complete for ${this.projectScopeLabel()}. Use these persisted findings first:\n${previewLines.map((line, idx) => `${idx + 1}. ${line}`).join('\n')}`;
+
+    return {
+      content: [{ type: 'text', text }],
+      structuredContent: {
+        ...overview.structuredContent,
+        bootstrap_query: query,
+        requested_repo: searchResult.requestedRepo,
+        effective_repo: searchResult.effectiveRepo,
+        repo_fallback_used: searchResult.repoFallbackUsed,
+        results: searchResult.hits,
+        preference_results: preferenceResult.hits,
+      },
+      isError: false,
+    };
+  }
+
   private handleArchiveCreatePath(args: Record<string, unknown>): unknown {
     const token = this.readString(args.overview_token, 'archive_create_path requires overview_token.');
     const tokenState = this.validateOverviewToken(token);
@@ -576,22 +697,26 @@ class StdioJsonRpcServer {
 
   private handleArchiveSearch(args: Record<string, unknown>): unknown {
     if (!this.activeOverviewToken) {
-      throw new Error('Call archive_overview once at session start before archive_search.');
+      throw new Error('Call archive_bootstrap or archive_overview once at session start before archive_search.');
     }
 
     const query = typeof args.query === 'string' ? args.query : '';
     if (!query.trim()) {
       throw new Error('archive_search requires a non-empty query.');
     }
+    if (query.trim().length < 2) {
+      throw new Error('archive_search query must be at least 2 characters.');
+    }
 
     const repo = typeof args.repo === 'string' ? args.repo : this.config.defaultRepo;
     const topK = typeof args.top_k === 'number' ? args.top_k : 5;
     const minConfidence = typeof args.min_confidence === 'number' ? args.min_confidence : 0.3;
     const pathPrefix = typeof args.path_prefix === 'string' ? args.path_prefix : undefined;
+    const repoFallback = typeof args.repo_fallback === 'boolean' ? args.repo_fallback : true;
     const labelsAny = Array.isArray(args.labels_any) ? args.labels_any.filter((entry): entry is string => typeof entry === 'string') : [];
     const labelsAll = Array.isArray(args.labels_all) ? args.labels_all.filter((entry): entry is string => typeof entry === 'string') : [];
 
-    const hits = this.archive.search({
+    const searchResult = this.runSearch({
       query,
       repo,
       topK,
@@ -599,10 +724,16 @@ class StdioJsonRpcServer {
       pathPrefix,
       labelsAny,
       labelsAll,
+      allowRepoFallback: repoFallback,
     });
+    const hits = searchResult.hits;
 
     const text = hits.length === 0
       ? 'No prior findings matched the query.'
+      : searchResult.repoFallbackUsed
+        ? `No hits in requested repo scope; showing ${hits.length} cross-repo fallback result(s).\n${hits
+          .map((hit, index) => `${index + 1}. [${hit.id}] ${hit.summary} (path=${hit.path}, confidence=${hit.confidence.toFixed(2)}, score=${hit.score.toFixed(2)})`)
+          .join('\n')}`
       : hits
         .map((hit, index) => `${index + 1}. [${hit.id}] ${hit.summary} (path=${hit.path}, confidence=${hit.confidence.toFixed(2)}, score=${hit.score.toFixed(2)})`)
         .join('\n');
@@ -611,7 +742,9 @@ class StdioJsonRpcServer {
       content: [{ type: 'text', text }],
       structuredContent: {
         query,
-        repo,
+        requested_repo: searchResult.requestedRepo,
+        effective_repo: searchResult.effectiveRepo,
+        repo_fallback_used: searchResult.repoFallbackUsed,
         project_id: this.config.projectId,
         project_name: this.config.projectName,
         path_prefix: pathPrefix,
@@ -673,6 +806,58 @@ class StdioJsonRpcServer {
     };
   }
 
+  private runSearch(input: {
+    query: string;
+    repo?: string;
+    topK: number;
+    minConfidence: number;
+    pathPrefix?: string;
+    labelsAny: string[];
+    labelsAll: string[];
+    allowRepoFallback: boolean;
+  }): {
+    hits: ReturnType<ConsciousArchiveStore['search']>;
+    requestedRepo?: string;
+    effectiveRepo?: string;
+    repoFallbackUsed: boolean;
+  } {
+    const requestedRepo = input.repo;
+    let hits = this.archive.search({
+      query: input.query,
+      repo: requestedRepo,
+      topK: input.topK,
+      minConfidence: input.minConfidence,
+      pathPrefix: input.pathPrefix,
+      labelsAny: input.labelsAny,
+      labelsAll: input.labelsAll,
+    });
+    let effectiveRepo = requestedRepo;
+    let repoFallbackUsed = false;
+
+    if (requestedRepo && hits.length === 0 && input.allowRepoFallback) {
+      const crossRepoHits = this.archive.search({
+        query: input.query,
+        topK: input.topK,
+        minConfidence: input.minConfidence,
+        pathPrefix: input.pathPrefix,
+        labelsAny: input.labelsAny,
+        labelsAll: input.labelsAll,
+      });
+      if (crossRepoHits.length > 0) {
+        hits = crossRepoHits;
+        effectiveRepo = undefined;
+        repoFallbackUsed = true;
+      }
+    }
+
+    return {
+      hits,
+      requestedRepo,
+      effectiveRepo,
+      repoFallbackUsed,
+    };
+  }
+
   private handleArchiveMarkUsed(args: Record<string, unknown>): unknown {
     const id = this.readString(args.id, 'archive_mark_used requires id.');
     const outcome = typeof args.outcome === 'string' ? args.outcome : '';
@@ -716,7 +901,7 @@ class StdioJsonRpcServer {
 
   private validateOverviewToken(token: string): { token: string; taxonomyVersion: number; issuedAt: number } {
     if (!this.activeOverviewToken) {
-      throw new Error('Call archive_overview before archive_write or archive_create_path.');
+      throw new Error('Call archive_bootstrap or archive_overview before archive_write or archive_create_path.');
     }
 
     if (this.activeOverviewToken.token !== token) {
