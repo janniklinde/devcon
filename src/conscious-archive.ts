@@ -2,8 +2,11 @@ import { createHash, randomBytes } from 'crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import * as path from 'path';
 
-const ARCHIVE_DB_VERSION = 2;
+const ARCHIVE_DB_VERSION = 3;
+const RECORD_BLOB_VERSION = 1;
 const ROOT_PATH_ID = 'path_root';
+const RECORDS_DIRNAME = 'records';
+const PREVIEW_CHAR_LIMIT = 500;
 
 export interface ArchivePath {
   id: string;
@@ -50,6 +53,37 @@ export interface ArchiveRecord {
   source?: string;
 }
 
+interface ArchiveIndexRecord {
+  id: string;
+  repo: string;
+  branch?: string;
+  commitSha?: string;
+  summary: string;
+  problemPreview: string;
+  solutionPreview: string;
+  pathId: string;
+  path: string;
+  labels: string[];
+  confidence: number;
+  createdAt: string;
+  updatedAt: string;
+  ttlDays: number;
+  useCount: number;
+  successCount: number;
+  lastUsedAt?: string;
+  hash: string;
+  source?: string;
+  blobRef: string;
+}
+
+interface ArchiveRecordBlob {
+  version: number;
+  id: string;
+  problem: string;
+  solution: string;
+  evidence: string[];
+}
+
 export interface ArchiveUsage {
   id: string;
   findingId: string;
@@ -61,7 +95,7 @@ interface ArchiveDatabase {
   version: number;
   taxonomyVersion: number;
   paths: ArchivePath[];
-  records: ArchiveRecord[];
+  records: ArchiveIndexRecord[];
   usage: ArchiveUsage[];
 }
 
@@ -125,6 +159,7 @@ export interface ArchivePaths {
   rootDir: string;
   dbPath: string;
   sessionsDir: string;
+  recordsDir: string;
 }
 
 function nowIso(): string {
@@ -173,6 +208,10 @@ function makePathId(): string {
   return `path_${ts}_${suffix}`;
 }
 
+function makeUsageId(): string {
+  return `usage_${Date.now().toString(36)}_${randomBytes(3).toString('hex')}`;
+}
+
 function recencyScore(createdAt: string): number {
   const createdMs = Date.parse(createdAt);
   if (!Number.isFinite(createdMs)) {
@@ -194,7 +233,7 @@ function recencyScore(createdAt: string): number {
   return 0.1;
 }
 
-function isExpired(record: ArchiveRecord): boolean {
+function isExpired(record: ArchiveIndexRecord): boolean {
   const createdMs = Date.parse(record.createdAt);
   if (!Number.isFinite(createdMs)) {
     return false;
@@ -297,6 +336,49 @@ function defaultPaths(): ArchivePath[] {
   return [root, engineering, debugging, user, preferences];
 }
 
+function defaultBlobRef(recordId: string): string {
+  return `${RECORDS_DIRNAME}/${recordId}.json`;
+}
+
+function normalizeBlobRef(ref: string | undefined, recordId: string): string {
+  const candidate = (ref ?? '').trim().replace(/\\/g, '/');
+  if (!candidate) {
+    return defaultBlobRef(recordId);
+  }
+  const normalized = path.posix.normalize(candidate);
+  if (
+    normalized.startsWith('/')
+    || normalized.startsWith('../')
+    || normalized.includes('/../')
+    || !normalized.startsWith(`${RECORDS_DIRNAME}/`)
+  ) {
+    return defaultBlobRef(recordId);
+  }
+  return normalized;
+}
+
+function sanitizeBlobRefForRead(ref: string): string {
+  const normalized = path.posix.normalize(ref.trim().replace(/\\/g, '/'));
+  if (
+    !normalized
+    || normalized.startsWith('/')
+    || normalized.startsWith('../')
+    || normalized.includes('/../')
+    || !normalized.startsWith(`${RECORDS_DIRNAME}/`)
+  ) {
+    throw new Error(`Invalid blobRef "${ref}"`);
+  }
+  return normalized;
+}
+
+function makePreview(input: string): string {
+  const text = input.trim();
+  if (text.length <= PREVIEW_CHAR_LIMIT) {
+    return text;
+  }
+  return `${text.slice(0, PREVIEW_CHAR_LIMIT)}...`;
+}
+
 function defaultDb(): ArchiveDatabase {
   return {
     version: ARCHIVE_DB_VERSION,
@@ -312,6 +394,7 @@ export function resolveConsciousPaths(rootDir: string): ArchivePaths {
     rootDir,
     dbPath: path.join(rootDir, 'archive-db.json'),
     sessionsDir: path.join(rootDir, 'sessions'),
+    recordsDir: path.join(rootDir, RECORDS_DIRNAME),
   };
 }
 
@@ -319,6 +402,7 @@ export function bootstrapConsciousPaths(rootDir: string): ArchivePaths {
   const paths = resolveConsciousPaths(rootDir);
   mkdirSync(paths.rootDir, { recursive: true });
   mkdirSync(paths.sessionsDir, { recursive: true });
+  mkdirSync(paths.recordsDir, { recursive: true });
   if (!existsSync(paths.dbPath)) {
     writeFileSync(paths.dbPath, `${JSON.stringify(defaultDb(), null, 2)}\n`, 'utf8');
   }
@@ -328,13 +412,19 @@ export function bootstrapConsciousPaths(rootDir: string): ArchivePaths {
 export class ConsciousArchiveStore {
   private readonly dbPath: string;
 
+  private readonly rootDir: string;
+
+  private readonly recordsDir: string;
+
   constructor(dbPath: string) {
     this.dbPath = dbPath;
+    this.rootDir = path.dirname(dbPath);
+    this.recordsDir = path.join(this.rootDir, RECORDS_DIRNAME);
   }
 
   ensureInitialized(): void {
-    const root = path.dirname(this.dbPath);
-    mkdirSync(root, { recursive: true });
+    mkdirSync(this.rootDir, { recursive: true });
+    mkdirSync(this.recordsDir, { recursive: true });
     if (!existsSync(this.dbPath)) {
       writeFileSync(this.dbPath, `${JSON.stringify(defaultDb(), null, 2)}\n`, 'utf8');
       return;
@@ -458,7 +548,7 @@ export class ConsciousArchiveStore {
         continue;
       }
 
-      const haystack = `${record.summary} ${record.problem} ${record.solution} ${record.labels.join(' ')} ${record.path}`;
+      const haystack = `${record.summary} ${record.problemPreview} ${record.solutionPreview} ${record.labels.join(' ')} ${record.path}`;
       const hayTokens = new Set(tokenize(haystack));
       const overlap = queryTokens.reduce((acc, token) => (hayTokens.has(token) ? acc + 1 : acc), 0);
       const tokenScore = queryTokens.length === 0 ? 0.4 : overlap / queryTokens.length;
@@ -475,8 +565,8 @@ export class ConsciousArchiveStore {
         id: record.id,
         repo: record.repo,
         summary: record.summary,
-        problem: record.problem,
-        solution: record.solution,
+        problem: record.problemPreview,
+        solution: record.solutionPreview,
         pathId: record.pathId,
         path: record.path,
         labels: record.labels,
@@ -515,7 +605,7 @@ export class ConsciousArchiveStore {
       solution: input.solution.trim(),
       confidence: clamp(input.confidence ?? 0.6, 0, 1),
       ttlDays: Math.max(1, Math.floor(input.ttlDays ?? 180)),
-      evidence: dedupeStrings((input.evidence ?? []).slice(0, 32)),
+      evidence: dedupeStrings((input.evidence ?? []).slice(0, 128)),
       labels: mergedLabels,
       source: input.source?.trim(),
     };
@@ -530,34 +620,51 @@ export class ConsciousArchiveStore {
 
     if (existing) {
       existing.summary = normalized.summary;
-      existing.problem = normalized.problem;
-      existing.solution = normalized.solution;
+      existing.problemPreview = makePreview(normalized.problem);
+      existing.solutionPreview = makePreview(normalized.solution);
       existing.branch = normalized.branch;
       existing.commitSha = normalized.commitSha;
       existing.source = normalized.source;
       existing.ttlDays = normalized.ttlDays as number;
       existing.confidence = Math.max(existing.confidence, normalized.confidence as number);
-      existing.evidence = dedupeStrings([...existing.evidence, ...(normalized.evidence ?? [])]).slice(0, 64);
       existing.labels = dedupeStrings([...existing.labels, ...(normalized.labels ?? [])]).slice(0, 32);
       existing.pathId = pathEntry.id;
       existing.path = pathEntry.fullPath;
       existing.updatedAt = now;
+      existing.blobRef = normalizeBlobRef(existing.blobRef, existing.id);
+
+      const existingBlob = this.readRecordBlob(existing.blobRef);
+      const mergedEvidence = dedupeStrings([
+        ...(existingBlob?.evidence ?? []),
+        ...(normalized.evidence ?? []),
+      ]).slice(0, 256);
+
+      const blob: ArchiveRecordBlob = {
+        version: RECORD_BLOB_VERSION,
+        id: existing.id,
+        problem: normalized.problem,
+        solution: normalized.solution,
+        evidence: mergedEvidence,
+      };
+
+      this.writeRecordBlob(existing.blobRef, blob);
       this.writeDb(db);
-      return existing;
+      return this.materializeRecord(existing, blob);
     }
 
-    const record: ArchiveRecord = {
-      id: makeRecordId(),
+    const recordId = makeRecordId();
+    const blobRef = defaultBlobRef(recordId);
+    const indexRecord: ArchiveIndexRecord = {
+      id: recordId,
       repo: normalized.repo,
       branch: normalized.branch,
       commitSha: normalized.commitSha,
       summary: normalized.summary,
-      problem: normalized.problem,
-      solution: normalized.solution,
+      problemPreview: makePreview(normalized.problem),
+      solutionPreview: makePreview(normalized.solution),
       pathId: pathEntry.id,
       path: pathEntry.fullPath,
       labels: normalized.labels ?? [],
-      evidence: normalized.evidence ?? [],
       confidence: normalized.confidence as number,
       createdAt: now,
       updatedAt: now,
@@ -566,11 +673,33 @@ export class ConsciousArchiveStore {
       successCount: 0,
       hash,
       source: normalized.source,
+      blobRef,
     };
 
-    db.records.push(record);
+    const blob: ArchiveRecordBlob = {
+      version: RECORD_BLOB_VERSION,
+      id: recordId,
+      problem: normalized.problem,
+      solution: normalized.solution,
+      evidence: normalized.evidence ?? [],
+    };
+
+    this.writeRecordBlob(blobRef, blob);
+    db.records.push(indexRecord);
     this.writeDb(db);
-    return record;
+    return this.materializeRecord(indexRecord, blob);
+  }
+
+  get(findingId: string): ArchiveRecord {
+    this.ensureInitialized();
+    const db = this.readDb();
+    const record = db.records.find((item) => item.id === findingId);
+    if (!record) {
+      throw new Error(`Finding ${findingId} was not found.`);
+    }
+
+    const blob = this.readRecordBlob(record.blobRef);
+    return this.materializeRecord(record, blob);
   }
 
   markUsed(findingId: string, outcome: 'helpful' | 'not_helpful' | 'unknown'): ArchiveRecord {
@@ -581,22 +710,104 @@ export class ConsciousArchiveStore {
       throw new Error(`Finding ${findingId} was not found.`);
     }
 
+    const now = nowIso();
     record.useCount += 1;
     if (outcome === 'helpful') {
       record.successCount += 1;
     }
-    record.lastUsedAt = nowIso();
-    record.updatedAt = nowIso();
+    record.lastUsedAt = now;
+    record.updatedAt = now;
 
     db.usage.push({
-      id: `usage_${Date.now().toString(36)}_${randomBytes(3).toString('hex')}`,
+      id: makeUsageId(),
       findingId,
       outcome,
-      usedAt: nowIso(),
+      usedAt: now,
     });
 
     this.writeDb(db);
-    return record;
+    const blob = this.readRecordBlob(record.blobRef);
+    return this.materializeRecord(record, blob);
+  }
+
+  private materializeRecord(indexRecord: ArchiveIndexRecord, blob?: ArchiveRecordBlob): ArchiveRecord {
+    const problem = blob?.problem ?? indexRecord.problemPreview;
+    const solution = blob?.solution ?? indexRecord.solutionPreview;
+    const evidence = blob?.evidence ?? [];
+    return {
+      id: indexRecord.id,
+      repo: indexRecord.repo,
+      branch: indexRecord.branch,
+      commitSha: indexRecord.commitSha,
+      summary: indexRecord.summary,
+      problem,
+      solution,
+      pathId: indexRecord.pathId,
+      path: indexRecord.path,
+      labels: indexRecord.labels,
+      evidence,
+      confidence: indexRecord.confidence,
+      createdAt: indexRecord.createdAt,
+      updatedAt: indexRecord.updatedAt,
+      ttlDays: indexRecord.ttlDays,
+      useCount: indexRecord.useCount,
+      successCount: indexRecord.successCount,
+      lastUsedAt: indexRecord.lastUsedAt,
+      hash: indexRecord.hash,
+      source: indexRecord.source,
+    };
+  }
+
+  private blobPathFromRef(blobRef: string): string {
+    const normalized = sanitizeBlobRefForRead(blobRef);
+    return path.join(this.rootDir, normalized);
+  }
+
+  private readRecordBlob(blobRef: string): ArchiveRecordBlob | undefined {
+    try {
+      const blobPath = this.blobPathFromRef(blobRef);
+      if (!existsSync(blobPath)) {
+        return undefined;
+      }
+      const raw = JSON.parse(readFileSync(blobPath, 'utf8')) as Record<string, unknown>;
+      if (!raw || typeof raw !== 'object') {
+        return undefined;
+      }
+      const problem = typeof raw.problem === 'string' ? raw.problem : '';
+      const solution = typeof raw.solution === 'string' ? raw.solution : '';
+      const evidence = Array.isArray(raw.evidence)
+        ? raw.evidence.filter((item): item is string => typeof item === 'string')
+        : [];
+      if (!problem && !solution) {
+        return undefined;
+      }
+      return {
+        version: typeof raw.version === 'number' ? raw.version : RECORD_BLOB_VERSION,
+        id: typeof raw.id === 'string' ? raw.id : '',
+        problem,
+        solution,
+        evidence,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private writeRecordBlob(blobRef: string, blob: ArchiveRecordBlob): void {
+    const blobPath = this.blobPathFromRef(blobRef);
+    mkdirSync(path.dirname(blobPath), { recursive: true });
+
+    const normalizedBlob: ArchiveRecordBlob = {
+      version: RECORD_BLOB_VERSION,
+      id: blob.id,
+      problem: blob.problem.trim(),
+      solution: blob.solution.trim(),
+      evidence: dedupeStrings(blob.evidence ?? []).slice(0, 256),
+    };
+
+    const tmpPath = `${blobPath}.tmp`;
+    writeFileSync(tmpPath, `${JSON.stringify(normalizedBlob, null, 2)}\n`, 'utf8');
+    renameSync(tmpPath, blobPath);
   }
 
   private readRawDb(): unknown {
@@ -640,9 +851,10 @@ export class ConsciousArchiveStore {
       pathMap.set(item.id, item);
     }
 
-    const normalizedRecords: ArchiveRecord[] = recordsRaw
+    const normalizedRecords: ArchiveIndexRecord[] = recordsRaw
       .filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === 'object')
       .map((entry) => {
+        const id = typeof entry.id === 'string' ? entry.id : makeRecordId();
         const pathId = typeof entry.pathId === 'string' && pathMap.has(entry.pathId) ? entry.pathId : ROOT_PATH_ID;
         const resolvedPath = pathMap.get(pathId)?.fullPath ?? '/';
         const oldTags = Array.isArray(entry.tags) ? entry.tags.filter((v): v is string => typeof v === 'string') : [];
@@ -651,32 +863,38 @@ export class ConsciousArchiveStore {
 
         const repo = typeof entry.repo === 'string' ? entry.repo : '';
         const summary = typeof entry.summary === 'string' ? entry.summary : '';
-        const problem = typeof entry.problem === 'string' ? entry.problem : '';
-        const solution = typeof entry.solution === 'string' ? entry.solution : '';
+        const oldProblem = typeof entry.problem === 'string' ? entry.problem : '';
+        const oldSolution = typeof entry.solution === 'string' ? entry.solution : '';
+
+        const explicitProblemPreview = typeof entry.problemPreview === 'string' ? entry.problemPreview : '';
+        const explicitSolutionPreview = typeof entry.solutionPreview === 'string' ? entry.solutionPreview : '';
+        const problemPreview = explicitProblemPreview || makePreview(oldProblem);
+        const solutionPreview = explicitSolutionPreview || makePreview(oldSolution);
 
         const fallbackHash = stableHashForRecord(
           {
             repo,
             summary,
-            problem,
-            solution,
+            problem: oldProblem || problemPreview,
+            solution: oldSolution || solutionPreview,
             pathId,
           },
           pathId,
         );
 
-        return {
-          id: typeof entry.id === 'string' ? entry.id : makeRecordId(),
+        const blobRef = normalizeBlobRef(typeof entry.blobRef === 'string' ? entry.blobRef : undefined, id);
+
+        const normalizedRecord: ArchiveIndexRecord = {
+          id,
           repo,
           branch: typeof entry.branch === 'string' ? entry.branch : undefined,
           commitSha: typeof entry.commitSha === 'string' ? entry.commitSha : undefined,
           summary,
-          problem,
-          solution,
+          problemPreview,
+          solutionPreview,
           pathId,
           path: typeof entry.path === 'string' && entry.path.length > 0 ? entry.path : resolvedPath,
           labels: mergedLabels,
-          evidence: Array.isArray(entry.evidence) ? entry.evidence.filter((v): v is string => typeof v === 'string') : [],
           confidence: typeof entry.confidence === 'number' ? clamp(entry.confidence, 0, 1) : 0.6,
           createdAt: typeof entry.createdAt === 'string' ? entry.createdAt : now,
           updatedAt: typeof entry.updatedAt === 'string' ? entry.updatedAt : now,
@@ -686,9 +904,29 @@ export class ConsciousArchiveStore {
           lastUsedAt: typeof entry.lastUsedAt === 'string' ? entry.lastUsedAt : undefined,
           hash: typeof entry.hash === 'string' ? entry.hash : fallbackHash,
           source: typeof entry.source === 'string' ? entry.source : undefined,
+          blobRef,
         };
+
+        const existingBlob = this.readRecordBlob(blobRef);
+        if (!existingBlob) {
+          const inlineEvidence = Array.isArray(entry.evidence)
+            ? entry.evidence.filter((v): v is string => typeof v === 'string')
+            : [];
+          if (oldProblem || oldSolution || inlineEvidence.length > 0 || problemPreview || solutionPreview) {
+            const bootstrapBlob: ArchiveRecordBlob = {
+              version: RECORD_BLOB_VERSION,
+              id,
+              problem: oldProblem || problemPreview,
+              solution: oldSolution || solutionPreview,
+              evidence: inlineEvidence,
+            };
+            this.writeRecordBlob(blobRef, bootstrapBlob);
+          }
+        }
+
+        return normalizedRecord;
       })
-      .filter((entry) => entry.repo.length > 0 && entry.summary.length > 0 && entry.problem.length > 0 && entry.solution.length > 0);
+      .filter((entry) => entry.repo.length > 0 && entry.summary.length > 0 && (entry.problemPreview.length > 0 || entry.solutionPreview.length > 0));
 
     const normalizedUsage: ArchiveUsage[] = usageRaw
       .filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === 'object')
@@ -697,7 +935,7 @@ export class ConsciousArchiveStore {
           ? entry.outcome
           : 'unknown';
         return {
-          id: typeof entry.id === 'string' ? entry.id : `usage_${Date.now().toString(36)}_${randomBytes(3).toString('hex')}`,
+          id: typeof entry.id === 'string' ? entry.id : makeUsageId(),
           findingId: typeof entry.findingId === 'string' ? entry.findingId : '',
           outcome,
           usedAt: typeof entry.usedAt === 'string' ? entry.usedAt : now,

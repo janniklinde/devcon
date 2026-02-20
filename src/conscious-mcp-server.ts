@@ -359,7 +359,7 @@ class StdioJsonRpcServer {
         protocolVersion,
         serverInfo: {
           name: 'devcon-archive',
-          version: '0.3.0',
+          version: '0.4.0',
         },
         capabilities: {
           tools: {
@@ -406,7 +406,7 @@ class StdioJsonRpcServer {
           },
           {
             name: 'archive_search',
-            description: 'Search historical findings by text, path prefix, and labels. Requires archive_overview once per session first so path/label choices follow current taxonomy.',
+            description: 'Search historical findings by text, path prefix, and labels. Returns summary + previews from the hot index. Call archive_get for full stored details. Requires archive_overview once per session first so path/label choices follow current taxonomy.',
             inputSchema: {
               type: 'object',
               properties: {
@@ -428,8 +428,19 @@ class StdioJsonRpcServer {
             },
           },
           {
+            name: 'archive_get',
+            description: 'Fetch full stored details for a finding id (problem, solution, evidence). Use this after archive_search when a hit looks relevant.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                id: { type: 'string' },
+              },
+              required: ['id'],
+            },
+          },
+          {
             name: 'archive_write',
-            description: 'Persist a durable finding in the existing taxonomy. Call archive_overview first, then pass overview_token + path_id. Storage is project-local; do not add project-name wrapper folders. Store user preferences under /user/preferences with label user-preference.',
+            description: 'Persist a durable finding in the existing taxonomy. Long details are persisted in per-finding files; archive_search serves index previews and archive_get retrieves full details. Call archive_overview first, then pass overview_token + path_id. Storage is project-local; do not add project-name wrapper folders. Store user preferences under /user/preferences with label user-preference.',
             inputSchema: {
               type: 'object',
               properties: {
@@ -491,6 +502,9 @@ class StdioJsonRpcServer {
       }
       if (name === 'archive_search') {
         return this.handleArchiveSearch(args);
+      }
+      if (name === 'archive_get') {
+        return this.handleArchiveGet(args);
       }
       if (name === 'archive_write') {
         return this.handleArchiveWrite(args);
@@ -644,6 +658,16 @@ class StdioJsonRpcServer {
 
     return {
       content: [{ type: 'text', text: `Stored finding ${record.id} in ${record.path}` }],
+      structuredContent: record,
+      isError: false,
+    };
+  }
+
+  private handleArchiveGet(args: Record<string, unknown>): unknown {
+    const id = this.readString(args.id, 'archive_get requires id.');
+    const record = this.archive.get(id);
+    return {
+      content: [{ type: 'text', text: `Loaded full finding ${record.id} from ${record.path}` }],
       structuredContent: record,
       isError: false,
     };
