@@ -113,6 +113,9 @@ Container isolation notes:
 - Persistent archive storage is mounted into the sidecar only (`~/.config/devcon/conscious` -> `/state`).
 - Conscious sidecar mode is not compatible with `--network-host`.
 - Override sidecar image via `DEVCON_CONSCIOUS_SIDECAR_IMAGE` (defaults to `devcon:latest`).
+- Memory persistence policy knobs:
+  - `DEVCON_CONSCIOUS_MEMORY_POLICY=off|encourage|require` (default `encourage`)
+  - `DEVCON_CONSCIOUS_MEMORY_POLICY_THRESHOLD=<N>` (default `4` read calls before reminders/gating)
 
 MCP tools exposed in conscious mode:
 
@@ -137,6 +140,8 @@ Write flow constraints:
 - Storage is already scoped to the current conscious project. Avoid redundant folders like `engineering/<project-name>`.
 - Internally, `archive-db.json` is a hot index and full per-finding details are stored in `records/*.json`.
 - Updates are append-only at the finding level: each update/write appends a revision that can be listed/fetched later.
+- With `DEVCON_CONSCIOUS_MEMORY_POLICY=encourage`, archive tool callbacks include a reflection prompt to consider persisting reusable insights (while skipping one-off details).
+- With `DEVCON_CONSCIOUS_MEMORY_POLICY=require`, after enough read-only archive exploration (`..._THRESHOLD`) further archive reads are blocked until at least one `archive_write`/`archive_update`.
 - `archive_search` can automatically fall back to cross-repo matches when strict repo scope returns none (`repo_fallback`).
 
 Automatic behavior:

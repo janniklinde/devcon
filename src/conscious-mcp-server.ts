@@ -34,6 +34,8 @@ interface RuntimeConfig {
   projectName?: string;
   seedQuery?: string;
   debugLogPath?: string;
+  memoryPolicy: 'off' | 'encourage' | 'require';
+  memoryPolicyThreshold: number;
 }
 
 const SUPPORTED_PROTOCOL_VERSIONS = [
@@ -50,6 +52,17 @@ function parseArgs(argv: string[]): RuntimeConfig {
   let projectName = process.env.DEVCON_CONSCIOUS_PROJECT_NAME;
   let seedQuery = process.env.DEVCON_CONSCIOUS_SEED_QUERY;
   let debugLogPath = process.env.DEVCON_CONSCIOUS_DEBUG_LOG;
+  let memoryPolicy: RuntimeConfig['memoryPolicy'] = 'encourage';
+  let memoryPolicyThreshold = 4;
+
+  const envPolicy = (process.env.DEVCON_CONSCIOUS_MEMORY_POLICY ?? '').trim().toLowerCase();
+  if (envPolicy === 'off' || envPolicy === 'encourage' || envPolicy === 'require') {
+    memoryPolicy = envPolicy;
+  }
+  const envThreshold = Number.parseInt(process.env.DEVCON_CONSCIOUS_MEMORY_POLICY_THRESHOLD ?? '', 10);
+  if (Number.isFinite(envThreshold) && envThreshold > 0) {
+    memoryPolicyThreshold = envThreshold;
+  }
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -131,6 +144,49 @@ function parseArgs(argv: string[]): RuntimeConfig {
       i += 1;
       continue;
     }
+    if (arg.startsWith('--memory-policy=')) {
+      const value = arg.slice('--memory-policy='.length).trim().toLowerCase();
+      if (value === 'off' || value === 'encourage' || value === 'require') {
+        memoryPolicy = value;
+      } else {
+        throw new Error('--memory-policy must be one of: off, encourage, require.');
+      }
+      continue;
+    }
+    if (arg === '--memory-policy') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--memory-policy requires a value.');
+      }
+      const value = next.trim().toLowerCase();
+      if (value !== 'off' && value !== 'encourage' && value !== 'require') {
+        throw new Error('--memory-policy must be one of: off, encourage, require.');
+      }
+      memoryPolicy = value;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--memory-policy-threshold=')) {
+      const parsed = Number.parseInt(arg.slice('--memory-policy-threshold='.length), 10);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        throw new Error('--memory-policy-threshold must be a positive integer.');
+      }
+      memoryPolicyThreshold = parsed;
+      continue;
+    }
+    if (arg === '--memory-policy-threshold') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--memory-policy-threshold requires a value.');
+      }
+      const parsed = Number.parseInt(next, 10);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        throw new Error('--memory-policy-threshold must be a positive integer.');
+      }
+      memoryPolicyThreshold = parsed;
+      i += 1;
+      continue;
+    }
   }
 
   if (!stateDir) {
@@ -144,6 +200,8 @@ function parseArgs(argv: string[]): RuntimeConfig {
     projectName,
     seedQuery,
     debugLogPath,
+    memoryPolicy,
+    memoryPolicyThreshold,
   };
 }
 
@@ -162,12 +220,18 @@ class StdioJsonRpcServer {
     issuedAt: number;
   };
 
+  private memoryReadCount = 0;
+
+  private memoryWriteCount = 0;
+
   constructor(config: RuntimeConfig) {
     this.config = config;
     const paths = resolveConsciousPaths(config.stateDir);
     this.archive = new ConsciousArchiveStore(paths.dbPath);
     this.archive.ensureInitialized();
-    this.log(`starting server (repo=${config.defaultRepo ?? 'unset'}, project=${this.projectScopeLabel()})`);
+    this.log(
+      `starting server (repo=${config.defaultRepo ?? 'unset'}, project=${this.projectScopeLabel()}, memoryPolicy=${config.memoryPolicy}, threshold=${config.memoryPolicyThreshold})`,
+    );
   }
 
   start(): void {
@@ -398,7 +462,7 @@ class StdioJsonRpcServer {
         tools: [
           {
             name: 'archive_bootstrap',
-            description: 'MANDATORY FIRST CALL in each new chat. Returns project-local taxonomy, overview_token, and concrete initial findings (including user preferences) so you can answer context questions before broad workspace scans.',
+            description: 'MANDATORY FIRST CALL in each new chat. Returns project-local taxonomy, overview_token, and concrete initial findings (including user preferences) so you can answer context questions before broad workspace scans. During the task, periodically reflect on whether a reusable insight should be persisted.',
             inputSchema: {
               type: 'object',
               properties: {
@@ -444,7 +508,7 @@ class StdioJsonRpcServer {
           },
           {
             name: 'archive_search',
-            description: 'Search historical findings by text, path prefix, and labels. Returns summary + previews from the hot index. Call archive_get for full stored details. Requires archive_overview or archive_bootstrap once per session first so path/label choices follow current taxonomy.',
+            description: 'Search historical findings by text, path prefix, and labels. Returns summary + previews from the hot index. Call archive_get for full stored details. Requires archive_overview or archive_bootstrap once per session first so path/label choices follow current taxonomy. As you work, reflect on whether newly discovered reusable insights should be persisted.',
             inputSchema: {
               type: 'object',
               properties: {
@@ -468,7 +532,7 @@ class StdioJsonRpcServer {
           },
           {
             name: 'archive_get',
-            description: 'Fetch full stored details for a finding id (problem, solution, evidence). Optionally pass revision_id to load a historical version.',
+            description: 'Fetch full stored details for a finding id (problem, solution, evidence). Optionally pass revision_id to load a historical version. While reviewing, reflect on whether a new reusable insight should be persisted.',
             inputSchema: {
               type: 'object',
               properties: {
@@ -480,7 +544,7 @@ class StdioJsonRpcServer {
           },
           {
             name: 'archive_versions',
-            description: 'List stored revisions for a finding so you can inspect historical versions before choosing one to load.',
+            description: 'List stored revisions for a finding so you can inspect historical versions before choosing one to load. While reviewing, reflect on whether a new reusable insight should be persisted.',
             inputSchema: {
               type: 'object',
               properties: {
@@ -492,7 +556,7 @@ class StdioJsonRpcServer {
           },
           {
             name: 'archive_write',
-            description: 'Persist a durable finding in the existing taxonomy. Long details are persisted in per-finding files; archive_search serves index previews and archive_get retrieves full details. Repeated writes append new revisions instead of destructive overwrite. Call archive_overview first, then pass overview_token + path_id. Storage is project-local; do not add project-name wrapper folders. Store user preferences under /user/preferences with label user-preference.',
+            description: 'Persist a durable finding in the existing taxonomy. Long details are persisted in per-finding files; archive_search serves index previews and archive_get retrieves full details. Repeated writes append new revisions instead of destructive overwrite. Call archive_overview first, then pass overview_token + path_id. Storage is project-local; do not add project-name wrapper folders. Store user preferences under /user/preferences with label user-preference. Prefer high-signal reusable insights; avoid noisy one-off writes.',
             inputSchema: {
               type: 'object',
               properties: {
@@ -521,7 +585,7 @@ class StdioJsonRpcServer {
           },
           {
             name: 'archive_update',
-            description: 'Update an existing finding by id and append a new revision. Use when refining prior memory without creating a separate finding.',
+            description: 'Update an existing finding by id and append a new revision. Use when refining prior memory without creating a separate finding. Prefer high-signal reusable insights; avoid noisy one-off writes.',
             inputSchema: {
               type: 'object',
               properties: {
@@ -616,7 +680,8 @@ class StdioJsonRpcServer {
     const topLabels = overview.labels.slice(0, 8).map((entry) => `${entry.label}(${entry.count})`).join(', ');
     const pathCount = overview.paths.length;
     const labelText = topLabels.length > 0 ? topLabels : '(none yet)';
-    const text = `Overview ready for ${this.projectScopeLabel()}. paths=${pathCount}, taxonomy_version=${overview.taxonomyVersion}, labels=${labelText}. Storage is project-local; avoid project-name wrapper folders. Use overview_token with archive_write/archive_create_path.`;
+    let text = `Overview ready for ${this.projectScopeLabel()}. paths=${pathCount}, taxonomy_version=${overview.taxonomyVersion}, labels=${labelText}. Storage is project-local; avoid project-name wrapper folders. Use overview_token with archive_write/archive_create_path.`;
+    text = this.appendMemoryReflection(text, 'read');
 
     return {
       content: [{ type: 'text', text }],
@@ -698,15 +763,18 @@ class StdioJsonRpcServer {
     const text = previewLines.length === 0
       ? `Bootstrap complete for ${this.projectScopeLabel()}. No initial findings matched query "${query}".`
       : `Bootstrap complete for ${this.projectScopeLabel()}. Use these persisted findings first:\n${previewLines.map((line, idx) => `${idx + 1}. ${line}`).join('\n')}`;
+    const textWithReflection = this.appendMemoryReflection(text, 'read');
 
     return {
-      content: [{ type: 'text', text }],
+      content: [{ type: 'text', text: textWithReflection }],
       structuredContent: {
         ...overview.structuredContent,
         bootstrap_query: query,
         requested_repo: searchResult.requestedRepo,
         effective_repo: searchResult.effectiveRepo,
         repo_fallback_used: searchResult.repoFallbackUsed,
+        memory_policy: this.config.memoryPolicy,
+        memory_policy_threshold: this.config.memoryPolicyThreshold,
         results: searchResult.hits,
         preference_results: preferenceResult.hits,
       },
@@ -732,7 +800,13 @@ class StdioJsonRpcServer {
     }
 
     return {
-      content: [{ type: 'text', text: result.created ? `Created path ${result.path.fullPath}` : `Path already exists: ${result.path.fullPath}` }],
+      content: [{
+        type: 'text',
+        text: this.appendMemoryReflection(
+          result.created ? `Created path ${result.path.fullPath}` : `Path already exists: ${result.path.fullPath}`,
+          'read',
+        ),
+      }],
       structuredContent: {
         created: result.created,
         path: result.path,
@@ -747,6 +821,7 @@ class StdioJsonRpcServer {
     if (!this.activeOverviewToken) {
       throw new Error('Call archive_bootstrap or archive_overview once at session start before archive_search.');
     }
+    this.enforceMemoryWriteGate('archive_search');
 
     const query = typeof args.query === 'string' ? args.query : '';
     if (!query.trim()) {
@@ -774,9 +849,10 @@ class StdioJsonRpcServer {
       labelsAll,
       allowRepoFallback: repoFallback,
     });
+    this.memoryReadCount += 1;
     const hits = searchResult.hits;
 
-    const text = hits.length === 0
+    let text = hits.length === 0
       ? 'No prior findings matched the query.'
       : searchResult.repoFallbackUsed
         ? `No hits in requested repo scope; showing ${hits.length} cross-repo fallback result(s).\n${hits
@@ -785,6 +861,7 @@ class StdioJsonRpcServer {
       : hits
         .map((hit, index) => `${index + 1}. [${hit.id}] ${hit.summary} (path=${hit.path}, confidence=${hit.confidence.toFixed(2)}, score=${hit.score.toFixed(2)})`)
         .join('\n');
+    text = this.appendMemoryReflection(text, 'read');
 
     return {
       content: [{ type: 'text', text }],
@@ -836,9 +913,10 @@ class StdioJsonRpcServer {
       ttlDays: typeof args.ttl_days === 'number' ? args.ttl_days : 180,
       source: typeof args.source === 'string' ? args.source : 'mcp',
     });
+    this.memoryWriteCount += 1;
 
     return {
-      content: [{ type: 'text', text: `Stored finding ${record.id} in ${record.path}` }],
+      content: [{ type: 'text', text: this.appendMemoryReflection(`Stored finding ${record.id} in ${record.path}`, 'write') }],
       structuredContent: record,
       isError: false,
     };
@@ -885,34 +963,42 @@ class StdioJsonRpcServer {
       ttlDays: typeof args.ttl_days === 'number' ? args.ttl_days : undefined,
       source: typeof args.source === 'string' ? args.source : 'mcp:update',
     });
+    this.memoryWriteCount += 1;
 
     return {
-      content: [{ type: 'text', text: `Updated finding ${record.id}; now at revision ${record.revision ?? '?'}` }],
+      content: [{ type: 'text', text: this.appendMemoryReflection(`Updated finding ${record.id}; now at revision ${record.revision ?? '?'}`, 'write') }],
       structuredContent: record,
       isError: false,
     };
   }
 
   private handleArchiveGet(args: Record<string, unknown>): unknown {
+    this.enforceMemoryWriteGate('archive_get');
     const id = this.readString(args.id, 'archive_get requires id.');
     const revisionId = typeof args.revision_id === 'string' ? args.revision_id : undefined;
     const record = this.archive.get(id, revisionId);
+    this.memoryReadCount += 1;
+    let text = revisionId ? `Loaded revision ${revisionId} for finding ${record.id}` : `Loaded full finding ${record.id} from ${record.path}`;
+    text = this.appendMemoryReflection(text, 'read');
     return {
-      content: [{ type: 'text', text: revisionId ? `Loaded revision ${revisionId} for finding ${record.id}` : `Loaded full finding ${record.id} from ${record.path}` }],
+      content: [{ type: 'text', text }],
       structuredContent: record,
       isError: false,
     };
   }
 
   private handleArchiveVersions(args: Record<string, unknown>): unknown {
+    this.enforceMemoryWriteGate('archive_versions');
     const id = this.readString(args.id, 'archive_versions requires id.');
     const limit = typeof args.limit === 'number' ? args.limit : 25;
     const revisions = this.archive.listVersions(id, limit);
-    const text = revisions.length === 0
+    this.memoryReadCount += 1;
+    let text = revisions.length === 0
       ? `No revisions found for finding ${id}.`
       : revisions
         .map((revision) => `${revision.revision}. [${revision.id}] ${revision.summary} (created=${revision.createdAt}${revision.isCurrent ? ', current' : ''})`)
         .join('\n');
+    text = this.appendMemoryReflection(text, 'read');
     return {
       content: [{ type: 'text', text }],
       structuredContent: {
@@ -922,6 +1008,42 @@ class StdioJsonRpcServer {
       },
       isError: false,
     };
+  }
+
+  private enforceMemoryWriteGate(toolName: 'archive_search' | 'archive_get' | 'archive_versions'): void {
+    if (this.config.memoryPolicy !== 'require') {
+      return;
+    }
+    if (this.memoryWriteCount > 0) {
+      return;
+    }
+    if (this.memoryReadCount < this.config.memoryPolicyThreshold) {
+      return;
+    }
+    throw new Error(
+      `Memory policy requires persistence after read-only exploration. Call archive_write or archive_update before additional ${toolName} calls.`,
+    );
+  }
+
+  private appendMemoryReflection(text: string, context: 'read' | 'write'): string {
+    const hint = this.memoryReflectionHint(context);
+    if (!hint) {
+      return text;
+    }
+    return `${text}\n\n${hint}`;
+  }
+
+  private memoryReflectionHint(context: 'read' | 'write'): string | undefined {
+    if (this.config.memoryPolicy === 'off') {
+      return undefined;
+    }
+    if (context === 'write') {
+      return 'Memory reflection: This call already persisted memory. Add another write only if you discovered a distinct reusable insight.';
+    }
+    if (this.config.memoryPolicy === 'require' && this.memoryWriteCount === 0 && this.memoryReadCount >= this.config.memoryPolicyThreshold) {
+      return 'Memory reflection: You have explored archive context extensively. If this turn produced a reusable insight, persist it with archive_write or archive_update before moving on.';
+    }
+    return 'Memory reflection: If this turn produced a reusable preference, decision, root-cause, bug pattern, or playbook step, consider persisting it with archive_write or archive_update. Skip one-off transient details.';
   }
 
   private runSearch(input: {
@@ -985,7 +1107,7 @@ class StdioJsonRpcServer {
 
     const record = this.archive.markUsed(id, outcome);
     return {
-      content: [{ type: 'text', text: `Marked ${id} as ${outcome}` }],
+      content: [{ type: 'text', text: this.appendMemoryReflection(`Marked ${id} as ${outcome}`, 'read') }],
       structuredContent: {
         id: record.id,
         useCount: record.useCount,

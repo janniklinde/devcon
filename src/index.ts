@@ -75,9 +75,11 @@ const CONSCIOUS_SIDECAR_MCP_SERVER_SCRIPT = '/opt/devcon/conscious-mcp-server.js
 const CONSCIOUS_SIDECAR_ARCHIVE_MODULE = '/opt/devcon/conscious-archive.js';
 const CONSCIOUS_SIDECAR_STATE_DIR = '/state';
 const CONSCIOUS_SIDECAR_NETWORK = 'devcon-conscious-net';
-const CONSCIOUS_SIDECAR_REV = '3';
+const CONSCIOUS_SIDECAR_REV = '4';
 const CONSCIOUS_SIDECAR_PORT = parsePositiveIntEnv(process.env.DEVCON_CONSCIOUS_TCP_PORT, 8765);
 const CONSCIOUS_SIDECAR_READY_TIMEOUT_MS = parsePositiveIntEnv(process.env.DEVCON_CONSCIOUS_READY_TIMEOUT_MS, 15_000);
+const CONSCIOUS_MEMORY_POLICY = process.env.DEVCON_CONSCIOUS_MEMORY_POLICY;
+const CONSCIOUS_MEMORY_POLICY_THRESHOLD = process.env.DEVCON_CONSCIOUS_MEMORY_POLICY_THRESHOLD;
 const CONSCIOUS_MCP_NAME = 'devcon-archive';
 const CONSCIOUS_PROJECT_ID_RELATIVE_PATH = 'devcon/project-id';
 const CONSCIOUS_PROJECTS_DIRNAME = 'projects';
@@ -978,6 +980,7 @@ function formatRetrievalMarkdown(
   lines.push('Storage is already project-local for this repo. Do not create project-name wrapper folders like `engineering/<project-name>`.');
   lines.push('`archive_search` returns fast index previews; call `archive_get` for full stored details of a hit.');
   lines.push('Use `archive_versions` to inspect revision history and `archive_get` with `revision_id` to load older versions.');
+  lines.push('During substantive work, periodically reflect on whether a reusable insight is worth persisting with `archive_write` or `archive_update`; skip transient one-off details.');
   lines.push('Use existing `path_id` values whenever possible; only create new paths when no existing one fits.');
   lines.push('');
   lines.push('Known paths:');
@@ -1162,6 +1165,14 @@ function ensureConsciousSidecar(runtime: ConsciousRuntime, image: string, dryRun
     `type=bind,source=${runtime.stateDir},target=${CONSCIOUS_SIDECAR_STATE_DIR}`,
     '--mount',
     `type=bind,source=${hostConsciousDistDir},target=/opt/devcon,readonly`,
+  ];
+  if (CONSCIOUS_MEMORY_POLICY && CONSCIOUS_MEMORY_POLICY.trim().length > 0) {
+    runArgs.push('-e', `DEVCON_CONSCIOUS_MEMORY_POLICY=${CONSCIOUS_MEMORY_POLICY}`);
+  }
+  if (CONSCIOUS_MEMORY_POLICY_THRESHOLD && CONSCIOUS_MEMORY_POLICY_THRESHOLD.trim().length > 0) {
+    runArgs.push('-e', `DEVCON_CONSCIOUS_MEMORY_POLICY_THRESHOLD=${CONSCIOUS_MEMORY_POLICY_THRESHOLD}`);
+  }
+  runArgs.push(
     image,
     'node',
     CONSCIOUS_SIDECAR_SERVER_SCRIPT,
@@ -1181,7 +1192,7 @@ function ensureConsciousSidecar(runtime: ConsciousRuntime, image: string, dryRun
     runtime.projectName,
     '--seed-query',
     runtime.seedQuery,
-  ];
+  );
 
   const startSidecar = (): void => {
     const run = spawnSync('docker', runArgs, { encoding: 'utf8' });
