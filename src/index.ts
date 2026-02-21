@@ -977,6 +977,7 @@ function formatRetrievalMarkdown(
   lines.push('Session bootstrap: call `archive_bootstrap` (or `archive_overview`) before other archive tools so path/label choices match current taxonomy.');
   lines.push('Storage is already project-local for this repo. Do not create project-name wrapper folders like `engineering/<project-name>`.');
   lines.push('`archive_search` returns fast index previews; call `archive_get` for full stored details of a hit.');
+  lines.push('Use `archive_versions` to inspect revision history and `archive_get` with `revision_id` to load older versions.');
   lines.push('Use existing `path_id` values whenever possible; only create new paths when no existing one fits.');
   lines.push('');
   lines.push('Known paths:');

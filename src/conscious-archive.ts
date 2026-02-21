@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import * as path from 'path';
 
-const ARCHIVE_DB_VERSION = 3;
+const ARCHIVE_DB_VERSION = 4;
 const RECORD_BLOB_VERSION = 1;
 const ROOT_PATH_ID = 'path_root';
 const RECORDS_DIRNAME = 'records';
@@ -51,6 +51,10 @@ export interface ArchiveRecord {
   lastUsedAt?: string;
   hash: string;
   source?: string;
+  revisionId?: string;
+  revision?: number;
+  revisionCreatedAt?: string;
+  revisionCount?: number;
 }
 
 interface ArchiveIndexRecord {
@@ -74,6 +78,7 @@ interface ArchiveIndexRecord {
   hash: string;
   source?: string;
   blobRef: string;
+  currentRevisionId?: string;
 }
 
 interface ArchiveRecordBlob {
@@ -82,6 +87,46 @@ interface ArchiveRecordBlob {
   problem: string;
   solution: string;
   evidence: string[];
+}
+
+interface ArchiveRecordRevision {
+  id: string;
+  findingId: string;
+  revision: number;
+  createdAt: string;
+  branch?: string;
+  commitSha?: string;
+  summary: string;
+  problemPreview: string;
+  solutionPreview: string;
+  pathId: string;
+  path: string;
+  labels: string[];
+  confidence: number;
+  ttlDays: number;
+  hash: string;
+  source?: string;
+  blobRef: string;
+}
+
+export interface ArchiveRecordRevisionInfo {
+  id: string;
+  findingId: string;
+  revision: number;
+  createdAt: string;
+  branch?: string;
+  commitSha?: string;
+  summary: string;
+  problem: string;
+  solution: string;
+  pathId: string;
+  path: string;
+  labels: string[];
+  confidence: number;
+  ttlDays: number;
+  hash: string;
+  source?: string;
+  isCurrent: boolean;
 }
 
 export interface ArchiveUsage {
@@ -96,6 +141,7 @@ interface ArchiveDatabase {
   taxonomyVersion: number;
   paths: ArchivePath[];
   records: ArchiveIndexRecord[];
+  revisions: ArchiveRecordRevision[];
   usage: ArchiveUsage[];
 }
 
@@ -133,6 +179,22 @@ export interface ArchiveWriteInput {
   summary: string;
   problem: string;
   solution: string;
+  pathId?: string;
+  labels?: string[];
+  tags?: string[];
+  evidence?: string[];
+  confidence?: number;
+  ttlDays?: number;
+  source?: string;
+}
+
+export interface ArchiveUpdateInput {
+  id: string;
+  branch?: string;
+  commitSha?: string;
+  summary?: string;
+  problem?: string;
+  solution?: string;
   pathId?: string;
   labels?: string[];
   tags?: string[];
@@ -210,6 +272,10 @@ function makePathId(): string {
 
 function makeUsageId(): string {
   return `usage_${Date.now().toString(36)}_${randomBytes(3).toString('hex')}`;
+}
+
+function makeRevisionId(): string {
+  return `rev_${Date.now().toString(36)}_${randomBytes(4).toString('hex')}`;
 }
 
 function recencyScore(createdAt: string): number {
@@ -340,6 +406,10 @@ function defaultBlobRef(recordId: string): string {
   return `${RECORDS_DIRNAME}/${recordId}.json`;
 }
 
+function defaultRevisionBlobRef(findingId: string, revisionId: string): string {
+  return `${RECORDS_DIRNAME}/revisions/${findingId}/${revisionId}.json`;
+}
+
 function normalizeBlobRef(ref: string | undefined, recordId: string): string {
   const candidate = (ref ?? '').trim().replace(/\\/g, '/');
   if (!candidate) {
@@ -385,6 +455,7 @@ function defaultDb(): ArchiveDatabase {
     taxonomyVersion: 1,
     paths: defaultPaths(),
     records: [],
+    revisions: [],
     usage: [],
   };
 }
@@ -622,26 +693,15 @@ export class ConsciousArchiveStore {
     const existing = db.records.find((record) => record.hash === hash && record.repo === normalized.repo);
 
     if (existing) {
-      existing.summary = normalized.summary;
-      existing.problemPreview = makePreview(normalized.problem);
-      existing.solutionPreview = makePreview(normalized.solution);
-      existing.branch = normalized.branch;
-      existing.commitSha = normalized.commitSha;
-      existing.source = normalized.source;
-      existing.ttlDays = normalized.ttlDays as number;
-      existing.confidence = Math.max(existing.confidence, normalized.confidence as number);
-      existing.labels = dedupeStrings([...existing.labels, ...(normalized.labels ?? [])]).slice(0, 32);
-      existing.pathId = pathEntry.id;
-      existing.path = pathEntry.fullPath;
-      existing.updatedAt = now;
-      existing.blobRef = normalizeBlobRef(existing.blobRef, existing.id);
-
       const existingBlob = this.readRecordBlob(existing.blobRef);
       const mergedEvidence = dedupeStrings([
         ...(existingBlob?.evidence ?? []),
         ...(normalized.evidence ?? []),
       ]).slice(0, 256);
 
+      const nextRevision = this.nextRevisionNumber(db.revisions, existing.id);
+      const revisionId = makeRevisionId();
+      const revisionBlobRef = defaultRevisionBlobRef(existing.id, revisionId);
       const blob: ArchiveRecordBlob = {
         version: RECORD_BLOB_VERSION,
         id: existing.id,
@@ -649,14 +709,53 @@ export class ConsciousArchiveStore {
         solution: normalized.solution,
         evidence: mergedEvidence,
       };
+      this.writeRecordBlob(revisionBlobRef, blob);
 
-      this.writeRecordBlob(existing.blobRef, blob);
+      const revision: ArchiveRecordRevision = {
+        id: revisionId,
+        findingId: existing.id,
+        revision: nextRevision,
+        createdAt: now,
+        branch: normalized.branch,
+        commitSha: normalized.commitSha,
+        summary: normalized.summary,
+        problemPreview: makePreview(normalized.problem),
+        solutionPreview: makePreview(normalized.solution),
+        pathId: pathEntry.id,
+        path: pathEntry.fullPath,
+        labels: dedupeStrings([...existing.labels, ...(normalized.labels ?? [])]).slice(0, 32),
+        confidence: Math.max(existing.confidence, normalized.confidence as number),
+        ttlDays: normalized.ttlDays as number,
+        hash,
+        source: normalized.source,
+        blobRef: revisionBlobRef,
+      };
+      db.revisions.push(revision);
+
+      existing.summary = revision.summary;
+      existing.problemPreview = revision.problemPreview;
+      existing.solutionPreview = revision.solutionPreview;
+      existing.branch = revision.branch;
+      existing.commitSha = revision.commitSha;
+      existing.source = revision.source;
+      existing.ttlDays = revision.ttlDays;
+      existing.confidence = revision.confidence;
+      existing.labels = revision.labels;
+      existing.pathId = revision.pathId;
+      existing.path = revision.path;
+      existing.updatedAt = now;
+      existing.hash = hash;
+      existing.blobRef = revision.blobRef;
+      existing.currentRevisionId = revision.id;
+
       this.writeDb(db);
-      return this.materializeRecord(existing, blob);
+      return this.materializeRecord(existing, blob, revision, this.countRevisions(db.revisions, existing.id));
     }
 
     const recordId = makeRecordId();
+    const revisionId = makeRevisionId();
     const blobRef = defaultBlobRef(recordId);
+    const revisionBlobRef = defaultRevisionBlobRef(recordId, revisionId);
     const indexRecord: ArchiveIndexRecord = {
       id: recordId,
       repo: normalized.repo,
@@ -676,7 +775,8 @@ export class ConsciousArchiveStore {
       successCount: 0,
       hash,
       source: normalized.source,
-      blobRef,
+      blobRef: revisionBlobRef,
+      currentRevisionId: revisionId,
     };
 
     const blob: ArchiveRecordBlob = {
@@ -688,12 +788,129 @@ export class ConsciousArchiveStore {
     };
 
     this.writeRecordBlob(blobRef, blob);
+    this.writeRecordBlob(revisionBlobRef, blob);
+    db.revisions.push({
+      id: revisionId,
+      findingId: recordId,
+      revision: 1,
+      createdAt: now,
+      branch: normalized.branch,
+      commitSha: normalized.commitSha,
+      summary: normalized.summary,
+      problemPreview: makePreview(normalized.problem),
+      solutionPreview: makePreview(normalized.solution),
+      pathId: pathEntry.id,
+      path: pathEntry.fullPath,
+      labels: normalized.labels ?? [],
+      confidence: normalized.confidence as number,
+      ttlDays: normalized.ttlDays as number,
+      hash,
+      source: normalized.source,
+      blobRef: revisionBlobRef,
+    });
     db.records.push(indexRecord);
     this.writeDb(db);
-    return this.materializeRecord(indexRecord, blob);
+    return this.materializeRecord(indexRecord, blob, db.revisions[db.revisions.length - 1], 1);
   }
 
-  get(findingId: string): ArchiveRecord {
+  update(input: ArchiveUpdateInput): ArchiveRecord {
+    this.ensureInitialized();
+    const db = this.readDb();
+    const existing = db.records.find((item) => item.id === input.id);
+    if (!existing) {
+      throw new Error(`Finding ${input.id} was not found.`);
+    }
+
+    const fallbackPath = db.paths.find((item) => item.id === existing.pathId);
+    const nextPathId = input.pathId ?? existing.pathId;
+    const nextPath = db.paths.find((item) => item.id === nextPathId);
+    if (!nextPath) {
+      throw new Error(`Unknown pathId ${nextPathId}. Fetch archive_overview first and use an existing path_id.`);
+    }
+
+    const currentBlob = this.readRecordBlob(existing.blobRef);
+    const summary = typeof input.summary === 'string' && input.summary.trim().length > 0 ? input.summary.trim() : existing.summary;
+    const problem = typeof input.problem === 'string' && input.problem.trim().length > 0
+      ? input.problem.trim()
+      : (currentBlob?.problem || existing.problemPreview);
+    const solution = typeof input.solution === 'string' && input.solution.trim().length > 0
+      ? input.solution.trim()
+      : (currentBlob?.solution || existing.solutionPreview);
+    const labels = input.labels || input.tags
+      ? dedupeStrings([...(input.labels ?? []), ...(input.tags ?? [])]).map(normalizeLabel).filter((entry) => entry.length > 0).slice(0, 32)
+      : existing.labels;
+    const evidence = dedupeStrings([
+      ...(currentBlob?.evidence ?? []),
+      ...(input.evidence ?? []),
+    ]).slice(0, 256);
+    const confidence = typeof input.confidence === 'number' ? clamp(input.confidence, 0, 1) : existing.confidence;
+    const ttlDays = typeof input.ttlDays === 'number' ? Math.max(1, Math.floor(input.ttlDays)) : existing.ttlDays;
+    const now = nowIso();
+    const hash = stableHashForRecord(
+      {
+        repo: existing.repo,
+        summary,
+        problem,
+        solution,
+        pathId: nextPath.id,
+      },
+      nextPath.id,
+    );
+
+    const nextRevision = this.nextRevisionNumber(db.revisions, existing.id);
+    const revisionId = makeRevisionId();
+    const revisionBlobRef = defaultRevisionBlobRef(existing.id, revisionId);
+    const blob: ArchiveRecordBlob = {
+      version: RECORD_BLOB_VERSION,
+      id: existing.id,
+      problem,
+      solution,
+      evidence,
+    };
+    this.writeRecordBlob(revisionBlobRef, blob);
+
+    const revision: ArchiveRecordRevision = {
+      id: revisionId,
+      findingId: existing.id,
+      revision: nextRevision,
+      createdAt: now,
+      branch: typeof input.branch === 'string' ? input.branch : existing.branch,
+      commitSha: typeof input.commitSha === 'string' ? input.commitSha : existing.commitSha,
+      summary,
+      problemPreview: makePreview(problem),
+      solutionPreview: makePreview(solution),
+      pathId: nextPath.id,
+      path: nextPath.fullPath,
+      labels,
+      confidence,
+      ttlDays,
+      hash,
+      source: typeof input.source === 'string' ? input.source.trim() : existing.source,
+      blobRef: revisionBlobRef,
+    };
+    db.revisions.push(revision);
+
+    existing.summary = revision.summary;
+    existing.problemPreview = revision.problemPreview;
+    existing.solutionPreview = revision.solutionPreview;
+    existing.branch = revision.branch;
+    existing.commitSha = revision.commitSha;
+    existing.pathId = revision.pathId || fallbackPath?.id || ROOT_PATH_ID;
+    existing.path = revision.path || fallbackPath?.fullPath || '/';
+    existing.labels = revision.labels;
+    existing.confidence = revision.confidence;
+    existing.ttlDays = revision.ttlDays;
+    existing.hash = revision.hash;
+    existing.source = revision.source;
+    existing.updatedAt = now;
+    existing.blobRef = revision.blobRef;
+    existing.currentRevisionId = revision.id;
+
+    this.writeDb(db);
+    return this.materializeRecord(existing, blob, revision, this.countRevisions(db.revisions, existing.id));
+  }
+
+  get(findingId: string, revisionId?: string): ArchiveRecord {
     this.ensureInitialized();
     const db = this.readDb();
     const record = db.records.find((item) => item.id === findingId);
@@ -701,8 +918,45 @@ export class ConsciousArchiveStore {
       throw new Error(`Finding ${findingId} was not found.`);
     }
 
-    const blob = this.readRecordBlob(record.blobRef);
-    return this.materializeRecord(record, blob);
+    const currentRevision = this.resolveRevision(db, record, revisionId);
+    const blob = this.readRecordBlob(currentRevision?.blobRef ?? record.blobRef);
+    return this.materializeRecord(record, blob, currentRevision, this.countRevisions(db.revisions, record.id));
+  }
+
+  listVersions(findingId: string, limit = 25): ArchiveRecordRevisionInfo[] {
+    this.ensureInitialized();
+    const db = this.readDb();
+    const record = db.records.find((item) => item.id === findingId);
+    if (!record) {
+      throw new Error(`Finding ${findingId} was not found.`);
+    }
+
+    const revisions = this.revisionsForFinding(db.revisions, findingId)
+      .sort((a, b) => b.revision - a.revision || b.createdAt.localeCompare(a.createdAt))
+      .slice(0, clamp(limit, 1, 100));
+
+    return revisions.map((revision) => {
+      const blob = this.readRecordBlob(revision.blobRef);
+      return {
+        id: revision.id,
+        findingId: revision.findingId,
+        revision: revision.revision,
+        createdAt: revision.createdAt,
+        branch: revision.branch,
+        commitSha: revision.commitSha,
+        summary: revision.summary,
+        problem: blob?.problem ?? revision.problemPreview,
+        solution: blob?.solution ?? revision.solutionPreview,
+        pathId: revision.pathId,
+        path: revision.path,
+        labels: revision.labels,
+        confidence: revision.confidence,
+        ttlDays: revision.ttlDays,
+        hash: revision.hash,
+        source: revision.source,
+        isCurrent: record.currentRevisionId === revision.id,
+      };
+    });
   }
 
   markUsed(findingId: string, outcome: 'helpful' | 'not_helpful' | 'unknown'): ArchiveRecord {
@@ -729,36 +983,81 @@ export class ConsciousArchiveStore {
     });
 
     this.writeDb(db);
-    const blob = this.readRecordBlob(record.blobRef);
-    return this.materializeRecord(record, blob);
+    const revision = this.resolveRevision(db, record);
+    const blob = this.readRecordBlob(revision?.blobRef ?? record.blobRef);
+    return this.materializeRecord(record, blob, revision, this.countRevisions(db.revisions, record.id));
   }
 
-  private materializeRecord(indexRecord: ArchiveIndexRecord, blob?: ArchiveRecordBlob): ArchiveRecord {
-    const problem = blob?.problem ?? indexRecord.problemPreview;
-    const solution = blob?.solution ?? indexRecord.solutionPreview;
+  private materializeRecord(
+    indexRecord: ArchiveIndexRecord,
+    blob?: ArchiveRecordBlob,
+    revision?: ArchiveRecordRevision,
+    revisionCount = 0,
+  ): ArchiveRecord {
+    const problem = blob?.problem ?? revision?.problemPreview ?? indexRecord.problemPreview;
+    const solution = blob?.solution ?? revision?.solutionPreview ?? indexRecord.solutionPreview;
     const evidence = blob?.evidence ?? [];
     return {
       id: indexRecord.id,
       repo: indexRecord.repo,
-      branch: indexRecord.branch,
-      commitSha: indexRecord.commitSha,
-      summary: indexRecord.summary,
+      branch: revision?.branch ?? indexRecord.branch,
+      commitSha: revision?.commitSha ?? indexRecord.commitSha,
+      summary: revision?.summary ?? indexRecord.summary,
       problem,
       solution,
-      pathId: indexRecord.pathId,
-      path: indexRecord.path,
-      labels: indexRecord.labels,
+      pathId: revision?.pathId ?? indexRecord.pathId,
+      path: revision?.path ?? indexRecord.path,
+      labels: revision?.labels ?? indexRecord.labels,
       evidence,
-      confidence: indexRecord.confidence,
+      confidence: revision?.confidence ?? indexRecord.confidence,
       createdAt: indexRecord.createdAt,
-      updatedAt: indexRecord.updatedAt,
-      ttlDays: indexRecord.ttlDays,
+      updatedAt: revision?.createdAt ?? indexRecord.updatedAt,
+      ttlDays: revision?.ttlDays ?? indexRecord.ttlDays,
       useCount: indexRecord.useCount,
       successCount: indexRecord.successCount,
       lastUsedAt: indexRecord.lastUsedAt,
-      hash: indexRecord.hash,
-      source: indexRecord.source,
+      hash: revision?.hash ?? indexRecord.hash,
+      source: revision?.source ?? indexRecord.source,
+      revisionId: revision?.id ?? indexRecord.currentRevisionId,
+      revision: revision?.revision,
+      revisionCreatedAt: revision?.createdAt,
+      revisionCount,
     };
+  }
+
+  private revisionsForFinding(revisions: ArchiveRecordRevision[], findingId: string): ArchiveRecordRevision[] {
+    return revisions.filter((item) => item.findingId === findingId);
+  }
+
+  private nextRevisionNumber(revisions: ArchiveRecordRevision[], findingId: string): number {
+    const currentMax = this.revisionsForFinding(revisions, findingId)
+      .reduce((max, item) => Math.max(max, item.revision), 0);
+    return currentMax + 1;
+  }
+
+  private countRevisions(revisions: ArchiveRecordRevision[], findingId: string): number {
+    return this.revisionsForFinding(revisions, findingId).length;
+  }
+
+  private resolveRevision(db: ArchiveDatabase, record: ArchiveIndexRecord, revisionId?: string): ArchiveRecordRevision | undefined {
+    const revisions = this.revisionsForFinding(db.revisions, record.id);
+    if (revisions.length === 0) {
+      return undefined;
+    }
+    if (revisionId) {
+      const explicit = revisions.find((item) => item.id === revisionId);
+      if (!explicit) {
+        throw new Error(`Revision ${revisionId} was not found for finding ${record.id}.`);
+      }
+      return explicit;
+    }
+    if (record.currentRevisionId) {
+      const current = revisions.find((item) => item.id === record.currentRevisionId);
+      if (current) {
+        return current;
+      }
+    }
+    return revisions.slice().sort((a, b) => b.revision - a.revision || b.createdAt.localeCompare(a.createdAt))[0];
   }
 
   private blobPathFromRef(blobRef: string): string {
@@ -834,6 +1133,7 @@ export class ConsciousArchiveStore {
 
     const version = typeof parsed.version === 'number' ? parsed.version : 1;
     const recordsRaw = Array.isArray(parsed.records) ? parsed.records : [];
+    const revisionsRaw = Array.isArray(parsed.revisions) ? parsed.revisions : [];
     const usageRaw = Array.isArray(parsed.usage) ? parsed.usage : [];
     const now = nowIso();
 
@@ -908,6 +1208,7 @@ export class ConsciousArchiveStore {
           hash: typeof entry.hash === 'string' ? entry.hash : fallbackHash,
           source: typeof entry.source === 'string' ? entry.source : undefined,
           blobRef,
+          currentRevisionId: typeof entry.currentRevisionId === 'string' ? entry.currentRevisionId : undefined,
         };
 
         const existingBlob = this.readRecordBlob(blobRef);
@@ -930,6 +1231,159 @@ export class ConsciousArchiveStore {
         return normalizedRecord;
       })
       .filter((entry) => entry.repo.length > 0 && entry.summary.length > 0 && (entry.problemPreview.length > 0 || entry.solutionPreview.length > 0));
+
+    const recordById = new Map<string, ArchiveIndexRecord>();
+    for (const record of normalizedRecords) {
+      recordById.set(record.id, record);
+    }
+
+    const normalizedRevisions: ArchiveRecordRevision[] = revisionsRaw
+      .filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === 'object')
+      .map((entry) => {
+        const findingId = typeof entry.findingId === 'string' ? entry.findingId : '';
+        const linkedRecord = recordById.get(findingId);
+        if (!linkedRecord) {
+          return undefined;
+        }
+
+        const pathId = typeof entry.pathId === 'string' && pathMap.has(entry.pathId)
+          ? entry.pathId
+          : linkedRecord.pathId;
+        const pathEntry = pathMap.get(pathId);
+        const pathValue = typeof entry.path === 'string' && entry.path.length > 0
+          ? entry.path
+          : (pathEntry?.fullPath ?? linkedRecord.path);
+        const labels = Array.isArray(entry.labels)
+          ? entry.labels.filter((value): value is string => typeof value === 'string')
+          : linkedRecord.labels;
+        const normalizedLabels = dedupeStrings(labels).map(normalizeLabel).filter((value) => value.length > 0);
+        const summary = typeof entry.summary === 'string' && entry.summary.trim().length > 0
+          ? entry.summary.trim()
+          : linkedRecord.summary;
+        const problemPreview = typeof entry.problemPreview === 'string' && entry.problemPreview.trim().length > 0
+          ? makePreview(entry.problemPreview)
+          : linkedRecord.problemPreview;
+        const solutionPreview = typeof entry.solutionPreview === 'string' && entry.solutionPreview.trim().length > 0
+          ? makePreview(entry.solutionPreview)
+          : linkedRecord.solutionPreview;
+        const hash = typeof entry.hash === 'string' && entry.hash.length > 0
+          ? entry.hash
+          : linkedRecord.hash;
+        const revisionId = typeof entry.id === 'string' ? entry.id : makeRevisionId();
+        const blobRef = normalizeBlobRef(
+          typeof entry.blobRef === 'string' ? entry.blobRef : linkedRecord.blobRef,
+          linkedRecord.id,
+        );
+
+        const existingBlob = this.readRecordBlob(blobRef);
+        if (!existingBlob) {
+          this.writeRecordBlob(blobRef, {
+            version: RECORD_BLOB_VERSION,
+            id: linkedRecord.id,
+            problem: problemPreview,
+            solution: solutionPreview,
+            evidence: [],
+          });
+        }
+
+        return {
+          id: revisionId,
+          findingId,
+          revision: typeof entry.revision === 'number' ? Math.max(1, Math.floor(entry.revision)) : 1,
+          createdAt: typeof entry.createdAt === 'string' ? entry.createdAt : linkedRecord.updatedAt,
+          branch: typeof entry.branch === 'string' ? entry.branch : linkedRecord.branch,
+          commitSha: typeof entry.commitSha === 'string' ? entry.commitSha : linkedRecord.commitSha,
+          summary,
+          problemPreview,
+          solutionPreview,
+          pathId,
+          path: pathValue,
+          labels: normalizedLabels,
+          confidence: typeof entry.confidence === 'number' ? clamp(entry.confidence, 0, 1) : linkedRecord.confidence,
+          ttlDays: typeof entry.ttlDays === 'number' ? Math.max(1, Math.floor(entry.ttlDays)) : linkedRecord.ttlDays,
+          hash,
+          source: typeof entry.source === 'string' ? entry.source : linkedRecord.source,
+          blobRef,
+        } as ArchiveRecordRevision;
+      })
+      .filter((entry): entry is ArchiveRecordRevision => Boolean(entry));
+
+    for (const record of normalizedRecords) {
+      const existing = normalizedRevisions.filter((revision) => revision.findingId === record.id);
+      if (existing.length === 0) {
+        const legacyBlobRef = normalizeBlobRef(record.blobRef, record.id);
+        const legacyBlob = this.readRecordBlob(legacyBlobRef);
+        if (!legacyBlob) {
+          this.writeRecordBlob(legacyBlobRef, {
+            version: RECORD_BLOB_VERSION,
+            id: record.id,
+            problem: record.problemPreview,
+            solution: record.solutionPreview,
+            evidence: [],
+          });
+        }
+
+        normalizedRevisions.push({
+          id: makeRevisionId(),
+          findingId: record.id,
+          revision: 1,
+          createdAt: record.createdAt,
+          branch: record.branch,
+          commitSha: record.commitSha,
+          summary: record.summary,
+          problemPreview: record.problemPreview,
+          solutionPreview: record.solutionPreview,
+          pathId: record.pathId,
+          path: record.path,
+          labels: record.labels,
+          confidence: record.confidence,
+          ttlDays: record.ttlDays,
+          hash: record.hash,
+          source: record.source,
+          blobRef: legacyBlobRef,
+        });
+      }
+    }
+
+    const revisionsByFinding = new Map<string, ArchiveRecordRevision[]>();
+    for (const revision of normalizedRevisions) {
+      const list = revisionsByFinding.get(revision.findingId) ?? [];
+      list.push(revision);
+      revisionsByFinding.set(revision.findingId, list);
+    }
+
+    for (const record of normalizedRecords) {
+      const revisions = revisionsByFinding.get(record.id) ?? [];
+      revisions.sort((a, b) => a.revision - b.revision || a.createdAt.localeCompare(b.createdAt));
+      revisions.forEach((revision, idx) => {
+        revision.revision = idx + 1;
+      });
+      if (revisions.length === 0) {
+        continue;
+      }
+
+      const latest = revisions[revisions.length - 1];
+      record.currentRevisionId = revisions.some((entry) => entry.id === record.currentRevisionId)
+        ? record.currentRevisionId
+        : latest.id;
+      const current = revisions.find((entry) => entry.id === record.currentRevisionId) ?? latest;
+      record.summary = current.summary;
+      record.problemPreview = current.problemPreview;
+      record.solutionPreview = current.solutionPreview;
+      record.branch = current.branch;
+      record.commitSha = current.commitSha;
+      record.pathId = current.pathId;
+      record.path = current.path;
+      record.labels = current.labels;
+      record.confidence = current.confidence;
+      record.ttlDays = current.ttlDays;
+      record.hash = current.hash;
+      record.source = current.source;
+      record.blobRef = current.blobRef;
+      if (record.updatedAt < current.createdAt) {
+        record.updatedAt = current.createdAt;
+      }
+    }
 
     const normalizedUsage: ArchiveUsage[] = usageRaw
       .filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === 'object')
@@ -957,6 +1411,7 @@ export class ConsciousArchiveStore {
       taxonomyVersion,
       paths: normalizedPaths,
       records: normalizedRecords,
+      revisions: normalizedRevisions,
       usage: normalizedUsage,
     };
   }

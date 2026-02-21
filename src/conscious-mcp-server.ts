@@ -375,7 +375,7 @@ class StdioJsonRpcServer {
         protocolVersion,
         serverInfo: {
           name: 'devcon-archive',
-          version: '0.6.0',
+          version: '0.7.0',
         },
         capabilities: {
           tools: {
@@ -468,18 +468,31 @@ class StdioJsonRpcServer {
           },
           {
             name: 'archive_get',
-            description: 'Fetch full stored details for a finding id (problem, solution, evidence). Use this after archive_search when a hit looks relevant.',
+            description: 'Fetch full stored details for a finding id (problem, solution, evidence). Optionally pass revision_id to load a historical version.',
             inputSchema: {
               type: 'object',
               properties: {
                 id: { type: 'string' },
+                revision_id: { type: 'string' },
+              },
+              required: ['id'],
+            },
+          },
+          {
+            name: 'archive_versions',
+            description: 'List stored revisions for a finding so you can inspect historical versions before choosing one to load.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                id: { type: 'string' },
+                limit: { type: 'integer', minimum: 1, maximum: 100, default: 25 },
               },
               required: ['id'],
             },
           },
           {
             name: 'archive_write',
-            description: 'Persist a durable finding in the existing taxonomy. Long details are persisted in per-finding files; archive_search serves index previews and archive_get retrieves full details. Call archive_overview first, then pass overview_token + path_id. Storage is project-local; do not add project-name wrapper folders. Store user preferences under /user/preferences with label user-preference.',
+            description: 'Persist a durable finding in the existing taxonomy. Long details are persisted in per-finding files; archive_search serves index previews and archive_get retrieves full details. Repeated writes append new revisions instead of destructive overwrite. Call archive_overview first, then pass overview_token + path_id. Storage is project-local; do not add project-name wrapper folders. Store user preferences under /user/preferences with label user-preference.',
             inputSchema: {
               type: 'object',
               properties: {
@@ -504,6 +517,35 @@ class StdioJsonRpcServer {
                 source: { type: 'string' },
               },
               required: ['overview_token', 'path_id', 'summary', 'problem', 'solution'],
+            },
+          },
+          {
+            name: 'archive_update',
+            description: 'Update an existing finding by id and append a new revision. Use when refining prior memory without creating a separate finding.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                overview_token: { type: 'string' },
+                id: { type: 'string' },
+                branch: { type: 'string' },
+                commit_sha: { type: 'string' },
+                path_id: { type: 'string' },
+                summary: { type: 'string' },
+                problem: { type: 'string' },
+                solution: { type: 'string' },
+                evidence: {
+                  type: 'array',
+                  items: { type: 'string' },
+                },
+                labels: {
+                  type: 'array',
+                  items: { type: 'string' },
+                },
+                confidence: { type: 'number', minimum: 0, maximum: 1 },
+                ttl_days: { type: 'integer', minimum: 1 },
+                source: { type: 'string' },
+              },
+              required: ['overview_token', 'id'],
             },
           },
           {
@@ -548,8 +590,14 @@ class StdioJsonRpcServer {
       if (name === 'archive_get') {
         return this.handleArchiveGet(args);
       }
+      if (name === 'archive_versions') {
+        return this.handleArchiveVersions(args);
+      }
       if (name === 'archive_write') {
         return this.handleArchiveWrite(args);
+      }
+      if (name === 'archive_update') {
+        return this.handleArchiveUpdate(args);
       }
       if (name === 'archive_mark_used') {
         return this.handleArchiveMarkUsed(args);
@@ -796,12 +844,82 @@ class StdioJsonRpcServer {
     };
   }
 
+  private handleArchiveUpdate(args: Record<string, unknown>): unknown {
+    const token = this.readString(args.overview_token, 'archive_update requires overview_token from archive_overview.');
+    this.validateOverviewToken(token);
+
+    const id = this.readString(args.id, 'archive_update requires id.');
+    const labels = Array.isArray(args.labels)
+      ? args.labels.filter((entry): entry is string => typeof entry === 'string')
+      : undefined;
+
+    const hasMeaningfulChange = [
+      'branch',
+      'commit_sha',
+      'path_id',
+      'summary',
+      'problem',
+      'solution',
+      'confidence',
+      'ttl_days',
+      'source',
+    ].some((key) => args[key] !== undefined)
+      || (Array.isArray(args.evidence) && args.evidence.length > 0)
+      || (Array.isArray(labels) && labels.length > 0);
+
+    if (!hasMeaningfulChange) {
+      throw new Error('archive_update requires at least one field to update.');
+    }
+
+    const record = this.archive.update({
+      id,
+      branch: typeof args.branch === 'string' ? args.branch : undefined,
+      commitSha: typeof args.commit_sha === 'string' ? args.commit_sha : undefined,
+      pathId: typeof args.path_id === 'string' ? args.path_id : undefined,
+      summary: typeof args.summary === 'string' ? args.summary : undefined,
+      problem: typeof args.problem === 'string' ? args.problem : undefined,
+      solution: typeof args.solution === 'string' ? args.solution : undefined,
+      evidence: Array.isArray(args.evidence) ? args.evidence.filter((entry): entry is string => typeof entry === 'string') : undefined,
+      labels,
+      confidence: typeof args.confidence === 'number' ? args.confidence : undefined,
+      ttlDays: typeof args.ttl_days === 'number' ? args.ttl_days : undefined,
+      source: typeof args.source === 'string' ? args.source : 'mcp:update',
+    });
+
+    return {
+      content: [{ type: 'text', text: `Updated finding ${record.id}; now at revision ${record.revision ?? '?'}` }],
+      structuredContent: record,
+      isError: false,
+    };
+  }
+
   private handleArchiveGet(args: Record<string, unknown>): unknown {
     const id = this.readString(args.id, 'archive_get requires id.');
-    const record = this.archive.get(id);
+    const revisionId = typeof args.revision_id === 'string' ? args.revision_id : undefined;
+    const record = this.archive.get(id, revisionId);
     return {
-      content: [{ type: 'text', text: `Loaded full finding ${record.id} from ${record.path}` }],
+      content: [{ type: 'text', text: revisionId ? `Loaded revision ${revisionId} for finding ${record.id}` : `Loaded full finding ${record.id} from ${record.path}` }],
       structuredContent: record,
+      isError: false,
+    };
+  }
+
+  private handleArchiveVersions(args: Record<string, unknown>): unknown {
+    const id = this.readString(args.id, 'archive_versions requires id.');
+    const limit = typeof args.limit === 'number' ? args.limit : 25;
+    const revisions = this.archive.listVersions(id, limit);
+    const text = revisions.length === 0
+      ? `No revisions found for finding ${id}.`
+      : revisions
+        .map((revision) => `${revision.revision}. [${revision.id}] ${revision.summary} (created=${revision.createdAt}${revision.isCurrent ? ', current' : ''})`)
+        .join('\n');
+    return {
+      content: [{ type: 'text', text }],
+      structuredContent: {
+        id,
+        revision_count: revisions.length,
+        revisions,
+      },
       isError: false,
     };
   }
