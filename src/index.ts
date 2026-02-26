@@ -2690,6 +2690,18 @@ function buildDockerArgs(options: {
       );
       postRunCleanupLines.push(`claude mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`);
     }
+  } else if (options.toolName === 'codex') {
+    initScriptLines.push(
+      'if command -v codex >/dev/null 2>&1; then',
+      `  codex mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`,
+      'fi',
+    );
+  } else if (options.toolName === 'claude') {
+    initScriptLines.push(
+      'if command -v claude >/dev/null 2>&1; then',
+      `  claude mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`,
+      'fi',
+    );
   }
 
   if (initScriptLines.length > 0) {
