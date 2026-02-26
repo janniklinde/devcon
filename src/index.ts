@@ -91,8 +91,7 @@ const CONSCIOUS_PROJECT_ID_RELATIVE_PATH = 'devcon/project-id';
 const CONSCIOUS_PROJECTS_DIRNAME = 'projects';
 const CONSCIOUS_PROJECT_REGISTRY_FILENAME = 'projects.json';
 const WORKSPACE_ROOT = '/workspace';
-const MAIN_PROJECT_DIRNAME = 'main_project';
-const WORKSPACE_TARGET = path.posix.join(WORKSPACE_ROOT, MAIN_PROJECT_DIRNAME);
+const DEFAULT_WORKSPACE_DIRNAME = 'project';
 const HOME_READONLY_DEFAULT = parseBooleanEnv(process.env.DEVCON_HOME_READONLY);
 const SHARE_HOME_DEFAULT = parseBooleanEnv(process.env.DEVCON_SHARE_HOME);
 const DEFAULT_IMAGE_TAG = 'devcon:latest';
@@ -1481,6 +1480,15 @@ function getCurrentWorkingDirectory(): string {
   }
 }
 
+function resolveDefaultWorkspaceTarget(cwd: string): string {
+  const normalizedCwd = path.resolve(cwd);
+  const workspaceDirname = path.basename(normalizedCwd);
+  if (!workspaceDirname || workspaceDirname === '.' || workspaceDirname === path.sep) {
+    return path.posix.join(WORKSPACE_ROOT, DEFAULT_WORKSPACE_DIRNAME);
+  }
+  return path.posix.join(WORKSPACE_ROOT, workspaceDirname);
+}
+
 function discoverSensitivePaths(cwd: string, targetBase: string, options: { allowGit: boolean }): SensitivePath[] {
   const patterns = compileSensitivePatterns(getEffectiveSensitivePatterns())
     .filter((pattern) => (options.allowGit ? pattern.raw !== '.git' : true));
@@ -2543,7 +2551,7 @@ function buildDockerArgs(options: {
     console.warn('Ignoring --ipv4 in --network-host mode: the container shares host network settings.');
   }
 
-  const workspaceTarget = options.tool.workdir ?? WORKSPACE_TARGET;
+  const workspaceTarget = options.tool.workdir ?? resolveDefaultWorkspaceTarget(options.cwd);
   const resolvedExtraMounts = resolveExtraMountContainerPaths(options.extraMounts, workspaceTarget);
   dockerArgs.push('--mount', `type=bind,source=${options.cwd},target=${workspaceTarget}`);
   dockerArgs.push('-w', workspaceTarget);

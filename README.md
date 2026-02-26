@@ -5,7 +5,7 @@
 ## What it does
 
 - Spin up a disposable Docker container per invocation.
-- Bind-mount the current working directory at `/workspace/main_project` and run as your host UID/GID so file permissions stay intact.
+- Bind-mount the current working directory at `/workspace/<current-folder-name>` and run as your host UID/GID so file permissions stay intact.
 - Optionally bind-mount extra host directories for a single run via `--mount PATH` (repeatable), mounted under `/workspace/<folder-name>` in the container.
 - Keep the host home directory private by default. Opt in with `--home` or `DEVCON_SHARE_HOME=1`, or whitelist individual directories via `writablePaths` so credentials like `~/.codex` can still be shared.
 - Hide `.env*`, `.git-credentials`, and other critical Git metadata from the container by overlaying empty bind mounts before the container starts.
@@ -249,7 +249,7 @@ Fields per tool:
 - `image` (**required**) – Docker image tag to run.
 - `command` – Array describing the command to execute inside the container. Omit it to rely on the image entrypoint.
 - `env` – Additional environment variables to inject.
-- `workdir` – Alternative container working directory (defaults to `/workspace/main_project`).
+- `workdir` – Alternative container working directory (defaults to `/workspace/<current-folder-name>`).
 - `shareHome` – Override the CLI default for sharing the host home directory (default is `false`).
 - `homeReadOnly` – When `true`, the home directory mount is forced read-only; pair with `writablePaths` to selectively re-enable write access to specific paths.
 - `writablePaths` – Array of directories (absolute or `~/`-prefixed) that should remain mounted read/write even if the home directory is not mounted. The directories must live under your host home directory; missing directories are created automatically.
