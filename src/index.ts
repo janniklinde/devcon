@@ -47,6 +47,7 @@ interface CliOptions {
   toolArgs: string[];
   dryRun: boolean;
   imageOverride?: string;
+  mountPaths: string[];
   shareHome: boolean;
   helpRequested: boolean;
   allowGit: boolean;
@@ -62,6 +63,11 @@ interface AutoBuildConfig {
   dockerfile: string;
   tag: string;
   description?: string;
+}
+
+interface ExtraMount {
+  hostPath: string;
+  mountName: string;
 }
 
 const CONFIG_PATH = process.env.DEVCON_TOOLS_FILE
@@ -84,7 +90,9 @@ const CONSCIOUS_MCP_NAME = 'devcon-archive';
 const CONSCIOUS_PROJECT_ID_RELATIVE_PATH = 'devcon/project-id';
 const CONSCIOUS_PROJECTS_DIRNAME = 'projects';
 const CONSCIOUS_PROJECT_REGISTRY_FILENAME = 'projects.json';
-const WORKSPACE_TARGET = '/workspace';
+const WORKSPACE_ROOT = '/workspace';
+const MAIN_PROJECT_DIRNAME = 'main_project';
+const WORKSPACE_TARGET = path.posix.join(WORKSPACE_ROOT, MAIN_PROJECT_DIRNAME);
 const HOME_READONLY_DEFAULT = parseBooleanEnv(process.env.DEVCON_HOME_READONLY);
 const SHARE_HOME_DEFAULT = parseBooleanEnv(process.env.DEVCON_SHARE_HOME);
 const DEFAULT_IMAGE_TAG = 'devcon:latest';
@@ -203,6 +211,63 @@ function ensureWritablePath(target: string): SensitivePath['type'] {
   return 'dir';
 }
 
+function resolveExtraMountInput(input: string, cwd: string, homeDir: string): string {
+  if (!input || input.trim().length === 0) {
+    throw new Error('Mount path entries must not be empty.');
+  }
+  if (input === '~') {
+    return homeDir;
+  }
+  if (input.startsWith('~/')) {
+    return path.join(homeDir, input.substring(2));
+  }
+  if (path.isAbsolute(input)) {
+    return path.resolve(input);
+  }
+  return path.resolve(cwd, input);
+}
+
+function resolveExtraMounts(mountInputs: string[], cwd: string): ExtraMount[] {
+  if (mountInputs.length === 0) {
+    return [];
+  }
+
+  const homeDir = os.homedir();
+  const unique = new Set<string>();
+  const resolved: ExtraMount[] = [];
+
+  for (const input of mountInputs) {
+    const hostPath = resolveExtraMountInput(input, cwd, homeDir);
+    if (unique.has(hostPath)) {
+      continue;
+    }
+    if (!existsSync(hostPath)) {
+      throw new Error(`Mount path ${hostPath} does not exist.`);
+    }
+    if (!statSync(hostPath).isDirectory()) {
+      throw new Error(`Mount path ${hostPath} must be a directory.`);
+    }
+    const mountName = path.basename(hostPath);
+    if (!mountName || mountName === '.' || mountName === path.sep) {
+      throw new Error(`Mount path ${hostPath} must have a valid directory name.`);
+    }
+    unique.add(hostPath);
+    resolved.push({
+      hostPath,
+      mountName,
+    });
+  }
+
+  return resolved;
+}
+
+function assertNoExtraMounts(mountInputs: string[], commandName: string): void {
+  if (mountInputs.length === 0) {
+    return;
+  }
+  throw new Error(`The --mount flag cannot be used with "devcon ${commandName}".`);
+}
+
 function loadCustomTools(): ToolMap {
   if (!existsSync(CONFIG_PATH)) {
     return {};
@@ -292,6 +357,7 @@ function saveSensitivePatterns(patterns: string[]): void {
 
 function parseArgs(argv: string[]): CliOptions {
   const toolArgs: string[] = [];
+  const mountPaths: string[] = [];
   let toolName: string | undefined;
   let dryRun = false;
   let imageOverride: string | undefined;
@@ -326,6 +392,25 @@ function parseArgs(argv: string[]): CliOptions {
 
     if (arg === '--dry-run') {
       dryRun = true;
+      continue;
+    }
+
+    if (arg.startsWith('--mount=')) {
+      const value = arg.substring('--mount='.length);
+      if (!value) {
+        throw new Error('--mount flag requires a directory path, e.g. --mount ../shared');
+      }
+      mountPaths.push(value);
+      continue;
+    }
+
+    if (arg === '--mount') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--mount flag requires a directory path, e.g. --mount ../shared');
+      }
+      mountPaths.push(next);
+      i += 1;
       continue;
     }
 
@@ -428,6 +513,7 @@ function parseArgs(argv: string[]): CliOptions {
     toolArgs,
     dryRun,
     imageOverride,
+    mountPaths,
     shareHome,
     helpRequested,
     allowGit,
@@ -1406,6 +1492,35 @@ function discoverSensitivePaths(cwd: string, targetBase: string, options: { allo
   }));
 }
 
+function dedupeSensitivePaths(paths: SensitivePath[]): SensitivePath[] {
+  const unique = new Map<string, SensitivePath>();
+  for (const entry of paths) {
+    if (!unique.has(entry.containerPath)) {
+      unique.set(entry.containerPath, entry);
+    }
+  }
+  return [...unique.values()];
+}
+
+function resolveExtraMountContainerPaths(extraMounts: ExtraMount[], workspaceTarget: string): Array<{
+  hostPath: string;
+  containerPath: string;
+}> {
+  const seenTargets = new Set<string>([workspaceTarget]);
+  const resolved: Array<{ hostPath: string; containerPath: string }> = [];
+
+  for (const extra of extraMounts) {
+    const containerPath = path.posix.join(WORKSPACE_ROOT, extra.mountName);
+    if (seenTargets.has(containerPath)) {
+      throw new Error(`Mount target collision at ${containerPath}. Choose a mount directory with a unique name.`);
+    }
+    seenTargets.add(containerPath);
+    resolved.push({ hostPath: extra.hostPath, containerPath });
+  }
+
+  return resolved;
+}
+
 function printSensitiveList(cwd: string): void {
   const defaults = DEFAULT_SENSITIVE_PATTERNS;
   const custom = loadSensitivePatterns();
@@ -2368,6 +2483,7 @@ function printHelp(tools: ToolMap): void {
   console.log('  --image=IMG   Override the docker image for this run');
   console.log('  --with-git    Unmask .git and inject a sandboxed git user inside the container');
   console.log('  --temp-git    Mask host .git but provide a temporary git repo/worktree inside the container');
+  console.log('  --mount PATH  Bind-mount an extra host directory under /workspace/<folder-name> (repeatable)');
   console.log('  --export-patch[=PATH] Export changes from temp-git repo after run (defaults to .devcon/drafts/<ts>.patch)');
   console.log('  --network-host, -network-host Use host networking (helps with VPNs that block Docker bridge DNS/NAT)');
   console.log('  --ipv4, -ipv4 Force IPv4-only networking by disabling IPv6 inside the container');
@@ -2392,6 +2508,7 @@ function buildDockerArgs(options: {
   toolName: string;
   tool: ToolDefinition;
   toolArgs: string[];
+  extraMounts: ExtraMount[];
   shareHome: boolean;
   image: string;
   allowGit: boolean;
@@ -2427,10 +2544,16 @@ function buildDockerArgs(options: {
   }
 
   const workspaceTarget = options.tool.workdir ?? WORKSPACE_TARGET;
+  const resolvedExtraMounts = resolveExtraMountContainerPaths(options.extraMounts, workspaceTarget);
   dockerArgs.push('--mount', `type=bind,source=${options.cwd},target=${workspaceTarget}`);
   dockerArgs.push('-w', workspaceTarget);
   dockerArgs.push('-e', `DEVCON_WORKSPACE=${workspaceTarget}`);
   dockerArgs.push('-e', `DEVCON_TOOL=${options.toolName}`);
+
+  for (const extra of resolvedExtraMounts) {
+    dockerArgs.push('--mount', `type=bind,source=${extra.hostPath},target=${extra.containerPath}`);
+    console.log(`Additional mount enabled: ${extra.hostPath} -> ${extra.containerPath}`);
+  }
 
   if (shareHome && homeDir && existsSync(homeDir)) {
     const normalizedHome = path.resolve(homeDir);
@@ -2460,10 +2583,27 @@ function buildDockerArgs(options: {
     console.warn('Writable paths were provided but the home directory is not mounted read-only. Ignoring writablePaths.');
   }
 
-  const scanStart = Date.now();
-  console.log('Scanning workspace for sensitive paths...');
-  const sensitivePaths = discoverSensitivePaths(options.cwd, workspaceTarget, { allowGit: options.allowGit });
-  console.log(`Found ${sensitivePaths.length} sensitive path(s) to mask (in ${Date.now() - scanStart}ms)`);
+  const scanTargets = [
+    {
+      label: 'workspace',
+      hostPath: options.cwd,
+      containerPath: workspaceTarget,
+    },
+    ...resolvedExtraMounts.map((extra, index) => ({
+      label: `mount ${index + 1}`,
+      hostPath: extra.hostPath,
+      containerPath: extra.containerPath,
+    })),
+  ];
+  let sensitivePaths: SensitivePath[] = [];
+  for (const target of scanTargets) {
+    const scanStart = Date.now();
+    console.log(`Scanning ${target.label} for sensitive paths...`);
+    const discovered = discoverSensitivePaths(target.hostPath, target.containerPath, { allowGit: options.allowGit });
+    console.log(`Found ${discovered.length} sensitive path(s) to mask in ${target.label} (in ${Date.now() - scanStart}ms)`);
+    sensitivePaths = sensitivePaths.concat(discovered);
+  }
+  sensitivePaths = dedupeSensitivePaths(sensitivePaths);
   for (const sensitive of sensitivePaths) {
     const placeholder = createPlaceholder(sensitive.type, cleanupTargets);
     const spec = `type=bind,source=${placeholder},target=${sensitive.containerPath},readonly`;
@@ -2625,6 +2765,7 @@ async function main(): Promise<void> {
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon update". Specify the desired image in the tool configuration instead.');
     }
+    assertNoExtraMounts(options.mountPaths, 'update');
     await handleUpdateCommand(options.toolArgs, tools, options.dryRun);
     return;
   }
@@ -2633,6 +2774,7 @@ async function main(): Promise<void> {
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon rebuild". Specify the desired image in the tool configuration instead.');
     }
+    assertNoExtraMounts(options.mountPaths, 'rebuild');
     await handleRebuildCommand(options.toolArgs, tools, options.dryRun);
     return;
   }
@@ -2643,6 +2785,7 @@ async function main(): Promise<void> {
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon sensitive". This command only manages sensitive-file patterns.');
     }
+    assertNoExtraMounts(options.mountPaths, 'sensitive');
     handleSensitiveCommand(options.toolArgs, cwd);
     return;
   }
@@ -2651,6 +2794,7 @@ async function main(): Promise<void> {
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon skip-scan". This command only manages directory scan skips.');
     }
+    assertNoExtraMounts(options.mountPaths, 'skip-scan');
     handleSkipScanCommand(options.toolArgs);
     return;
   }
@@ -2659,10 +2803,12 @@ async function main(): Promise<void> {
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon conscious". This command manages conscious storage only.');
     }
+    assertNoExtraMounts(options.mountPaths, 'conscious');
     await handleConsciousCommand(options.toolArgs, cwd, options.consciousStatePath);
     return;
   }
 
+  const extraMounts = resolveExtraMounts(options.mountPaths, cwd);
   const tool = tools[options.toolName];
 
   if (options.toolName === 'run') {
@@ -2700,6 +2846,7 @@ async function main(): Promise<void> {
       toolName: options.toolName,
       tool: toolDef,
       toolArgs: options.toolArgs,
+      extraMounts,
       shareHome: options.shareHome,
       image,
       allowGit: options.allowGit,
@@ -2779,6 +2926,7 @@ async function main(): Promise<void> {
     toolName: options.toolName,
     tool,
     toolArgs: options.toolArgs,
+    extraMounts,
     shareHome: options.shareHome && tool.shareHome !== false,
     image,
     allowGit: options.allowGit,

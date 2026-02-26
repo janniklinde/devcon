@@ -5,7 +5,8 @@
 ## What it does
 
 - Spin up a disposable Docker container per invocation.
-- Bind-mount the current working directory at `/workspace` and run as your host UID/GID so file permissions stay intact.
+- Bind-mount the current working directory at `/workspace/main_project` and run as your host UID/GID so file permissions stay intact.
+- Optionally bind-mount extra host directories for a single run via `--mount PATH` (repeatable), mounted under `/workspace/<folder-name>` in the container.
 - Keep the host home directory private by default. Opt in with `--home` or `DEVCON_SHARE_HOME=1`, or whitelist individual directories via `writablePaths` so credentials like `~/.codex` can still be shared.
 - Hide `.env*`, `.git-credentials`, and other critical Git metadata from the container by overlaying empty bind mounts before the container starts.
 - Detect when the default `devcon:latest` docker image is missing and (after a `y` confirmation) build it automatically from `docker/devcon/Dockerfile`.
@@ -40,6 +41,7 @@ devcon sensitive remove secrets/**
 devcon skip-scan list          # show skip-scan directories (defaults + custom)
 devcon skip-scan add .cache    # add a directory name to skip during scans
 devcon skip-scan remove .cache
+devcon --mount ../shared codex # add one extra host directory for this run only
 devcon run --with-git -- ls    # open an interactive shell (default image) and run a command
 devcon --conscious codex       # enable persistent archive memory for this run
 ```
@@ -67,6 +69,10 @@ devcon codex --image ghcr.io/my/codex:latest -- --trace
 
 # Temporarily share the entire home directory (default is no home mount)
 devcon codex --home
+
+# Mount another host directory for this run only
+devcon --mount ../shared codex
+devcon --mount ~/work/notes --mount /tmp/datasets codex
 ```
 
 Useful flags (place before `--` that separates devcon flags from tool args):
@@ -76,6 +82,7 @@ Useful flags (place before `--` that separates devcon flags from tool args):
 - `--image=NAME` – Override the docker image configured for the tool.
 - `--with-git` – Unmask `.git` and inject a sandboxed git identity (`devcon-bot <devcon@example.com>`) inside the container.
 - `--temp-git` – Keep host `.git` masked but mount a temporary git repo/worktree in the container (sandboxed identity pre-configured).
+- `--mount PATH` – Add an extra bind mount for the current run only (repeatable). Mounted under `/workspace/<folder-name>` (e.g. `--mount ../shared` => `/workspace/shared`) and scanned/masked with the same sensitive-path rules as the main project mount.
 - `--export-patch[=PATH]` – With `--temp-git`, export patches after the run to PATH (or `.devcon/drafts/<timestamp>.patch`).
 - `--network-host` / `-network-host` – Use host networking (often required on VPNs that block Docker bridge DNS/NAT).
 - `--ipv4` / `-ipv4` – Force IPv4-only networking by disabling IPv6 inside the container.
@@ -242,7 +249,7 @@ Fields per tool:
 - `image` (**required**) – Docker image tag to run.
 - `command` – Array describing the command to execute inside the container. Omit it to rely on the image entrypoint.
 - `env` – Additional environment variables to inject.
-- `workdir` – Alternative container working directory (defaults to `/workspace`).
+- `workdir` – Alternative container working directory (defaults to `/workspace/main_project`).
 - `shareHome` – Override the CLI default for sharing the host home directory (default is `false`).
 - `homeReadOnly` – When `true`, the home directory mount is forced read-only; pair with `writablePaths` to selectively re-enable write access to specific paths.
 - `writablePaths` – Array of directories (absolute or `~/`-prefixed) that should remain mounted read/write even if the home directory is not mounted. The directories must live under your host home directory; missing directories are created automatically.
