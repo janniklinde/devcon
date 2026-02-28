@@ -2488,6 +2488,16 @@ function startWebTmuxSession(sessionName: string, cwd: string, scriptPath: strin
   }
 }
 
+function killTmuxSession(sessionName: string): void {
+  if (!tmuxSessionExists(sessionName)) {
+    return;
+  }
+  const kill = spawnSync('tmux', ['kill-session', '-t', sessionName], { stdio: 'ignore' });
+  if (kill.status !== 0) {
+    console.warn(`Failed to kill tmux session "${sessionName}".`);
+  }
+}
+
 function resolveWebHost(options: CliOptions): string {
   const host = options.webHost ?? process.env.HOST ?? WEB_DEFAULT_HOST;
   const trimmed = host.trim();
@@ -2502,6 +2512,26 @@ function resolveWebPort(options: CliOptions): number {
     return options.webPort;
   }
   return parsePositiveIntEnv(process.env.PORT, WEB_DEFAULT_PORT);
+}
+
+function formatHostForUrl(host: string): string {
+  return host.includes(':') ? `[${host}]` : host;
+}
+
+function getLocalNetworkIpv4Addresses(): string[] {
+  const interfaces = os.networkInterfaces();
+  const ips = new Set<string>();
+  for (const addresses of Object.values(interfaces)) {
+    if (!addresses) {
+      continue;
+    }
+    for (const addr of addresses) {
+      if (addr.family === 'IPv4' && !addr.internal) {
+        ips.add(addr.address);
+      }
+    }
+  }
+  return [...ips];
 }
 
 function resolveWebPassword(options: CliOptions): { password: string; generated: boolean } {
@@ -2557,7 +2587,18 @@ async function launchWebModeSession(
   } else {
     console.log('Web password: using provided WEB_PASSWORD/--web-password value.');
   }
-  console.log(`Open from another device: http://<host-ip>:${port}`);
+  console.log(`Web terminal bind URL: http://${formatHostForUrl(host)}:${port}`);
+  if (host === '0.0.0.0' || host === '::') {
+    const localIps = getLocalNetworkIpv4Addresses();
+    if (localIps.length > 0) {
+      console.log('Local network URLs:');
+      for (const ip of localIps) {
+        console.log(`  http://${ip}:${port}`);
+      }
+    } else {
+      console.log('Local network URL: unable to detect a non-loopback IPv4 address.');
+    }
+  }
   console.log(`To stop this session later: tmux kill-session -t ${sessionName}`);
 
   const webEnv: NodeJS.ProcessEnv = {
@@ -2590,11 +2631,13 @@ async function launchWebModeSession(
     };
 
     webProcess.on('error', (error) => {
+      killTmuxSession(sessionName);
       clearHandlers();
       reject(error);
     });
 
     webProcess.on('exit', (code) => {
+      killTmuxSession(sessionName);
       clearHandlers();
       if (interrupted) {
         resolve();
