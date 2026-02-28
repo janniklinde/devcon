@@ -57,6 +57,11 @@ interface CliOptions {
   networkHost: boolean;
   conscious: boolean;
   consciousStatePath?: string;
+  webMode: boolean;
+  webHost?: string;
+  webPort?: number;
+  webPassword?: string;
+  webSessionName?: string;
 }
 
 interface AutoBuildConfig {
@@ -68,6 +73,14 @@ interface AutoBuildConfig {
 interface ExtraMount {
   hostPath: string;
   mountName: string;
+}
+
+interface DockerLaunchPlan {
+  command: string;
+  args: string[];
+  cleanup: () => void;
+  cleanupTargets: string[];
+  tempGitDir?: string;
 }
 
 const CONFIG_PATH = process.env.DEVCON_TOOLS_FILE
@@ -98,6 +111,8 @@ const DEFAULT_IMAGE_TAG = 'devcon:latest';
 const DEFAULT_IMAGE_DOCKERFILE = path.resolve(__dirname, '..', 'docker', 'devcon', 'Dockerfile');
 const NETWORK_CHECK_HOST = 'api.openai.com';
 const NETWORK_PROBE_TIMEOUT_MS = parsePositiveIntEnv(process.env.DEVCON_NETWORK_PROBE_TIMEOUT_MS, 2500);
+const WEB_DEFAULT_HOST = '0.0.0.0';
+const WEB_DEFAULT_PORT = 7682;
 const DEFAULT_AUTO_BUILD: AutoBuildConfig = {
   dockerfile: DEFAULT_IMAGE_DOCKERFILE,
   tag: DEFAULT_IMAGE_TAG,
@@ -368,6 +383,11 @@ function parseArgs(argv: string[]): CliOptions {
   let networkHost = false;
   let conscious = false;
   let consciousStatePath: string | undefined;
+  let webMode = false;
+  let webHost: string | undefined;
+  let webPort: number | undefined;
+  let webPassword: string | undefined;
+  let webSessionName: string | undefined;
   let forward = false;
   let helpRequested = false;
 
@@ -391,6 +411,88 @@ function parseArgs(argv: string[]): CliOptions {
 
     if (arg === '--dry-run') {
       dryRun = true;
+      continue;
+    }
+
+    if (arg === '--web') {
+      webMode = true;
+      continue;
+    }
+
+    if (arg.startsWith('--web-host=')) {
+      webHost = arg.substring('--web-host='.length);
+      webMode = true;
+      continue;
+    }
+
+    if (arg === '--web-host') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--web-host flag requires an argument, e.g. --web-host 0.0.0.0');
+      }
+      webHost = next;
+      webMode = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--web-port=')) {
+      const value = arg.substring('--web-port='.length);
+      const parsed = Number.parseInt(value, 10);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        throw new Error('--web-port must be a positive integer, e.g. --web-port 7682');
+      }
+      webPort = parsed;
+      webMode = true;
+      continue;
+    }
+
+    if (arg === '--web-port') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--web-port flag requires an argument, e.g. --web-port 7682');
+      }
+      const parsed = Number.parseInt(next, 10);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        throw new Error('--web-port must be a positive integer, e.g. --web-port 7682');
+      }
+      webPort = parsed;
+      webMode = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--web-password=')) {
+      webPassword = arg.substring('--web-password='.length);
+      webMode = true;
+      continue;
+    }
+
+    if (arg === '--web-password') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--web-password flag requires an argument.');
+      }
+      webPassword = next;
+      webMode = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--web-session=')) {
+      webSessionName = arg.substring('--web-session='.length);
+      webMode = true;
+      continue;
+    }
+
+    if (arg === '--web-session') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--web-session flag requires an argument, e.g. --web-session devcon-web');
+      }
+      webSessionName = next;
+      webMode = true;
+      i += 1;
       continue;
     }
 
@@ -522,6 +624,11 @@ function parseArgs(argv: string[]): CliOptions {
     networkHost,
     conscious,
     consciousStatePath,
+    webMode,
+    webHost,
+    webPort,
+    webPassword,
+    webSessionName,
   };
 }
 
@@ -2298,6 +2405,210 @@ async function maybeEnableHostNetwork(
   return switchToHost;
 }
 
+function ensureTmuxAvailable(): void {
+  const check = spawnSync('tmux', ['-V'], { stdio: 'ignore' });
+  if (check.status !== 0) {
+    throw new Error('tmux is required for --web mode but was not found in PATH.');
+  }
+}
+
+function resolveWebServerScriptPath(): string {
+  const scriptPath = path.resolve(__dirname, '..', 'web', 'server.js');
+  if (!existsSync(scriptPath)) {
+    throw new Error(
+      `Web mode server script not found at ${scriptPath}. Ensure the package includes the "web/" directory.`,
+    );
+  }
+  return scriptPath;
+}
+
+function sanitizeWebSessionToken(raw: string): string {
+  const normalized = raw.trim().replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  return normalized.length > 0 ? normalized : 'devcon';
+}
+
+function resolveWebSessionName(options: CliOptions): string {
+  if (options.webSessionName && options.webSessionName.trim().length > 0) {
+    const provided = options.webSessionName.trim();
+    if (!/^[A-Za-z0-9_-]+$/.test(provided)) {
+      throw new Error('--web-session must contain only letters, numbers, "_" or "-".');
+    }
+    return provided;
+  }
+  const toolToken = sanitizeWebSessionToken(options.toolName ?? 'run');
+  const suffix = randomBytes(3).toString('hex');
+  return `devcon-${toolToken}-${suffix}`;
+}
+
+function buildShellCommand(command: string, args: string[]): string {
+  return [command, ...args].map(shellQuote).join(' ');
+}
+
+function createWebLauncherScript(
+  launch: DockerLaunchPlan,
+  cwd: string,
+): { scriptPath: string; dirPath: string } {
+  const launcherDir = mkdtempSync(path.join(os.tmpdir(), 'devcon-web-launch-'));
+  const scriptPath = path.join(launcherDir, 'launch.sh');
+  const cleanupTargets = [...launch.cleanupTargets, launcherDir];
+  const cleanupLines = cleanupTargets.length > 0
+    ? cleanupTargets.map((target) => `  rm -rf ${shellQuote(target)} >/dev/null 2>&1 || true`).join('\n')
+    : '  :';
+  const script = `#!/bin/bash
+set +e
+cleanup() {
+${cleanupLines}
+}
+trap cleanup EXIT
+cd ${shellQuote(cwd)} || exit 1
+${buildShellCommand(launch.command, launch.args)}
+status=$?
+exit $status
+`;
+  writeFileSync(scriptPath, script, { encoding: 'utf8', mode: 0o755 });
+  return { scriptPath, dirPath: launcherDir };
+}
+
+function tmuxSessionExists(sessionName: string): boolean {
+  const check = spawnSync('tmux', ['has-session', '-t', sessionName], { stdio: 'ignore' });
+  return check.status === 0;
+}
+
+function startWebTmuxSession(sessionName: string, cwd: string, scriptPath: string): void {
+  if (tmuxSessionExists(sessionName)) {
+    throw new Error(`tmux session "${sessionName}" already exists. Pick another name via --web-session.`);
+  }
+  const create = spawnSync(
+    'tmux',
+    ['new-session', '-d', '-s', sessionName, '-c', cwd, scriptPath],
+    { stdio: 'inherit' },
+  );
+  if (create.status !== 0) {
+    throw new Error(`Failed to create tmux session "${sessionName}" for web mode.`);
+  }
+}
+
+function resolveWebHost(options: CliOptions): string {
+  const host = options.webHost ?? process.env.HOST ?? WEB_DEFAULT_HOST;
+  const trimmed = host.trim();
+  if (!trimmed) {
+    throw new Error('--web-host must not be empty.');
+  }
+  return trimmed;
+}
+
+function resolveWebPort(options: CliOptions): number {
+  if (options.webPort) {
+    return options.webPort;
+  }
+  return parsePositiveIntEnv(process.env.PORT, WEB_DEFAULT_PORT);
+}
+
+function resolveWebPassword(options: CliOptions): { password: string; generated: boolean } {
+  const provided = options.webPassword ?? process.env.WEB_PASSWORD ?? process.env.AUTH_TOKEN;
+  if (provided && provided.length > 0) {
+    return { password: provided, generated: false };
+  }
+  return { password: randomBytes(9).toString('base64url'), generated: true };
+}
+
+async function launchWebModeSession(
+  options: CliOptions,
+  cwd: string,
+  launch: DockerLaunchPlan,
+): Promise<void> {
+  ensureTmuxAvailable();
+  const sessionName = resolveWebSessionName(options);
+  const host = resolveWebHost(options);
+  const port = resolveWebPort(options);
+  const passwordInfo = resolveWebPassword(options);
+
+  if (options.dryRun) {
+    console.log(`[dry-run] Web mode session: ${sessionName}`);
+    console.log(`[dry-run] Docker command: ${buildShellCommand(launch.command, launch.args)}`);
+    console.log(`[dry-run] Web server: HOST=${host} PORT=${port} TMUX_TARGET=${sessionName}`);
+    if (passwordInfo.generated) {
+      console.log('[dry-run] A one-time random web password would be generated at runtime.');
+    }
+    launch.cleanup();
+    return;
+  }
+
+  const webServerScript = resolveWebServerScriptPath();
+  let launcherScriptPath = '';
+  let launcherDir = '';
+  try {
+    const launcher = createWebLauncherScript(launch, cwd);
+    launcherScriptPath = launcher.scriptPath;
+    launcherDir = launcher.dirPath;
+    startWebTmuxSession(sessionName, cwd, launcherScriptPath);
+  } catch (error) {
+    launch.cleanup();
+    if (launcherDir) {
+      rmSync(launcherDir, { recursive: true, force: true });
+    }
+    throw error;
+  }
+
+  console.log(`Web mode enabled for tool "${options.toolName}".`);
+  console.log(`tmux session: ${sessionName}`);
+  if (passwordInfo.generated) {
+    console.log(`Web password (generated): ${passwordInfo.password}`);
+  } else {
+    console.log('Web password: using provided WEB_PASSWORD/--web-password value.');
+  }
+  console.log(`Open from another device: http://<host-ip>:${port}`);
+  console.log(`To stop this session later: tmux kill-session -t ${sessionName}`);
+
+  const webEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOST: host,
+    PORT: String(port),
+    TMUX_TARGET: sessionName,
+    WEB_PASSWORD: passwordInfo.password,
+    AUTO_CREATE_SESSION: '0',
+  };
+
+  await new Promise<void>((resolve, reject) => {
+    const webProcess = spawn(process.execPath, [webServerScript], {
+      stdio: 'inherit',
+      env: webEnv,
+    });
+
+    let interrupted = false;
+    const terminate = (): void => {
+      interrupted = true;
+      webProcess.kill('SIGINT');
+    };
+
+    process.on('SIGINT', terminate);
+    process.on('SIGTERM', terminate);
+
+    const clearHandlers = (): void => {
+      process.off('SIGINT', terminate);
+      process.off('SIGTERM', terminate);
+    };
+
+    webProcess.on('error', (error) => {
+      clearHandlers();
+      reject(error);
+    });
+
+    webProcess.on('exit', (code) => {
+      clearHandlers();
+      if (interrupted) {
+        resolve();
+        return;
+      }
+      if (code === 0 || code === null) {
+        resolve();
+        return;
+      }
+      reject(new Error(`Web server exited with code ${code}`));
+    });
+  });
+}
+
 function runCommand(
   command: string,
   args: string[],
@@ -2495,6 +2806,11 @@ function printHelp(tools: ToolMap): void {
   console.log('  --export-patch[=PATH] Export changes from temp-git repo after run (defaults to .devcon/drafts/<ts>.patch)');
   console.log('  --network-host, -network-host Use host networking (helps with VPNs that block Docker bridge DNS/NAT)');
   console.log('  --ipv4, -ipv4 Force IPv4-only networking by disabling IPv6 inside the container');
+  console.log('  --web         Run tool inside tmux and expose it through the built-in web terminal');
+  console.log('  --web-host HOST Web server bind host (default: 0.0.0.0)');
+  console.log('  --web-port PORT Web server port (default: 7682)');
+  console.log('  --web-password PASS Password for web terminal login (auto-generated if omitted)');
+  console.log('  --web-session NAME tmux session name to use for --web (default: auto-generated)');
   console.log('  --conscious, -conscious Enable persistent archive memory via sidecar and auto-mount MCP tools');
   console.log('  --conscious-path PATH Override where conscious state is stored (default: ~/.config/devcon/conscious)');
   console.log('  --help        Show this message');
@@ -2524,7 +2840,7 @@ function buildDockerArgs(options: {
   forceIpv4: boolean;
   networkHost: boolean;
   conscious?: ConsciousRuntime;
-}): { command: string; args: string[]; cleanup: () => void; tempGitDir?: string } {
+}): DockerLaunchPlan {
   const dockerArgs: string[] = ['run', '--rm', '-it'];
   const cleanupTargets: string[] = [];
   const writablePaths = options.tool.writablePaths ?? [];
@@ -2753,7 +3069,13 @@ ${initScriptLines.join('\n')}
     }
   };
 
-  return { command: 'docker', args: dockerArgs, cleanup, tempGitDir };
+  return {
+    command: 'docker',
+    args: dockerArgs,
+    cleanup,
+    cleanupTargets: [...cleanupTargets],
+    tempGitDir,
+  };
 }
 
 async function main(): Promise<void> {
@@ -2774,6 +3096,10 @@ async function main(): Promise<void> {
     throw new Error('--export-patch requires --temp-git so the host repository stays masked.');
   }
 
+  if (options.webMode && options.exportPatchPath !== undefined) {
+    throw new Error('--export-patch is not supported with --web mode.');
+  }
+
   if (!options.toolName) {
     console.error('No tool specified.');
     printHelp(tools);
@@ -2782,6 +3108,9 @@ async function main(): Promise<void> {
   }
 
   if (options.toolName === 'update') {
+    if (options.webMode) {
+      throw new Error('The --web flag cannot be used with "devcon update".');
+    }
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon update". Specify the desired image in the tool configuration instead.');
     }
@@ -2791,6 +3120,9 @@ async function main(): Promise<void> {
   }
 
   if (options.toolName === 'rebuild') {
+    if (options.webMode) {
+      throw new Error('The --web flag cannot be used with "devcon rebuild".');
+    }
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon rebuild". Specify the desired image in the tool configuration instead.');
     }
@@ -2802,6 +3134,9 @@ async function main(): Promise<void> {
   const cwd = getCurrentWorkingDirectory();
 
   if (options.toolName === 'sensitive') {
+    if (options.webMode) {
+      throw new Error('The --web flag cannot be used with "devcon sensitive".');
+    }
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon sensitive". This command only manages sensitive-file patterns.');
     }
@@ -2811,6 +3146,9 @@ async function main(): Promise<void> {
   }
 
   if (options.toolName === 'skip-scan') {
+    if (options.webMode) {
+      throw new Error('The --web flag cannot be used with "devcon skip-scan".');
+    }
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon skip-scan". This command only manages directory scan skips.');
     }
@@ -2820,6 +3158,9 @@ async function main(): Promise<void> {
   }
 
   if (options.toolName === 'conscious') {
+    if (options.webMode) {
+      throw new Error('The --web flag cannot be used with "devcon conscious".');
+    }
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon conscious". This command manages conscious storage only.');
     }
@@ -2861,7 +3202,7 @@ async function main(): Promise<void> {
       description: 'Interactive shell',
     };
 
-    const { command, args, cleanup } = buildDockerArgs({
+    const launch = buildDockerArgs({
       cwd,
       toolName: options.toolName,
       tool: toolDef,
@@ -2876,13 +3217,21 @@ async function main(): Promise<void> {
       conscious: consciousRuntime,
     });
 
-    if (options.dryRun) {
-      console.log([command, ...args].join(' '));
-      cleanup();
+    if (options.webMode) {
+      if (consciousRuntime) {
+        console.warn('Web mode note: conscious auto-capture on CLI exit is not performed while running inside tmux.');
+      }
+      await launchWebModeSession(options, cwd, launch);
       return;
     }
 
-    const child = spawn(command, args, { stdio: 'inherit' });
+    if (options.dryRun) {
+      console.log([launch.command, ...launch.args].join(' '));
+      launch.cleanup();
+      return;
+    }
+
+    const child = spawn(launch.command, launch.args, { stdio: 'inherit' });
     const terminate = (): void => {
       child.kill('SIGINT');
     };
@@ -2895,12 +3244,12 @@ async function main(): Promise<void> {
       if (captured) {
         console.log(`Conscious mode captured finding ${captured.id}`);
       }
-      cleanup();
+      launch.cleanup();
       process.exit(code ?? 1);
     });
 
     child.on('error', (error) => {
-      cleanup();
+      launch.cleanup();
       console.error('Failed to start docker:', error instanceof Error ? error.message : error);
       process.exit(1);
     });
@@ -2941,7 +3290,7 @@ async function main(): Promise<void> {
     console.log(`Conscious sidecar ready: ${consciousRuntime.sidecarContainerName} (${consciousRuntime.sidecarHost}:${consciousRuntime.sidecarPort})`);
   }
 
-  const { command, args, cleanup, tempGitDir } = buildDockerArgs({
+  const launch = buildDockerArgs({
     cwd,
     toolName: options.toolName,
     tool,
@@ -2956,13 +3305,24 @@ async function main(): Promise<void> {
     conscious: consciousRuntime,
   });
 
-  if (options.dryRun) {
-    console.log([command, ...args].join(' '));
-    cleanup();
+  if (options.webMode) {
+    if (options.tempGit) {
+      console.warn('Web mode note: --temp-git is supported, but patch export/auto-capture callbacks are not run by the parent CLI process.');
+    }
+    if (consciousRuntime) {
+      console.warn('Web mode note: conscious auto-capture on CLI exit is not performed while running inside tmux.');
+    }
+    await launchWebModeSession(options, cwd, launch);
     return;
   }
 
-  const child = spawn(command, args, { stdio: 'inherit' });
+  if (options.dryRun) {
+    console.log([launch.command, ...launch.args].join(' '));
+    launch.cleanup();
+    return;
+  }
+
+  const child = spawn(launch.command, launch.args, { stdio: 'inherit' });
   const terminate = (): void => {
     child.kill('SIGINT');
   };
@@ -2971,9 +3331,9 @@ async function main(): Promise<void> {
   process.on('SIGTERM', terminate);
 
   child.on('exit', (code) => {
-    if (options.tempGit && tempGitDir && options.exportPatchPath !== undefined) {
+    if (options.tempGit && launch.tempGitDir && options.exportPatchPath !== undefined) {
       try {
-        exportTempGitPatch(tempGitDir, cwd, options.exportPatchPath || undefined);
+        exportTempGitPatch(launch.tempGitDir, cwd, options.exportPatchPath || undefined);
       } catch (error) {
         console.warn('Failed to export patch from temp git repo:', error instanceof Error ? error.message : error);
       }
@@ -2982,12 +3342,12 @@ async function main(): Promise<void> {
     if (captured) {
       console.log(`Conscious mode captured finding ${captured.id}`);
     }
-    cleanup();
+    launch.cleanup();
     process.exit(code ?? 1);
   });
 
   child.on('error', (error) => {
-    cleanup();
+    launch.cleanup();
     console.error('Failed to start docker:', error instanceof Error ? error.message : error);
     process.exit(1);
   });

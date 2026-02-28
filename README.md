@@ -75,6 +75,31 @@ devcon --mount ../shared codex
 devcon --mount ~/work/notes --mount /tmp/datasets codex
 ```
 
+## Web mode (phone + desktop)
+
+Use `--web` to launch a tool in a tmux-backed session and immediately expose it through the built-in web terminal:
+
+```bash
+devcon --web codex
+```
+
+You can also set explicit connection settings:
+
+```bash
+devcon --web --web-host 0.0.0.0 --web-port 7682 --web-password 'strong-password' codex
+```
+
+Notes:
+
+- `--web` requires `tmux` on the host.
+- If no password is provided (`--web-password` or `WEB_PASSWORD`), devcon generates one-time credentials and prints them.
+- By default devcon auto-generates a tmux session name. Override via `--web-session NAME`.
+- The container keeps running in tmux until it exits or you stop it (`tmux kill-session -t <name>`).
+
+Manual mode is still available via `npm run web` if you want to attach the web UI to an existing tmux session (`TMUX_TARGET=...`).
+
+Security note: do not expose the web terminal directly to the public internet without TLS and upstream access control.
+
 Useful flags (place before `--` that separates devcon flags from tool args):
 
 - `--dry-run` – Print the assembled `docker run` invocation instead of executing it.
@@ -86,6 +111,11 @@ Useful flags (place before `--` that separates devcon flags from tool args):
 - `--export-patch[=PATH]` – With `--temp-git`, export patches after the run to PATH (or `.devcon/drafts/<timestamp>.patch`).
 - `--network-host` / `-network-host` – Use host networking (often required on VPNs that block Docker bridge DNS/NAT).
 - `--ipv4` / `-ipv4` – Force IPv4-only networking by disabling IPv6 inside the container.
+- `--web` – Run the tool inside tmux and expose it through the built-in web terminal.
+- `--web-host HOST` – Override web server bind host (default: `0.0.0.0`).
+- `--web-port PORT` – Override web server port (default: `7682`).
+- `--web-password PASS` – Set web terminal login password (auto-generated if omitted).
+- `--web-session NAME` – Set tmux session name for web mode.
 - `--conscious` / `-conscious` – Enable conscious mode (persistent archive + MCP memory tools).
 - `--conscious-path PATH` – Override conscious state directory (defaults to `~/.config/devcon/conscious`).
 - `--help` / `--list` – Show usage plus the registered tools.
