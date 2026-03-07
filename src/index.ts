@@ -3,6 +3,8 @@ import { spawn, spawnSync, SpawnOptionsWithoutStdio } from 'child_process';
 import { createHash, randomBytes } from 'crypto';
 import {
   existsSync,
+  accessSync,
+  constants as fsConstants,
   mkdtempSync,
   readdirSync,
   rmSync,
@@ -14,10 +16,12 @@ import {
   Dirent,
   mkdirSync,
   cpSync,
+  lstatSync,
 } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as readline from 'readline';
+import * as net from 'net';
 import {
   bootstrapConsciousPaths,
   resolveConsciousPaths,
@@ -46,6 +50,7 @@ interface CliOptions {
   toolName?: string;
   toolArgs: string[];
   dryRun: boolean;
+  backend: BackendType;
   imageOverride?: string;
   mountPaths: string[];
   shareHome: boolean;
@@ -64,6 +69,8 @@ interface CliOptions {
   webSessionName?: string;
 }
 
+type BackendType = 'docker' | 'microvm';
+
 interface AutoBuildConfig {
   dockerfile: string;
   tag: string;
@@ -75,12 +82,50 @@ interface ExtraMount {
   mountName: string;
 }
 
-interface DockerLaunchPlan {
+interface LaunchPlan {
   command: string;
   args: string[];
   cleanup: () => void;
   cleanupTargets: string[];
   tempGitDir?: string;
+  finalize?: () => void | Promise<void>;
+}
+
+interface SyncPlanTarget {
+  label: string;
+  hostPath: string;
+  guestPath: string;
+  stagePath: string;
+  rootType: 'file' | 'dir';
+  initialEntries: Set<string>;
+}
+
+type MicrovmGuestArch = 'amd64' | 'arm64';
+
+interface MicrovmHostDependency {
+  command: string;
+  aptPackage?: string;
+  brewPackage?: string;
+}
+
+interface MicrovmProfile {
+  hostPlatform: NodeJS.Platform;
+  hostArch: string;
+  guestArch: MicrovmGuestArch;
+  qemuBinary: string;
+  downloadUrl: string;
+  pristineImageName: string;
+  preparedImageName: string;
+  firmwareCandidates: string[];
+  startArgs: (options: {
+    imagePath: string;
+    sshPort: number;
+    pidFilePath: string;
+    serialLogPath: string;
+    seedImagePath?: string;
+    firmwarePath?: string;
+  }) => string[];
+  dependencies: MicrovmHostDependency[];
 }
 
 const CONFIG_PATH = process.env.DEVCON_TOOLS_FILE
@@ -109,10 +154,23 @@ const HOME_READONLY_DEFAULT = parseBooleanEnv(process.env.DEVCON_HOME_READONLY);
 const SHARE_HOME_DEFAULT = parseBooleanEnv(process.env.DEVCON_SHARE_HOME);
 const DEFAULT_IMAGE_TAG = 'devcon:latest';
 const DEFAULT_IMAGE_DOCKERFILE = path.resolve(__dirname, '..', 'docker', 'devcon', 'Dockerfile');
+const DEFAULT_BACKEND: BackendType = process.env.DEVCON_BACKEND === 'microvm' ? 'microvm' : 'docker';
 const NETWORK_CHECK_HOST = 'api.openai.com';
 const NETWORK_PROBE_TIMEOUT_MS = parsePositiveIntEnv(process.env.DEVCON_NETWORK_PROBE_TIMEOUT_MS, 2500);
 const WEB_DEFAULT_HOST = '0.0.0.0';
 const WEB_DEFAULT_PORT = 7682;
+const MICROVM_ROOT_PATH = resolveMicrovmRootPath();
+const MICROVM_IMAGE_URL_AMD64 = 'https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img';
+const MICROVM_IMAGE_URL_ARM64 = 'https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img';
+const MICROVM_GUEST_USER = 'devcon';
+const MICROVM_GUEST_HOME = `/home/${MICROVM_GUEST_USER}`;
+const MICROVM_BOOT_TIMEOUT_MS = parsePositiveIntEnv(process.env.DEVCON_MICROVM_BOOT_TIMEOUT_MS, 120_000);
+const MICROVM_PREPARE_TIMEOUT_MS = parsePositiveIntEnv(process.env.DEVCON_MICROVM_PREPARE_TIMEOUT_MS, 900_000);
+const MICROVM_DEFAULT_MEMORY_MB = parsePositiveIntEnv(process.env.DEVCON_MICROVM_MEMORY_MB, 4096);
+const MICROVM_DEFAULT_CPUS = parsePositiveIntEnv(process.env.DEVCON_MICROVM_CPUS, 2);
+const MICROVM_DISK_SIZE_GB = parsePositiveIntEnv(process.env.DEVCON_MICROVM_DISK_SIZE_GB, 16);
+const MICROVM_PREPARED_IMAGE_REV = '2';
+const MICROVM_FIRMWARE_ENV = 'DEVCON_MICROVM_FIRMWARE';
 const DEFAULT_AUTO_BUILD: AutoBuildConfig = {
   dockerfile: DEFAULT_IMAGE_DOCKERFILE,
   tag: DEFAULT_IMAGE_TAG,
@@ -179,6 +237,226 @@ function parsePositiveIntEnv(value: string | undefined, fallback: number): numbe
     return fallback;
   }
   return parsed;
+}
+
+function pathIsWritable(target: string): boolean {
+  try {
+    const probe = existsSync(target) ? target : path.dirname(target);
+    accessSync(probe, fsConstants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveMicrovmRootPath(): string {
+  const explicit = process.env.DEVCON_MICROVM_ROOT;
+  if (explicit && explicit.trim().length > 0) {
+    return path.resolve(explicit);
+  }
+
+  const xdgCache = process.env.XDG_CACHE_HOME;
+  if (xdgCache && pathIsWritable(xdgCache)) {
+    return path.join(path.resolve(xdgCache), 'devcon', 'microvm');
+  }
+
+  const homeDir = os.homedir();
+  if (homeDir && pathIsWritable(homeDir)) {
+    return path.join(homeDir, '.cache', 'devcon', 'microvm');
+  }
+
+  const uidSuffix = typeof process.getuid === 'function' ? String(process.getuid()) : 'unknown';
+  return path.join(os.tmpdir(), `devcon-${uidSuffix}`, 'microvm');
+}
+
+function normalizeHostArch(arch: string): 'x64' | 'arm64' | 'unknown' {
+  if (arch === 'x64') {
+    return 'x64';
+  }
+  if (arch === 'arm64' || arch === 'aarch64') {
+    return 'arm64';
+  }
+  return 'unknown';
+}
+
+function resolveMicrovmProfile(): MicrovmProfile {
+  const normalizedArch = normalizeHostArch(os.arch());
+  const preparedSuffix = `r${MICROVM_PREPARED_IMAGE_REV}-${MICROVM_DISK_SIZE_GB}g`;
+  if (process.platform === 'darwin' && normalizedArch === 'arm64') {
+    return {
+      hostPlatform: process.platform,
+      hostArch: os.arch(),
+      guestArch: 'arm64',
+      qemuBinary: 'qemu-system-aarch64',
+      downloadUrl: process.env.DEVCON_MICROVM_IMAGE_URL || MICROVM_IMAGE_URL_ARM64,
+      pristineImageName: 'ubuntu-24.04-cloudimg-arm64.img',
+      preparedImageName: `devcon-microvm-base-arm64-${preparedSuffix}.qcow2`,
+      firmwareCandidates: [
+        process.env[MICROVM_FIRMWARE_ENV] ?? '',
+        '/opt/homebrew/share/qemu/edk2-aarch64-code.fd',
+        '/opt/homebrew/share/qemu/QEMU_EFI.fd',
+        '/usr/local/share/qemu/edk2-aarch64-code.fd',
+        '/usr/local/share/qemu/QEMU_EFI.fd',
+      ].filter((entry) => entry.length > 0),
+      startArgs: ({ imagePath, sshPort, pidFilePath, serialLogPath, seedImagePath, firmwarePath }) => {
+        if (!firmwarePath) {
+          throw new Error(
+            `Apple Silicon microVM launches require an AArch64 UEFI firmware file. Set ${MICROVM_FIRMWARE_ENV} if QEMU was installed outside Homebrew.`,
+          );
+        }
+        const args = [
+          '-daemonize',
+          '-display',
+          'none',
+          '-machine',
+          'virt,accel=hvf:tcg',
+          '-cpu',
+          'max',
+          '-m',
+          String(MICROVM_DEFAULT_MEMORY_MB),
+          '-smp',
+          String(MICROVM_DEFAULT_CPUS),
+          '-pidfile',
+          pidFilePath,
+          '-serial',
+          `file:${serialLogPath}`,
+          '-bios',
+          firmwarePath,
+          '-drive',
+          `if=virtio,format=qcow2,file=${imagePath}`,
+          '-nic',
+          `user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:${sshPort}-:22`,
+        ];
+        if (seedImagePath) {
+          args.push('-drive', `if=virtio,format=raw,file=${seedImagePath},readonly=on`);
+        }
+        return args;
+      },
+      dependencies: [
+        { command: 'qemu-system-aarch64', brewPackage: 'qemu' },
+        { command: 'qemu-img', brewPackage: 'qemu' },
+        { command: 'ssh' },
+        { command: 'ssh-keygen' },
+        { command: 'curl' },
+        { command: 'tar' },
+      ],
+    };
+  }
+
+  if (process.platform === 'linux' && normalizedArch === 'x64') {
+    return {
+      hostPlatform: process.platform,
+      hostArch: os.arch(),
+      guestArch: 'amd64',
+      qemuBinary: 'qemu-system-x86_64',
+      downloadUrl: process.env.DEVCON_MICROVM_IMAGE_URL || MICROVM_IMAGE_URL_AMD64,
+      pristineImageName: 'ubuntu-24.04-cloudimg-amd64.img',
+      preparedImageName: `devcon-microvm-base-amd64-${preparedSuffix}.qcow2`,
+      firmwareCandidates: [],
+      startArgs: ({ imagePath, sshPort, pidFilePath, serialLogPath, seedImagePath }) => {
+        const args = [
+          '-daemonize',
+          '-display',
+          'none',
+          '-machine',
+          'q35,accel=kvm:tcg',
+          '-cpu',
+          'max',
+          '-m',
+          String(MICROVM_DEFAULT_MEMORY_MB),
+          '-smp',
+          String(MICROVM_DEFAULT_CPUS),
+          '-pidfile',
+          pidFilePath,
+          '-serial',
+          `file:${serialLogPath}`,
+          '-drive',
+          `if=virtio,format=qcow2,file=${imagePath}`,
+          '-nic',
+          `user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:${sshPort}-:22`,
+        ];
+        if (seedImagePath) {
+          args.push('-drive', `if=virtio,format=raw,file=${seedImagePath},readonly=on`);
+        }
+        return args;
+      },
+      dependencies: [
+        { command: 'qemu-system-x86_64', aptPackage: 'qemu-system-x86' },
+        { command: 'qemu-img', aptPackage: 'qemu-utils' },
+        { command: 'cloud-localds', aptPackage: 'cloud-image-utils' },
+        { command: 'ssh', aptPackage: 'openssh-client' },
+        { command: 'ssh-keygen', aptPackage: 'openssh-client' },
+        { command: 'curl', aptPackage: 'curl' },
+        { command: 'tar', aptPackage: 'tar' },
+      ],
+    };
+  }
+
+  if (process.platform === 'linux' && normalizedArch === 'arm64') {
+    return {
+      hostPlatform: process.platform,
+      hostArch: os.arch(),
+      guestArch: 'arm64',
+      qemuBinary: 'qemu-system-aarch64',
+      downloadUrl: process.env.DEVCON_MICROVM_IMAGE_URL || MICROVM_IMAGE_URL_ARM64,
+      pristineImageName: 'ubuntu-24.04-cloudimg-arm64.img',
+      preparedImageName: `devcon-microvm-base-arm64-${preparedSuffix}.qcow2`,
+      firmwareCandidates: [
+        process.env[MICROVM_FIRMWARE_ENV] ?? '',
+        '/usr/share/qemu-efi-aarch64/QEMU_EFI.fd',
+        '/usr/share/AAVMF/AAVMF_CODE.fd',
+        '/usr/share/edk2/aarch64/QEMU_EFI.fd',
+        '/usr/share/qemu/QEMU_EFI.fd',
+      ].filter((entry) => entry.length > 0),
+      startArgs: ({ imagePath, sshPort, pidFilePath, serialLogPath, seedImagePath, firmwarePath }) => {
+        if (!firmwarePath) {
+          throw new Error(
+            `Linux arm64 microVM launches require an AArch64 UEFI firmware file. Install qemu-efi-aarch64 or set ${MICROVM_FIRMWARE_ENV}.`,
+          );
+        }
+        const args = [
+          '-daemonize',
+          '-display',
+          'none',
+          '-machine',
+          'virt,accel=kvm:tcg',
+          '-cpu',
+          'max',
+          '-m',
+          String(MICROVM_DEFAULT_MEMORY_MB),
+          '-smp',
+          String(MICROVM_DEFAULT_CPUS),
+          '-pidfile',
+          pidFilePath,
+          '-serial',
+          `file:${serialLogPath}`,
+          '-bios',
+          firmwarePath,
+          '-drive',
+          `if=virtio,format=qcow2,file=${imagePath}`,
+          '-nic',
+          `user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:${sshPort}-:22`,
+        ];
+        if (seedImagePath) {
+          args.push('-drive', `if=virtio,format=raw,file=${seedImagePath},readonly=on`);
+        }
+        return args;
+      },
+      dependencies: [
+        { command: 'qemu-system-aarch64', aptPackage: 'qemu-system-arm' },
+        { command: 'qemu-img', aptPackage: 'qemu-utils' },
+        { command: 'cloud-localds', aptPackage: 'cloud-image-utils' },
+        { command: 'ssh', aptPackage: 'openssh-client' },
+        { command: 'ssh-keygen', aptPackage: 'openssh-client' },
+        { command: 'curl', aptPackage: 'curl' },
+        { command: 'tar', aptPackage: 'tar' },
+      ],
+    };
+  }
+
+  throw new Error(
+    `The microVM backend is not supported on ${process.platform}/${os.arch()} yet. Supported hosts: linux/x64, linux/arm64, darwin/arm64.`,
+  );
 }
 
 function resolveUserPath(input: string, homeDir: string): string {
@@ -374,6 +652,7 @@ function parseArgs(argv: string[]): CliOptions {
   const mountPaths: string[] = [];
   let toolName: string | undefined;
   let dryRun = false;
+  let backend = DEFAULT_BACKEND;
   let imageOverride: string | undefined;
   let shareHome = SHARE_HOME_DEFAULT;
   let allowGit = false;
@@ -411,6 +690,28 @@ function parseArgs(argv: string[]): CliOptions {
 
     if (arg === '--dry-run') {
       dryRun = true;
+      continue;
+    }
+
+    if (arg.startsWith('--backend=')) {
+      const value = arg.substring('--backend='.length).trim();
+      if (value !== 'docker' && value !== 'microvm') {
+        throw new Error('--backend must be either "docker" or "microvm".');
+      }
+      backend = value;
+      continue;
+    }
+
+    if (arg === '--backend') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--backend flag requires an argument, e.g. --backend microvm');
+      }
+      if (next !== 'docker' && next !== 'microvm') {
+        throw new Error('--backend must be either "docker" or "microvm".');
+      }
+      backend = next;
+      i += 1;
       continue;
     }
 
@@ -613,6 +914,7 @@ function parseArgs(argv: string[]): CliOptions {
     toolName,
     toolArgs,
     dryRun,
+    backend,
     imageOverride,
     mountPaths,
     shareHome,
@@ -2445,7 +2747,7 @@ function buildShellCommand(command: string, args: string[]): string {
 }
 
 function createWebLauncherScript(
-  launch: DockerLaunchPlan,
+  launch: LaunchPlan,
   cwd: string,
 ): { scriptPath: string; dirPath: string } {
   const launcherDir = mkdtempSync(path.join(os.tmpdir(), 'devcon-web-launch-'));
@@ -2545,7 +2847,7 @@ function resolveWebPassword(options: CliOptions): { password: string; generated:
 async function launchWebModeSession(
   options: CliOptions,
   cwd: string,
-  launch: DockerLaunchPlan,
+  launch: LaunchPlan,
 ): Promise<void> {
   ensureTmuxAvailable();
   const sessionName = resolveWebSessionName(options);
@@ -2839,16 +3141,17 @@ function printHelp(tools: ToolMap): void {
   console.log('  devcon skip-scan <list|add|remove> [dir]\n');
   console.log('  devcon conscious <list|inspect|tree|wipe-project|wipe-all> [options]\n');
   console.log('Flags:');
-  console.log('  --dry-run     Print the docker command without executing it');
-  console.log('  --home        Share your host home directory with the container (disabled by default)');
-  console.log('  --no-home     Do not share your host home directory with the container');
-  console.log('  --image=IMG   Override the docker image for this run');
-  console.log('  --with-git    Unmask .git and inject a sandboxed git user inside the container');
-  console.log('  --temp-git    Mask host .git but provide a temporary git repo/worktree inside the container');
-  console.log('  --mount PATH  Bind-mount an extra host directory under /workspace/<folder-name> (repeatable)');
+  console.log('  --dry-run     Print the assembled launch plan without executing it');
+  console.log('  --backend NAME Choose runtime backend: docker (default) or microvm');
+  console.log('  --home        Share your host home directory with the container (Docker backend only)');
+  console.log('  --no-home     Do not share your host home directory with the runtime');
+  console.log('  --image=IMG   Override the docker image for this run (Docker backend only)');
+  console.log('  --with-git    Unmask .git and inject a sandboxed git user inside the runtime');
+  console.log('  --temp-git    Mask host .git but provide a temporary git repo/worktree inside the runtime');
+  console.log('  --mount PATH  Add an extra host directory under /workspace/<folder-name> (repeatable)');
   console.log('  --export-patch[=PATH] Export changes from temp-git repo after run (defaults to .devcon/drafts/<ts>.patch)');
-  console.log('  --network-host, -network-host Use host networking (helps with VPNs that block Docker bridge DNS/NAT)');
-  console.log('  --ipv4, -ipv4 Force IPv4-only networking by disabling IPv6 inside the container');
+  console.log('  --network-host, -network-host Use host networking (Docker backend only)');
+  console.log('  --ipv4, -ipv4 Force IPv4-only networking inside the runtime when supported');
   console.log('  --web         Run tool inside tmux and expose it through the built-in web terminal');
   console.log('  --web-host HOST Web server bind host (default: 0.0.0.0)');
   console.log('  --web-port PORT Web server port (default: 7682)');
@@ -2883,7 +3186,7 @@ function buildDockerArgs(options: {
   forceIpv4: boolean;
   networkHost: boolean;
   conscious?: ConsciousRuntime;
-}): DockerLaunchPlan {
+}): LaunchPlan {
   const dockerArgs: string[] = ['run', '--rm', '-it'];
   const cleanupTargets: string[] = [];
   const writablePaths = options.tool.writablePaths ?? [];
@@ -3121,6 +3424,941 @@ ${initScriptLines.join('\n')}
   };
 }
 
+function getMicrovmPaths(profile: MicrovmProfile): {
+  rootDir: string;
+  imagesDir: string;
+  runsDir: string;
+  sshDir: string;
+  pristineImagePath: string;
+  preparedImagePath: string;
+  privateKeyPath: string;
+  publicKeyPath: string;
+} {
+  const imagesDir = path.join(MICROVM_ROOT_PATH, 'images');
+  const runsDir = path.join(MICROVM_ROOT_PATH, 'runs');
+  const sshDir = path.join(MICROVM_ROOT_PATH, 'ssh');
+  return {
+    rootDir: MICROVM_ROOT_PATH,
+    imagesDir,
+    runsDir,
+    sshDir,
+    pristineImagePath: path.join(imagesDir, profile.pristineImageName),
+    preparedImagePath: path.join(imagesDir, profile.preparedImageName),
+    privateKeyPath: path.join(sshDir, 'id_ed25519'),
+    publicKeyPath: path.join(sshDir, 'id_ed25519.pub'),
+  };
+}
+
+function ensureDir(target: string): void {
+  if (!existsSync(target)) {
+    mkdirSync(target, { recursive: true });
+  }
+}
+
+function commandExists(command: string, args: string[] = ['--version']): boolean {
+  const direct = spawnSync(command, args, { stdio: 'ignore' });
+  if (!direct.error && direct.status === 0) {
+    return true;
+  }
+
+  const lookup = spawnSync('/bin/sh', ['-lc', `command -v ${shellQuote(command)} >/dev/null 2>&1`], {
+    stdio: 'ignore',
+  });
+  return !lookup.error && lookup.status === 0;
+}
+
+function renderAptInstallCommand(packages: string[]): string {
+  return `sudo apt-get update && sudo apt-get install -y ${packages.join(' ')}`;
+}
+
+function renderBrewInstallCommand(packages: string[]): string {
+  return `brew install ${packages.join(' ')}`;
+}
+
+async function installViaApt(packages: string[], dryRun: boolean): Promise<void> {
+  if (packages.length === 0) {
+    return;
+  }
+  const installCommand = renderAptInstallCommand(packages);
+  if (dryRun) {
+    console.log(`[dry-run] Missing microVM host dependencies. Would run: ${installCommand}`);
+    return;
+  }
+
+  if (!commandExists('apt-get')) {
+    throw new Error(`Missing microVM host dependencies (${packages.join(', ')}). Install them with: ${installCommand}`);
+  }
+
+  const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+  const command = isRoot ? 'apt-get' : 'sudo';
+  const updateArgs = isRoot ? ['update'] : ['apt-get', 'update'];
+  const installArgs = isRoot ? ['install', '-y', ...packages] : ['apt-get', 'install', '-y', ...packages];
+
+  if (!isRoot) {
+    if (!commandExists('sudo', ['--version'])) {
+      throw new Error(`Missing microVM host dependencies (${packages.join(', ')}). Install them with: ${installCommand}`);
+    }
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+      throw new Error(`Missing microVM host dependencies (${packages.join(', ')}). Install them with: ${installCommand}`);
+    }
+    const confirmed = await promptYesNo('Install required microVM host packages now? [y/N] ');
+    if (!confirmed) {
+      throw new Error(`Install the missing microVM host packages and retry: ${installCommand}`);
+    }
+  } else {
+    console.log(`Installing required microVM host packages: ${packages.join(', ')}`);
+  }
+
+  await runCommand(command, updateArgs);
+  await runCommand(command, installArgs);
+}
+
+async function installViaBrew(packages: string[], dryRun: boolean): Promise<void> {
+  if (packages.length === 0) {
+    return;
+  }
+  const installCommand = renderBrewInstallCommand(packages);
+  if (dryRun) {
+    console.log(`[dry-run] Missing microVM host dependencies. Would run: ${installCommand}`);
+    return;
+  }
+  if (!commandExists('brew', ['--version'])) {
+    throw new Error(`Missing microVM host dependencies (${packages.join(', ')}). Install them with: ${installCommand}`);
+  }
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error(`Missing microVM host dependencies (${packages.join(', ')}). Install them with: ${installCommand}`);
+  }
+  const confirmed = await promptYesNo('Install required microVM host packages with Homebrew now? [y/N] ');
+  if (!confirmed) {
+    throw new Error(`Install the missing microVM host packages and retry: ${installCommand}`);
+  }
+  await runCommand('brew', ['install', ...packages]);
+}
+
+async function ensureMicrovmHostDependencies(profile: MicrovmProfile, dryRun: boolean): Promise<void> {
+  const missing = profile.dependencies.filter((entry) => !commandExists(entry.command));
+  if (missing.length === 0) {
+    return;
+  }
+
+  if (profile.hostPlatform === 'linux') {
+    const aptPackages = Array.from(new Set(
+      missing
+        .map((entry) => entry.aptPackage)
+        .filter((entry): entry is string => Boolean(entry)),
+    ));
+    if (aptPackages.length === 0) {
+      throw new Error(`Missing microVM host dependencies: ${missing.map((entry) => entry.command).join(', ')}`);
+    }
+    await installViaApt(aptPackages, dryRun);
+    return;
+  }
+
+  if (profile.hostPlatform === 'darwin') {
+    const brewPackages = Array.from(new Set(
+      missing
+        .map((entry) => entry.brewPackage)
+        .filter((entry): entry is string => Boolean(entry)),
+    ));
+    if (brewPackages.length === 0) {
+      throw new Error(`Missing microVM host dependencies: ${missing.map((entry) => entry.command).join(', ')}`);
+    }
+    await installViaBrew(brewPackages, dryRun);
+    return;
+  }
+
+  throw new Error(`Unsupported host platform for microVM dependency installation: ${profile.hostPlatform}`);
+}
+
+function ensureMicrovmSshKeyPair(privateKeyPath: string, publicKeyPath: string): void {
+  if (existsSync(privateKeyPath) && existsSync(publicKeyPath)) {
+    return;
+  }
+  ensureDir(path.dirname(privateKeyPath));
+  const keygen = spawnSync(
+    'ssh-keygen',
+    ['-t', 'ed25519', '-N', '', '-C', 'devcon-microvm', '-f', privateKeyPath],
+    { stdio: 'inherit' },
+  );
+  if (keygen.status !== 0) {
+    throw new Error('Failed to generate the microVM SSH keypair.');
+  }
+}
+
+function resolveMicrovmFirmwarePath(profile: MicrovmProfile): string | undefined {
+  for (const candidate of profile.firmwareCandidates) {
+    if (candidate && existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+async function ensureMicrovmPristineImage(profile: MicrovmProfile, imagePath: string, dryRun: boolean): Promise<void> {
+  if (existsSync(imagePath)) {
+    return;
+  }
+  ensureDir(path.dirname(imagePath));
+  if (dryRun) {
+    console.log(`[dry-run] Would download microVM base image from ${profile.downloadUrl} to ${imagePath}`);
+    return;
+  }
+  console.log(`Downloading Ubuntu cloud image for microVM backend: ${profile.downloadUrl}`);
+  await runCommand('curl', ['-fL', profile.downloadUrl, '-o', imagePath]);
+}
+
+function renderMicrovmBootstrapUserData(publicKey: string): string {
+  return `#cloud-config
+growpart:
+  mode: auto
+  devices: ['/']
+  ignore_growroot_disabled: false
+resize_rootfs: true
+package_update: true
+packages:
+  - git
+  - curl
+  - ripgrep
+  - ca-certificates
+  - openssh-server
+  - sudo
+  - nodejs
+  - npm
+users:
+  - default
+  - name: ${MICROVM_GUEST_USER}
+    gecos: Devcon MicroVM
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${publicKey.trim()}
+runcmd:
+  - mkdir -p ${MICROVM_GUEST_HOME}/.ssh /workspace /tmp/devcon
+  - chown -R ${MICROVM_GUEST_USER}:${MICROVM_GUEST_USER} ${MICROVM_GUEST_HOME} /workspace /tmp/devcon
+  - chmod 700 ${MICROVM_GUEST_HOME}/.ssh
+  - npm install -g @openai/codex@latest @anthropic-ai/claude-code@latest
+  - touch /opt/devcon-microvm-ready
+`;
+}
+
+function renderMicrovmBootstrapMetaData(): string {
+  return `instance-id: devcon-microvm-bootstrap
+local-hostname: devcon-microvm
+`;
+}
+
+function createCloudInitSeedViaHdiutil(seedImagePath: string, userDataPath: string, metaDataPath: string): void {
+  const seedDir = mkdtempSync(path.join(os.tmpdir(), 'devcon-microvm-seed-'));
+  try {
+    cpSync(userDataPath, path.join(seedDir, 'user-data'));
+    cpSync(metaDataPath, path.join(seedDir, 'meta-data'));
+    const requestedOutput = seedImagePath.endsWith('.iso') ? seedImagePath : `${seedImagePath}.iso`;
+    const result = spawnSync(
+      'hdiutil',
+      ['makehybrid', '-o', requestedOutput, seedDir, '-iso', '-joliet', '-default-volume-name', 'cidata'],
+      { stdio: 'inherit' },
+    );
+    if (result.status !== 0) {
+      throw new Error('Failed to create the cloud-init seed image with hdiutil.');
+    }
+    const generatedPath = existsSync(requestedOutput)
+      ? requestedOutput
+      : existsSync(`${requestedOutput}.cdr`)
+        ? `${requestedOutput}.cdr`
+        : undefined;
+    if (!generatedPath) {
+      throw new Error('hdiutil did not produce the expected cloud-init seed image output.');
+    }
+    if (generatedPath !== seedImagePath) {
+      cpSync(generatedPath, seedImagePath);
+      rmSync(generatedPath, { force: true });
+    }
+  } finally {
+    rmSync(seedDir, { recursive: true, force: true });
+  }
+}
+
+function createCloudInitSeedImage(seedImagePath: string, userDataPath: string, metaDataPath: string): void {
+  if (commandExists('cloud-localds')) {
+    const seed = spawnSync('cloud-localds', [seedImagePath, userDataPath, metaDataPath], { stdio: 'inherit' });
+    if (seed.status !== 0) {
+      throw new Error('Failed to create the cloud-init seed image with cloud-localds.');
+    }
+    return;
+  }
+  if (process.platform === 'darwin' && commandExists('hdiutil')) {
+    createCloudInitSeedViaHdiutil(seedImagePath, userDataPath, metaDataPath);
+    return;
+  }
+  throw new Error(
+    'Unable to create the cloud-init seed image. Install cloud-image-utils (cloud-localds) or set up a compatible ISO creation tool.',
+  );
+}
+
+function getBaseSshArgs(port: number, privateKeyPath: string): string[] {
+  return [
+    '-i',
+    privateKeyPath,
+    '-p',
+    String(port),
+    '-o',
+    'StrictHostKeyChecking=no',
+    '-o',
+    'UserKnownHostsFile=/dev/null',
+    '-o',
+    'LogLevel=ERROR',
+    '-o',
+    'ServerAliveInterval=30',
+    '-o',
+    'ServerAliveCountMax=4',
+  ];
+}
+
+function readVmPid(pidFilePath: string): number | undefined {
+  if (!existsSync(pidFilePath)) {
+    return undefined;
+  }
+  const raw = readFileSync(pidFilePath, 'utf8').trim();
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function isPidRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForPidExit(pid: number, timeoutMs: number): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (!isPidRunning(pid)) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+}
+
+function stopMicrovm(pidFilePath: string): void {
+  const pid = readVmPid(pidFilePath);
+  if (!pid) {
+    return;
+  }
+  if (!isPidRunning(pid)) {
+    return;
+  }
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch {
+    return;
+  }
+}
+
+async function waitForSshReady(port: number, privateKeyPath: string, timeoutMs: number): Promise<void> {
+  const started = Date.now();
+  const sshArgs = [
+    ...getBaseSshArgs(port, privateKeyPath),
+    `${MICROVM_GUEST_USER}@127.0.0.1`,
+    'true',
+  ];
+
+  while (Date.now() - started < timeoutMs) {
+    const probe = spawnSync('ssh', sshArgs, {
+      stdio: 'ignore',
+      timeout: 5_000,
+    });
+    if (probe.status === 0) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+
+  throw new Error(`Timed out waiting for the microVM to accept SSH on port ${port}.`);
+}
+
+async function findFreeTcpPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.on('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      if (!address || typeof address === 'string') {
+        server.close(() => reject(new Error('Unable to allocate an ephemeral TCP port for the microVM SSH tunnel.')));
+        return;
+      }
+      const port = address.port;
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(port);
+      });
+    });
+  });
+}
+
+function createQemuOverlay(baseImagePath: string, overlayImagePath: string): void {
+  const result = spawnSync(
+    'qemu-img',
+    ['create', '-f', 'qcow2', '-F', 'qcow2', '-b', baseImagePath, overlayImagePath, `${MICROVM_DISK_SIZE_GB}G`],
+    { stdio: 'inherit' },
+  );
+  if (result.status !== 0) {
+    throw new Error(`Failed to create microVM overlay image at ${overlayImagePath}.`);
+  }
+}
+
+function startQemuInstance(options: {
+  profile: MicrovmProfile;
+  imagePath: string;
+  sshPort: number;
+  pidFilePath: string;
+  serialLogPath: string;
+  seedImagePath?: string;
+  firmwarePath?: string;
+}): void {
+  const qemuArgs = options.profile.startArgs(options);
+  const result = spawnSync(options.profile.qemuBinary, qemuArgs, { stdio: 'inherit' });
+  if (result.status !== 0) {
+    throw new Error('Failed to start the microVM instance with QEMU.');
+  }
+}
+
+async function buildPreparedMicrovmImage(
+  profile: MicrovmProfile,
+  paths: ReturnType<typeof getMicrovmPaths>,
+): Promise<void> {
+  const bootstrapDir = mkdtempSync(path.join(os.tmpdir(), 'devcon-microvm-bootstrap-'));
+  const overlayImagePath = path.join(bootstrapDir, 'bootstrap-overlay.qcow2');
+  const userDataPath = path.join(bootstrapDir, 'user-data');
+  const metaDataPath = path.join(bootstrapDir, 'meta-data');
+  const seedImagePath = path.join(bootstrapDir, 'seed.img');
+  const pidFilePath = path.join(bootstrapDir, 'qemu.pid');
+  const serialLogPath = path.join(bootstrapDir, 'serial.log');
+
+  try {
+    ensureMicrovmSshKeyPair(paths.privateKeyPath, paths.publicKeyPath);
+    const firmwarePath = resolveMicrovmFirmwarePath(profile);
+    const publicKey = readFileSync(paths.publicKeyPath, 'utf8');
+    writeFileSync(userDataPath, renderMicrovmBootstrapUserData(publicKey), 'utf8');
+    writeFileSync(metaDataPath, renderMicrovmBootstrapMetaData(), 'utf8');
+    createQemuOverlay(paths.pristineImagePath, overlayImagePath);
+    createCloudInitSeedImage(seedImagePath, userDataPath, metaDataPath);
+
+    const sshPort = await findFreeTcpPort();
+    console.log('Preparing reusable microVM image. This can take several minutes on the first run.');
+    startQemuInstance({
+      profile,
+      imagePath: overlayImagePath,
+      sshPort,
+      pidFilePath,
+      serialLogPath,
+      seedImagePath,
+      firmwarePath,
+    });
+
+    try {
+      await waitForSshReady(sshPort, paths.privateKeyPath, MICROVM_BOOT_TIMEOUT_MS);
+      const markerArgs = [
+        ...getBaseSshArgs(sshPort, paths.privateKeyPath),
+        `${MICROVM_GUEST_USER}@127.0.0.1`,
+        'test',
+        '-f',
+        '/opt/devcon-microvm-ready',
+      ];
+      const started = Date.now();
+      while (Date.now() - started < MICROVM_PREPARE_TIMEOUT_MS) {
+        const check = spawnSync('ssh', markerArgs, { stdio: 'ignore', timeout: 10_000 });
+        if (check.status === 0) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+      }
+
+      const readyCheck = spawnSync('ssh', markerArgs, { stdio: 'ignore', timeout: 10_000 });
+      if (readyCheck.status !== 0) {
+        throw new Error(
+          `Timed out preparing the microVM image. Check ${serialLogPath} for guest bootstrap output.`,
+        );
+      }
+
+      spawnSync(
+        'ssh',
+        [...getBaseSshArgs(sshPort, paths.privateKeyPath), `${MICROVM_GUEST_USER}@127.0.0.1`, 'sudo', 'shutdown', '-h', 'now'],
+        { stdio: 'ignore', timeout: 15_000 },
+      );
+    } finally {
+      const pid = readVmPid(pidFilePath);
+      if (pid) {
+        await waitForPidExit(pid, 30_000).catch(() => undefined);
+      }
+    }
+
+    const convert = spawnSync('qemu-img', ['convert', '-O', 'qcow2', overlayImagePath, paths.preparedImagePath], {
+      stdio: 'inherit',
+    });
+    if (convert.status !== 0) {
+      throw new Error(`Failed to finalize the prepared microVM image at ${paths.preparedImagePath}.`);
+    }
+  } finally {
+    stopMicrovm(pidFilePath);
+    rmSync(bootstrapDir, { recursive: true, force: true });
+  }
+}
+
+async function ensurePreparedMicrovmImage(
+  profile: MicrovmProfile,
+  dryRun: boolean,
+): Promise<ReturnType<typeof getMicrovmPaths>> {
+  const paths = getMicrovmPaths(profile);
+  ensureDir(paths.rootDir);
+  ensureDir(paths.imagesDir);
+  ensureDir(paths.runsDir);
+  ensureDir(paths.sshDir);
+  await ensureMicrovmHostDependencies(profile, dryRun);
+  ensureMicrovmSshKeyPair(paths.privateKeyPath, paths.publicKeyPath);
+  await ensureMicrovmPristineImage(profile, paths.pristineImagePath, dryRun);
+
+  if (existsSync(paths.preparedImagePath) || dryRun) {
+    if (dryRun && !existsSync(paths.preparedImagePath)) {
+      console.log(`[dry-run] Would prepare reusable microVM image at ${paths.preparedImagePath}`);
+    }
+    return paths;
+  }
+
+  await buildPreparedMicrovmImage(profile, paths);
+  return paths;
+}
+
+function collectRelativeEntries(rootPath: string): Set<string> {
+  const entries = new Set<string>();
+  if (!existsSync(rootPath)) {
+    return entries;
+  }
+
+  const rootStat = lstatSync(rootPath);
+  if (!rootStat.isDirectory()) {
+    entries.add(path.basename(rootPath));
+    return entries;
+  }
+
+  const stack = [rootPath];
+  while (stack.length > 0) {
+    const current = stack.pop() as string;
+    const children = readdirSync(current, { withFileTypes: true });
+    for (const child of children) {
+      const absPath = path.join(current, child.name);
+      const relPath = toPosixPath(path.relative(rootPath, absPath));
+      entries.add(relPath);
+      if (child.isDirectory()) {
+        stack.push(absPath);
+      }
+    }
+  }
+  return entries;
+}
+
+function copyIntoStage(sourcePath: string, stagePath: string, excludedPaths: Set<string> = new Set()): void {
+  ensureDir(path.dirname(stagePath));
+  const sourceStat = lstatSync(sourcePath);
+  if (!sourceStat.isDirectory()) {
+    cpSync(sourcePath, stagePath, { dereference: false });
+    return;
+  }
+
+  cpSync(sourcePath, stagePath, {
+    recursive: true,
+    dereference: false,
+    filter: (current) => {
+      const normalized = path.resolve(current);
+      for (const excluded of excludedPaths) {
+        if (normalized === excluded || normalized.startsWith(`${excluded}${path.sep}`)) {
+          return false;
+        }
+      }
+      return true;
+    },
+  });
+}
+
+function resolveWritablePathExcludes(hostPath: string, homeDir: string): Set<string> {
+  const excludes = new Set<string>();
+  const normalizedHost = path.resolve(hostPath);
+  const codexRoot = path.resolve(path.join(homeDir, '.codex'));
+  if (normalizedHost === codexRoot) {
+    for (const entry of ['tmp', 'sessions', 'shell_snapshots', 'log']) {
+      const child = path.join(codexRoot, entry);
+      if (existsSync(child)) {
+        excludes.add(child);
+      }
+    }
+  }
+  return excludes;
+}
+
+function mapWritablePathToGuest(rawPath: string, hostHome: string): { hostPath: string; guestPath: string } {
+  const hostPath = resolveUserPath(rawPath, hostHome);
+  ensurePathWithinHome(hostPath, hostHome);
+  ensureWritablePath(hostPath);
+  const relative = path.relative(hostHome, hostPath);
+  const guestPath = relative
+    ? path.posix.join(MICROVM_GUEST_HOME, toPosixPath(relative))
+    : MICROVM_GUEST_HOME;
+  return { hostPath, guestPath };
+}
+
+function writeExecutable(targetPath: string, contents: string): void {
+  ensureDir(path.dirname(targetPath));
+  writeFileSync(targetPath, contents, { encoding: 'utf8', mode: 0o755 });
+}
+
+function buildMicrovmSshCommand(port: number, privateKeyPath: string, remoteCommand: string, tty = true): {
+  command: string;
+  args: string[];
+} {
+  const args = [
+    ...getBaseSshArgs(port, privateKeyPath),
+  ];
+  if (tty) {
+    args.push('-tt');
+  }
+  args.push(`${MICROVM_GUEST_USER}@127.0.0.1`, `/bin/bash -lc ${shellQuote(remoteCommand)}`);
+  return { command: 'ssh', args };
+}
+
+async function pipeTarToSsh(sourceRoot: string, port: number, privateKeyPath: string, remoteExtractDir: string): Promise<void> {
+  const tarCreate = process.platform === 'darwin'
+    ? `cd ${shellQuote(sourceRoot)} && find . -mindepth 1 -maxdepth 1 -print0 | COPYFILE_DISABLE=1 tar --null --no-mac-metadata --no-xattrs -cf - --files-from -`
+    : `cd ${shellQuote(sourceRoot)} && find . -mindepth 1 -maxdepth 1 -print0 | tar --null -cf - --files-from -`;
+  const importDir = '/tmp/devcon/import';
+  const promoteScript = [
+    `rm -rf ${shellQuote(importDir)}`,
+    `mkdir -p ${shellQuote(importDir)}`,
+    `tar --no-same-owner --no-same-permissions -m -C ${shellQuote(importDir)} -xf -`,
+    `if [ -d ${shellQuote(path.posix.join(importDir, 'workspace'))} ]; then mkdir -p ${shellQuote(path.posix.join(remoteExtractDir, 'workspace'))}; cp -a ${shellQuote(path.posix.join(importDir, 'workspace'))}/. ${shellQuote(path.posix.join(remoteExtractDir, 'workspace'))}/; fi`,
+    `if [ -d ${shellQuote(path.posix.join(importDir, 'home', MICROVM_GUEST_USER))} ]; then mkdir -p ${shellQuote(MICROVM_GUEST_HOME)}; cp -a ${shellQuote(path.posix.join(importDir, 'home', MICROVM_GUEST_USER))}/. ${shellQuote(MICROVM_GUEST_HOME)}/; fi`,
+    `if [ -d ${shellQuote(path.posix.join(importDir, 'tmp', 'devcon'))} ]; then mkdir -p /tmp/devcon; cp -a ${shellQuote(path.posix.join(importDir, 'tmp', 'devcon'))}/. /tmp/devcon/; fi`,
+    `rm -rf ${shellQuote(importDir)}`,
+  ].join(' && ');
+  const remoteExtract = `/bin/bash -lc ${shellQuote(promoteScript)}`;
+  const command = `${tarCreate} | ssh ${getBaseSshArgs(port, privateKeyPath).map(shellQuote).join(' ')} ${shellQuote(`${MICROVM_GUEST_USER}@127.0.0.1`)} ${shellQuote(remoteExtract)}`;
+  await runCommand('/bin/bash', ['-lc', command]);
+}
+
+async function pipeTarFromSsh(pathsToFetch: string[], destinationRoot: string, port: number, privateKeyPath: string): Promise<void> {
+  ensureDir(destinationRoot);
+  const quotedPaths = pathsToFetch.map((entry) => shellQuote(entry.replace(/^\/+/, ''))).join(' ');
+  const remoteCommand = `tar --ignore-failed-read -C / -cf - ${quotedPaths}`;
+  const command = `ssh ${getBaseSshArgs(port, privateKeyPath).map(shellQuote).join(' ')} ${shellQuote(`${MICROVM_GUEST_USER}@127.0.0.1`)} ${shellQuote(remoteCommand)} | tar -C ${shellQuote(destinationRoot)} -xf -`;
+  await runCommand('/bin/bash', ['-lc', command]);
+}
+
+function syncStageBackToHost(target: SyncPlanTarget): void {
+  const sourceExists = existsSync(target.stagePath);
+  const hostExists = existsSync(target.hostPath);
+  if (target.rootType === 'file') {
+    if (sourceExists) {
+      ensureDir(path.dirname(target.hostPath));
+      cpSync(target.stagePath, target.hostPath, { force: true, dereference: false });
+    } else if (hostExists) {
+      rmSync(target.hostPath, { force: true });
+    }
+    return;
+  }
+
+  if (sourceExists) {
+    ensureDir(path.dirname(target.hostPath));
+    cpSync(target.stagePath, target.hostPath, { recursive: true, force: true, dereference: false });
+  }
+
+  const rels = [...target.initialEntries].sort((a, b) => b.length - a.length);
+  for (const relPath of rels) {
+    const sourcePath = sourceExists ? path.join(target.stagePath, relPath) : '';
+    if (sourceExists && existsSync(sourcePath)) {
+      continue;
+    }
+    const hostPath = path.join(target.hostPath, relPath);
+    if (!existsSync(hostPath)) {
+      continue;
+    }
+    rmSync(hostPath, { recursive: true, force: true });
+  }
+
+  if (!sourceExists && hostExists && lstatSync(target.hostPath).isFile()) {
+    rmSync(target.hostPath, { force: true });
+  }
+}
+
+function buildMicrovmInitScript(options: {
+  toolName: string;
+  tool: ToolDefinition;
+  toolArgs: string[];
+  guestWorkspaceTarget: string;
+  allowGit: boolean;
+  tempGit: boolean;
+}): string {
+  const lines = [
+    'set -e',
+    `export HOME=${shellQuote(MICROVM_GUEST_HOME)}`,
+    `export DEVCON_WORKSPACE=${shellQuote(options.guestWorkspaceTarget)}`,
+    `export DEVCON_TOOL=${shellQuote(options.toolName)}`,
+  ];
+
+  for (const [key, value] of Object.entries(options.tool.env ?? {})) {
+    lines.push(`export ${key}=${shellQuote(value)}`);
+  }
+
+  if (options.tempGit) {
+    lines.push(
+      'export GIT_DIR=/tmp/devcon/gitdir',
+      `export GIT_WORK_TREE=${shellQuote(options.guestWorkspaceTarget)}`,
+      'if ! git rev-parse --verify HEAD >/dev/null 2>&1; then',
+      '  git add -A >/dev/null 2>&1 || true',
+      '  git commit -m "devcon baseline" >/dev/null 2>&1 || true',
+      'fi',
+    );
+  }
+
+  if (options.allowGit) {
+    lines.push('export GIT_CONFIG_GLOBAL=/tmp/devcon/gitconfig');
+  }
+
+  if (options.toolName === 'codex') {
+    lines.push(
+      'if command -v codex >/dev/null 2>&1; then',
+      `  codex mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`,
+      'fi',
+    );
+  } else if (options.toolName === 'claude') {
+    lines.push(
+      'if command -v claude >/dev/null 2>&1; then',
+      `  claude mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`,
+      'fi',
+    );
+  }
+
+  const toolCommand = options.tool.command ?? [];
+  const commandArgs = [...toolCommand, ...options.toolArgs];
+  const commandString = commandArgs.length > 0
+    ? commandArgs.map(shellQuote).join(' ')
+    : '/bin/bash';
+  lines.push(`cd ${shellQuote(options.guestWorkspaceTarget)}`);
+  lines.push(`exec ${commandString}`);
+
+  return `#!/bin/bash
+${lines.join('\n')}
+`;
+}
+
+async function buildMicrovmLaunchPlan(options: {
+  cwd: string;
+  toolName: string;
+  tool: ToolDefinition;
+  toolArgs: string[];
+  extraMounts: ExtraMount[];
+  shareHome: boolean;
+  allowGit: boolean;
+  tempGit: boolean;
+  forceIpv4: boolean;
+}): Promise<LaunchPlan> {
+  if (options.shareHome) {
+    throw new Error('The microVM backend does not support --home yet. Use writablePaths for the specific state you want to share.');
+  }
+  if (options.forceIpv4) {
+    console.warn('MicroVM backend note: --ipv4 is currently ignored; QEMU user-mode networking already uses a private NAT.');
+  }
+
+  const profile = resolveMicrovmProfile();
+  const paths = await ensurePreparedMicrovmImage(profile, false);
+  const runDir = mkdtempSync(path.join(paths.runsDir, 'run-'));
+  const cleanupTargets = [runDir];
+  const overlayImagePath = path.join(runDir, 'overlay.qcow2');
+  const pidFilePath = path.join(runDir, 'qemu.pid');
+  const serialLogPath = path.join(runDir, 'serial.log');
+  const stageRoot = path.join(runDir, 'stage');
+  const outputRoot = path.join(runDir, 'output');
+  const guestWorkspaceTarget = options.tool.workdir ?? resolveDefaultWorkspaceTarget(options.cwd);
+  const syncTargets: SyncPlanTarget[] = [];
+  let tempGitDir: string | undefined;
+
+  try {
+    const firmwarePath = resolveMicrovmFirmwarePath(profile);
+    createQemuOverlay(paths.preparedImagePath, overlayImagePath);
+    ensureDir(stageRoot);
+    ensureDir(outputRoot);
+
+    const resolvedExtraMounts = resolveExtraMountContainerPaths(options.extraMounts, guestWorkspaceTarget);
+    const scanTargets = [
+      { label: 'workspace', hostPath: options.cwd, guestPath: guestWorkspaceTarget },
+      ...resolvedExtraMounts.map((entry, index) => ({
+        label: `mount ${index + 1}`,
+        hostPath: entry.hostPath,
+        guestPath: entry.containerPath,
+      })),
+    ];
+
+    for (const target of scanTargets) {
+      console.log(`Staging ${target.label} for the microVM...`);
+      const sensitive = dedupeSensitivePaths(
+        discoverSensitivePaths(target.hostPath, target.guestPath, { allowGit: options.allowGit }),
+      );
+      const stagePath = path.join(stageRoot, target.guestPath.replace(/^\/+/, ''));
+      copyIntoStage(
+        target.hostPath,
+        stagePath,
+        new Set(sensitive.map((entry) => path.resolve(entry.hostPath))),
+      );
+      syncTargets.push({
+        label: target.label,
+        hostPath: target.hostPath,
+        guestPath: target.guestPath,
+        stagePath,
+        rootType: detectPathType(target.hostPath),
+        initialEntries: collectRelativeEntries(stagePath),
+      });
+    }
+
+    const homeDir = os.homedir();
+    for (const rawPath of options.tool.writablePaths ?? []) {
+      const mapped = mapWritablePathToGuest(rawPath, homeDir);
+      const stagePath = path.join(stageRoot, mapped.guestPath.replace(/^\/+/, ''));
+      copyIntoStage(mapped.hostPath, stagePath, resolveWritablePathExcludes(mapped.hostPath, homeDir));
+      syncTargets.push({
+        label: `writable path ${rawPath}`,
+        hostPath: mapped.hostPath,
+        guestPath: mapped.guestPath,
+        stagePath,
+        rootType: detectPathType(mapped.hostPath),
+        initialEntries: collectRelativeEntries(stagePath),
+      });
+    }
+
+    if (options.tempGit) {
+      const temp = prepareTempGitRepo(guestWorkspaceTarget);
+      tempGitDir = temp.hostDir;
+      cleanupTargets.push(temp.hostDir);
+      const stagePath = path.join(stageRoot, temp.containerDir.replace(/^\/+/, ''));
+      copyIntoStage(temp.hostDir, stagePath);
+      syncTargets.push({
+        label: 'temporary git repository',
+        hostPath: temp.hostDir,
+        guestPath: temp.containerDir,
+        stagePath,
+        rootType: 'dir',
+        initialEntries: collectRelativeEntries(stagePath),
+      });
+    }
+
+    if (options.allowGit) {
+      const gitConfigPath = path.join(stageRoot, 'tmp', 'devcon', 'gitconfig');
+      writeExecutable(gitConfigPath, '[user]\n\tname = devcon-bot\n\temail = devcon@example.com\n');
+    }
+
+    const initScriptPath = path.join(stageRoot, 'tmp', 'devcon', 'init.sh');
+    writeExecutable(initScriptPath, buildMicrovmInitScript({
+      toolName: options.toolName,
+      tool: options.tool,
+      toolArgs: options.toolArgs,
+      guestWorkspaceTarget,
+      allowGit: options.allowGit,
+      tempGit: options.tempGit,
+    }));
+
+    const sshPort = await findFreeTcpPort();
+    startQemuInstance({
+      profile,
+      imagePath: overlayImagePath,
+      sshPort,
+      pidFilePath,
+      serialLogPath,
+      firmwarePath,
+    });
+    await waitForSshReady(sshPort, paths.privateKeyPath, MICROVM_BOOT_TIMEOUT_MS);
+    await pipeTarToSsh(stageRoot, sshPort, paths.privateKeyPath, '/');
+
+    const launch = buildMicrovmSshCommand(
+      sshPort,
+      paths.privateKeyPath,
+      'source /tmp/devcon/init.sh',
+    );
+
+    return {
+      command: launch.command,
+      args: launch.args,
+      cleanupTargets,
+      tempGitDir,
+      finalize: async () => {
+        await pipeTarFromSsh(syncTargets.map((entry) => entry.guestPath), outputRoot, sshPort, paths.privateKeyPath);
+        for (const entry of syncTargets) {
+          const outputStagePath = path.join(outputRoot, entry.guestPath.replace(/^\/+/, ''));
+          syncStageBackToHost({
+            ...entry,
+            stagePath: outputStagePath,
+          });
+        }
+      },
+      cleanup: () => {
+        stopMicrovm(pidFilePath);
+        const pid = readVmPid(pidFilePath);
+        if (pid && isPidRunning(pid)) {
+          try {
+            process.kill(pid, 'SIGKILL');
+          } catch {
+            // Ignore secondary shutdown errors.
+          }
+        }
+        for (const target of cleanupTargets) {
+          try {
+            rmSync(target, { recursive: true, force: true });
+          } catch (error) {
+            console.warn('Failed to clean temporary artifact', target, error);
+          }
+        }
+      },
+    };
+  } catch (error) {
+    stopMicrovm(pidFilePath);
+    rmSync(runDir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function printMicrovmDryRunSummary(options: {
+  toolName: string;
+  tool: ToolDefinition;
+  cwd: string;
+  extraMounts: ExtraMount[];
+  toolArgs?: string[];
+}): void {
+  const profile = resolveMicrovmProfile();
+  const paths = getMicrovmPaths(profile);
+  const workspaceTarget = options.tool.workdir ?? resolveDefaultWorkspaceTarget(options.cwd);
+  console.log('[dry-run] Backend: microvm');
+  console.log(`[dry-run] Host profile: ${profile.hostPlatform}/${profile.hostArch} -> guest ${profile.guestArch}`);
+  console.log(`[dry-run] Workspace: ${options.cwd} -> ${workspaceTarget}`);
+  if (options.extraMounts.length > 0) {
+    for (const mount of options.extraMounts) {
+      console.log(`[dry-run] Extra mount: ${mount.hostPath} -> ${path.posix.join(WORKSPACE_ROOT, mount.mountName)}`);
+    }
+  }
+  console.log(`[dry-run] Prepared image cache: ${paths.preparedImagePath}`);
+  console.log(`[dry-run] Pristine image cache: ${paths.pristineImagePath}`);
+  if (profile.firmwareCandidates.length > 0) {
+    const firmwarePath = resolveMicrovmFirmwarePath(profile);
+    console.log(`[dry-run] Firmware: ${firmwarePath ?? `not found (set ${MICROVM_FIRMWARE_ENV})`}`);
+  }
+  const toolCommand = options.tool.command ?? [];
+  const commandArgs = [...toolCommand, ...(options.toolArgs ?? [])];
+  console.log(`[dry-run] Guest command: ${commandArgs.length > 0 ? commandArgs.join(' ') : '/bin/bash'}`);
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const options = parseArgs(argv);
@@ -3143,6 +4381,10 @@ async function main(): Promise<void> {
     throw new Error('--export-patch is not supported with --web mode.');
   }
 
+  if (options.backend === 'microvm' && options.webMode) {
+    throw new Error('The microVM backend does not support --web mode yet.');
+  }
+
   if (!options.toolName) {
     console.error('No tool specified.');
     printHelp(tools);
@@ -3151,6 +4393,9 @@ async function main(): Promise<void> {
   }
 
   if (options.toolName === 'update') {
+    if (options.backend === 'microvm') {
+      throw new Error('"devcon update" currently manages Docker images only. The microVM backend provisions itself automatically on first use.');
+    }
     if (options.webMode) {
       throw new Error('The --web flag cannot be used with "devcon update".');
     }
@@ -3163,6 +4408,9 @@ async function main(): Promise<void> {
   }
 
   if (options.toolName === 'rebuild') {
+    if (options.backend === 'microvm') {
+      throw new Error('"devcon rebuild" currently manages Docker images only. Remove --backend microvm for this command.');
+    }
     if (options.webMode) {
       throw new Error('The --web flag cannot be used with "devcon rebuild".');
     }
@@ -3216,49 +4464,85 @@ async function main(): Promise<void> {
   const tool = tools[options.toolName];
 
   if (options.toolName === 'run') {
-    ensureDockerAvailable();
-    const consciousRuntime = options.conscious
-      ? await prepareConsciousRuntime(cwd, options.toolArgs, options.consciousStatePath)
-      : undefined;
-    if (consciousRuntime) {
-      console.log(`Conscious mode enabled (state: ${consciousRuntime.stateDir})`);
-      console.log(`Conscious project: ${consciousRuntime.projectName} [${consciousRuntime.projectId}]`);
-      console.log(`Seed retrieval query: "${consciousRuntime.seedQuery}"`);
-      console.log(`MCP debug log: ${consciousRuntime.mcpLogHostPath}`);
-    }
-    const image = options.imageOverride ?? DEFAULT_IMAGE_TAG;
-    await ensureImageAvailable(image, image === DEFAULT_IMAGE_TAG ? DEFAULT_AUTO_BUILD : undefined);
-    const networkHost = await maybeEnableHostNetwork(image, options.networkHost, options.dryRun);
-    if (consciousRuntime) {
-      if (networkHost) {
-        throw new Error('Conscious sidecar mode is not compatible with --network-host.');
-      }
-      const sidecarImage = getConsciousSidecarImage();
-      await ensureImageAvailable(sidecarImage, sidecarImage === DEFAULT_IMAGE_TAG ? DEFAULT_AUTO_BUILD : undefined);
-      ensureConsciousSidecar(consciousRuntime, sidecarImage, options.dryRun);
-      console.log(`Conscious sidecar ready: ${consciousRuntime.sidecarContainerName} (${consciousRuntime.sidecarHost}:${consciousRuntime.sidecarPort})`);
-    }
-
     const toolDef: ToolDefinition = {
-      image,
+      image: DEFAULT_IMAGE_TAG,
       command: options.toolArgs.length === 0 ? ['/bin/bash'] : [],
       description: 'Interactive shell',
     };
 
-    const launch = buildDockerArgs({
-      cwd,
-      toolName: options.toolName,
-      tool: toolDef,
-      toolArgs: options.toolArgs,
-      extraMounts,
-      shareHome: options.shareHome,
-      image,
-      allowGit: options.allowGit,
-      tempGit: options.tempGit,
-      forceIpv4: options.forceIpv4,
-      networkHost,
-      conscious: consciousRuntime,
-    });
+    let launch: LaunchPlan;
+    let consciousRuntime: ConsciousRuntime | undefined;
+
+    if (options.backend === 'docker') {
+      ensureDockerAvailable();
+      consciousRuntime = options.conscious
+        ? await prepareConsciousRuntime(cwd, options.toolArgs, options.consciousStatePath)
+        : undefined;
+      if (consciousRuntime) {
+        console.log(`Conscious mode enabled (state: ${consciousRuntime.stateDir})`);
+        console.log(`Conscious project: ${consciousRuntime.projectName} [${consciousRuntime.projectId}]`);
+        console.log(`Seed retrieval query: "${consciousRuntime.seedQuery}"`);
+        console.log(`MCP debug log: ${consciousRuntime.mcpLogHostPath}`);
+      }
+      const image = options.imageOverride ?? DEFAULT_IMAGE_TAG;
+      await ensureImageAvailable(image, image === DEFAULT_IMAGE_TAG ? DEFAULT_AUTO_BUILD : undefined);
+      const networkHost = await maybeEnableHostNetwork(image, options.networkHost, options.dryRun);
+      if (consciousRuntime) {
+        if (networkHost) {
+          throw new Error('Conscious sidecar mode is not compatible with --network-host.');
+        }
+        const sidecarImage = getConsciousSidecarImage();
+        await ensureImageAvailable(sidecarImage, sidecarImage === DEFAULT_IMAGE_TAG ? DEFAULT_AUTO_BUILD : undefined);
+        ensureConsciousSidecar(consciousRuntime, sidecarImage, options.dryRun);
+        console.log(`Conscious sidecar ready: ${consciousRuntime.sidecarContainerName} (${consciousRuntime.sidecarHost}:${consciousRuntime.sidecarPort})`);
+      }
+
+      launch = buildDockerArgs({
+        cwd,
+        toolName: options.toolName,
+        tool: { ...toolDef, image },
+        toolArgs: options.toolArgs,
+        extraMounts,
+        shareHome: options.shareHome,
+        image,
+        allowGit: options.allowGit,
+        tempGit: options.tempGit,
+        forceIpv4: options.forceIpv4,
+        networkHost,
+        conscious: consciousRuntime,
+      });
+    } else {
+      if (options.conscious) {
+        throw new Error('The microVM backend does not support --conscious yet.');
+      }
+      if (options.imageOverride) {
+        throw new Error('The --image flag is only supported by the Docker backend.');
+      }
+      if (options.networkHost) {
+        throw new Error('The microVM backend does not support --network-host.');
+      }
+      if (options.dryRun) {
+        printMicrovmDryRunSummary({
+          toolName: options.toolName,
+          tool: toolDef,
+          cwd,
+          extraMounts,
+          toolArgs: options.toolArgs,
+        });
+        return;
+      }
+      launch = await buildMicrovmLaunchPlan({
+        cwd,
+        toolName: options.toolName,
+        tool: toolDef,
+        toolArgs: options.toolArgs,
+        extraMounts,
+        shareHome: options.shareHome,
+        allowGit: options.allowGit,
+        tempGit: options.tempGit,
+        forceIpv4: options.forceIpv4,
+      });
+    }
 
     if (options.webMode) {
       if (consciousRuntime) {
@@ -3283,17 +4567,23 @@ async function main(): Promise<void> {
     process.on('SIGTERM', terminate);
 
     child.on('exit', (code) => {
-      const captured = maybeCaptureConsciousLearning(consciousRuntime, cwd, code);
-      if (captured) {
-        console.log(`Conscious mode captured finding ${captured.id}`);
-      }
-      launch.cleanup();
-      process.exit(code ?? 1);
+      Promise.resolve(launch.finalize?.())
+        .catch((error) => {
+          console.warn('Launch finalization failed:', error instanceof Error ? error.message : error);
+        })
+        .finally(() => {
+          const captured = maybeCaptureConsciousLearning(consciousRuntime, cwd, code);
+          if (captured) {
+            console.log(`Conscious mode captured finding ${captured.id}`);
+          }
+          launch.cleanup();
+          process.exit(code ?? 1);
+        });
     });
 
     child.on('error', (error) => {
       launch.cleanup();
-      console.error('Failed to start docker:', error instanceof Error ? error.message : error);
+      console.error('Failed to start launch process:', error instanceof Error ? error.message : error);
       process.exit(1);
     });
     return;
@@ -3306,47 +4596,83 @@ async function main(): Promise<void> {
     return;
   }
 
-  ensureDockerAvailable();
+  let consciousRuntime: ConsciousRuntime | undefined;
+  let launch: LaunchPlan;
 
-  const consciousRuntime = options.conscious
-    ? await prepareConsciousRuntime(cwd, options.toolArgs, options.consciousStatePath)
-    : undefined;
-  if (consciousRuntime) {
-    console.log(`Conscious mode enabled (state: ${consciousRuntime.stateDir})`);
-    console.log(`Conscious project: ${consciousRuntime.projectName} [${consciousRuntime.projectId}]`);
-    console.log(`Seed retrieval query: "${consciousRuntime.seedQuery}"`);
-    console.log(`MCP debug log: ${consciousRuntime.mcpLogHostPath}`);
-  }
-
-  console.log(`Preparing to launch tool "${options.toolName}" using image "${tool.image}"...`);
-
-  const image = options.imageOverride ?? tool.image;
-  await ensureImageAvailable(image, options.imageOverride ? undefined : tool.autoBuild);
-  const networkHost = await maybeEnableHostNetwork(image, options.networkHost, options.dryRun);
-  if (consciousRuntime) {
-    if (networkHost) {
-      throw new Error('Conscious sidecar mode is not compatible with --network-host.');
+  if (options.backend === 'docker') {
+    ensureDockerAvailable();
+    consciousRuntime = options.conscious
+      ? await prepareConsciousRuntime(cwd, options.toolArgs, options.consciousStatePath)
+      : undefined;
+    if (consciousRuntime) {
+      console.log(`Conscious mode enabled (state: ${consciousRuntime.stateDir})`);
+      console.log(`Conscious project: ${consciousRuntime.projectName} [${consciousRuntime.projectId}]`);
+      console.log(`Seed retrieval query: "${consciousRuntime.seedQuery}"`);
+      console.log(`MCP debug log: ${consciousRuntime.mcpLogHostPath}`);
     }
-    const sidecarImage = getConsciousSidecarImage();
-    await ensureImageAvailable(sidecarImage, sidecarImage === DEFAULT_IMAGE_TAG ? DEFAULT_AUTO_BUILD : undefined);
-    ensureConsciousSidecar(consciousRuntime, sidecarImage, options.dryRun);
-    console.log(`Conscious sidecar ready: ${consciousRuntime.sidecarContainerName} (${consciousRuntime.sidecarHost}:${consciousRuntime.sidecarPort})`);
-  }
 
-  const launch = buildDockerArgs({
-    cwd,
-    toolName: options.toolName,
-    tool,
-    toolArgs: options.toolArgs,
-    extraMounts,
-    shareHome: options.shareHome && tool.shareHome !== false,
-    image,
-    allowGit: options.allowGit,
-    tempGit: options.tempGit,
-    forceIpv4: options.forceIpv4,
-    networkHost,
-    conscious: consciousRuntime,
-  });
+    console.log(`Preparing to launch tool "${options.toolName}" using image "${tool.image}"...`);
+
+    const image = options.imageOverride ?? tool.image;
+    await ensureImageAvailable(image, options.imageOverride ? undefined : tool.autoBuild);
+    const networkHost = await maybeEnableHostNetwork(image, options.networkHost, options.dryRun);
+    if (consciousRuntime) {
+      if (networkHost) {
+        throw new Error('Conscious sidecar mode is not compatible with --network-host.');
+      }
+      const sidecarImage = getConsciousSidecarImage();
+      await ensureImageAvailable(sidecarImage, sidecarImage === DEFAULT_IMAGE_TAG ? DEFAULT_AUTO_BUILD : undefined);
+      ensureConsciousSidecar(consciousRuntime, sidecarImage, options.dryRun);
+      console.log(`Conscious sidecar ready: ${consciousRuntime.sidecarContainerName} (${consciousRuntime.sidecarHost}:${consciousRuntime.sidecarPort})`);
+    }
+
+    launch = buildDockerArgs({
+      cwd,
+      toolName: options.toolName,
+      tool,
+      toolArgs: options.toolArgs,
+      extraMounts,
+      shareHome: options.shareHome && tool.shareHome !== false,
+      image,
+      allowGit: options.allowGit,
+      tempGit: options.tempGit,
+      forceIpv4: options.forceIpv4,
+      networkHost,
+      conscious: consciousRuntime,
+    });
+  } else {
+    if (options.conscious) {
+      throw new Error('The microVM backend does not support --conscious yet.');
+    }
+    if (options.imageOverride) {
+      throw new Error('The --image flag is only supported by the Docker backend.');
+    }
+    if (options.networkHost) {
+      throw new Error('The microVM backend does not support --network-host.');
+    }
+    if (options.dryRun) {
+      printMicrovmDryRunSummary({
+        toolName: options.toolName,
+        tool,
+        cwd,
+        extraMounts,
+        toolArgs: options.toolArgs,
+      });
+      return;
+    }
+    console.log(`Preparing to launch tool "${options.toolName}" using the microVM backend...`);
+    launch = await buildMicrovmLaunchPlan({
+      cwd,
+      toolName: options.toolName,
+      tool,
+      toolArgs: options.toolArgs,
+      extraMounts,
+      shareHome: options.shareHome && tool.shareHome !== false,
+      allowGit: options.allowGit,
+      tempGit: options.tempGit,
+      forceIpv4: options.forceIpv4,
+    });
+  }
 
   if (options.webMode) {
     if (options.tempGit) {
@@ -3374,24 +4700,30 @@ async function main(): Promise<void> {
   process.on('SIGTERM', terminate);
 
   child.on('exit', (code) => {
-    if (options.tempGit && launch.tempGitDir && options.exportPatchPath !== undefined) {
-      try {
-        exportTempGitPatch(launch.tempGitDir, cwd, options.exportPatchPath || undefined);
-      } catch (error) {
-        console.warn('Failed to export patch from temp git repo:', error instanceof Error ? error.message : error);
-      }
-    }
-    const captured = maybeCaptureConsciousLearning(consciousRuntime, cwd, code);
-    if (captured) {
-      console.log(`Conscious mode captured finding ${captured.id}`);
-    }
-    launch.cleanup();
-    process.exit(code ?? 1);
+    Promise.resolve(launch.finalize?.())
+      .catch((error) => {
+        console.warn('Launch finalization failed:', error instanceof Error ? error.message : error);
+      })
+      .finally(() => {
+        if (options.tempGit && launch.tempGitDir && options.exportPatchPath !== undefined) {
+          try {
+            exportTempGitPatch(launch.tempGitDir, cwd, options.exportPatchPath || undefined);
+          } catch (error) {
+            console.warn('Failed to export patch from temp git repo:', error instanceof Error ? error.message : error);
+          }
+        }
+        const captured = maybeCaptureConsciousLearning(consciousRuntime, cwd, code);
+        if (captured) {
+          console.log(`Conscious mode captured finding ${captured.id}`);
+        }
+        launch.cleanup();
+        process.exit(code ?? 1);
+      });
   });
 
   child.on('error', (error) => {
     launch.cleanup();
-    console.error('Failed to start docker:', error instanceof Error ? error.message : error);
+    console.error('Failed to start launch process:', error instanceof Error ? error.message : error);
     process.exit(1);
   });
 }

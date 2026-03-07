@@ -1,10 +1,11 @@
 # devcon
 
-`devcon` is a Linux-only CLI that launches AI coding agents like Codex CLI or Claude Code in fresh Docker containers that already have your working directory wired up. Install globally (`npm install -g devcon`) and run `devcon codex` (or `devcon claude`) from any project to get a locked-down shell within seconds. If no image is configured, Devcon defaults to a local `devcon:latest` image that bundles both Codex CLI and Claude Code; the first time you run a tool the CLI offers to build this image for you.
+`devcon` launches AI coding agents like Codex CLI or Claude Code in fresh Docker containers or lightweight microVMs with your working directory wired up. Install globally (`npm install -g devcon`) and run `devcon codex` (or `devcon claude`) from any project to get a locked-down shell within seconds. If no image is configured, Devcon defaults to a local `devcon:latest` image that bundles both Codex CLI and Claude Code; the first time you run a Docker-backed tool the CLI offers to build this image for you.
 
 ## What it does
 
 - Spin up a disposable Docker container per invocation.
+- Optionally boot a disposable QEMU-backed microVM per invocation (`--backend microvm`) with root inside the guest and copy-in/copy-out workspace sync.
 - Bind-mount the current working directory at `/workspace/<current-folder-name>` and run as your host UID/GID so file permissions stay intact.
 - Optionally bind-mount extra host directories for a single run via `--mount PATH` (repeatable), mounted under `/workspace/<folder-name>` in the container.
 - Keep the host home directory private by default. Opt in with `--home` or `DEVCON_SHARE_HOME=1`, or whitelist individual directories via `writablePaths` so credentials like `~/.codex` can still be shared.
@@ -15,7 +16,7 @@
 
 ## Installation
 
-You need Docker installed and running. Only Linux hosts are supported for now because the CLI relies on Unix-specific APIs such as `getuid`/`getgid`.
+You need Docker installed and running for the default Docker backend. The microVM backend (`--backend microvm`) supports Linux `x86_64`, Linux `arm64`, and macOS Apple Silicon hosts.
 
 If you're working from a clone (like this repo), build and install the CLI locally:
 
@@ -44,6 +45,7 @@ devcon skip-scan remove .cache
 devcon --mount ../shared codex # add one extra host directory for this run only
 devcon run --with-git -- ls    # open an interactive shell (default image) and run a command
 devcon --conscious codex       # enable persistent archive memory for this run
+devcon --backend microvm codex # boot the same tool inside a lightweight VM
 ```
 
 Examples:
@@ -66,6 +68,9 @@ devcon --network-host codex
 
 # Override the docker image just for this run
 devcon codex --image ghcr.io/my/codex:latest -- --trace
+
+# Use a lightweight VM instead of Docker
+devcon --backend microvm codex
 
 # Temporarily share the entire home directory (default is no home mount)
 devcon codex --home
@@ -102,7 +107,8 @@ Security note: do not expose the web terminal directly to the public internet wi
 
 Useful flags (place before `--` that separates devcon flags from tool args):
 
-- `--dry-run` – Print the assembled `docker run` invocation instead of executing it.
+- `--dry-run` – Print the assembled launch plan instead of executing it.
+- `--backend=NAME` – Choose the runtime backend: `docker` (default) or `microvm`.
 - `--home` / `--no-home` – Force-enable or force-disable home-directory sharing for this run.
 - `--image=NAME` – Override the docker image configured for the tool.
 - `--with-git` – Unmask `.git` and inject a sandboxed git identity (`devcon-bot <devcon@example.com>`) inside the container.
@@ -128,6 +134,24 @@ Pass tool arguments after `--` so they are not parsed by devcon. Examples:
 devcon codex --with-git -- git status
 devcon codex -- --dry-run "my prompt"
 ```
+
+## MicroVM backend (`--backend microvm`)
+
+`devcon --backend microvm <tool>` runs the tool inside a disposable QEMU VM instead of Docker. The guest is provisioned automatically on first use:
+
+- Host dependencies are checked up front. On Debian/Ubuntu hosts, devcon can install missing packages such as `qemu-system-x86`, `qemu-system-arm`, `qemu-utils`, `cloud-image-utils`, and `openssh-client` for you. On macOS Apple Silicon, devcon can use Homebrew to install `qemu` automatically when available.
+- Devcon downloads an Ubuntu cloud image into `~/.cache/devcon/microvm` (or `XDG_CACHE_HOME`, or `/tmp/devcon-<uid>/microvm` as a fallback).
+- On first boot, devcon prepares a reusable guest image and installs `git`, `ripgrep`, `nodejs`, `npm`, `@openai/codex`, and `@anthropic-ai/claude-code` automatically.
+- For each run, the workspace and extra mounts are copied into the guest, sensitive paths are excluded using the same masking rules, and changes are copied back after the session exits.
+
+Current limitations:
+
+- `--web` is not supported with the microVM backend yet.
+- `--conscious` is not supported with the microVM backend yet.
+- `--network-host` is Docker-only.
+- `--image` is Docker-only.
+- `--home` is not supported yet; use per-tool `writablePaths` instead.
+- AArch64 guests require UEFI firmware. Devcon searches common Linux and Homebrew QEMU firmware paths automatically; set `DEVCON_MICROVM_FIRMWARE` if yours lives elsewhere.
 
 ## Conscious mode (`--conscious`)
 
