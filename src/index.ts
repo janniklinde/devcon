@@ -62,6 +62,7 @@ interface CliOptions {
   webPort?: number;
   webPassword?: string;
   webSessionName?: string;
+  webNoServer: boolean;
 }
 
 interface AutoBuildConfig {
@@ -81,6 +82,13 @@ interface DockerLaunchPlan {
   cleanup: () => void;
   cleanupTargets: string[];
   tempGitDir?: string;
+}
+
+interface WebhubOptions {
+  host: string;
+  port: number;
+  password?: string;
+  allowDirs: string[];
 }
 
 const CONFIG_PATH = process.env.DEVCON_TOOLS_FILE
@@ -113,6 +121,7 @@ const NETWORK_CHECK_HOST = 'api.openai.com';
 const NETWORK_PROBE_TIMEOUT_MS = parsePositiveIntEnv(process.env.DEVCON_NETWORK_PROBE_TIMEOUT_MS, 2500);
 const WEB_DEFAULT_HOST = '0.0.0.0';
 const WEB_DEFAULT_PORT = 7682;
+const WEBHUB_DEFAULT_PORT = 7690;
 const DEFAULT_AUTO_BUILD: AutoBuildConfig = {
   dockerfile: DEFAULT_IMAGE_DOCKERFILE,
   tag: DEFAULT_IMAGE_TAG,
@@ -388,6 +397,7 @@ function parseArgs(argv: string[]): CliOptions {
   let webPort: number | undefined;
   let webPassword: string | undefined;
   let webSessionName: string | undefined;
+  let webNoServer = false;
   let forward = false;
   let helpRequested = false;
 
@@ -416,6 +426,12 @@ function parseArgs(argv: string[]): CliOptions {
 
     if (arg === '--web') {
       webMode = true;
+      continue;
+    }
+
+    if (arg === '--web-no-server') {
+      webMode = true;
+      webNoServer = true;
       continue;
     }
 
@@ -629,6 +645,7 @@ function parseArgs(argv: string[]): CliOptions {
     webPort,
     webPassword,
     webSessionName,
+    webNoServer,
   };
 }
 
@@ -2549,22 +2566,25 @@ async function launchWebModeSession(
 ): Promise<void> {
   ensureTmuxAvailable();
   const sessionName = resolveWebSessionName(options);
-  const host = resolveWebHost(options);
-  const port = resolveWebPort(options);
-  const passwordInfo = resolveWebPassword(options);
 
   if (options.dryRun) {
     console.log(`[dry-run] Web mode session: ${sessionName}`);
     console.log(`[dry-run] Docker command: ${buildShellCommand(launch.command, launch.args)}`);
-    console.log(`[dry-run] Web server: HOST=${host} PORT=${port} TMUX_TARGET=${sessionName}`);
-    if (passwordInfo.generated) {
-      console.log('[dry-run] A one-time random web password would be generated at runtime.');
+    if (options.webNoServer) {
+      console.log('[dry-run] Web server disabled (--web-no-server).');
+    } else {
+      const host = resolveWebHost(options);
+      const port = resolveWebPort(options);
+      const passwordInfo = resolveWebPassword(options);
+      console.log(`[dry-run] Web server: HOST=${host} PORT=${port} TMUX_TARGET=${sessionName}`);
+      if (passwordInfo.generated) {
+        console.log('[dry-run] A one-time random web password would be generated at runtime.');
+      }
     }
     launch.cleanup();
     return;
   }
 
-  const webServerScript = resolveWebServerScriptPath();
   let launcherScriptPath = '';
   let launcherDir = '';
   try {
@@ -2579,6 +2599,18 @@ async function launchWebModeSession(
     }
     throw error;
   }
+
+  if (options.webNoServer) {
+    console.log(`Web mode session ready for tool "${options.toolName}".`);
+    console.log(`tmux session: ${sessionName}`);
+    console.log('Web server disabled (--web-no-server).');
+    return;
+  }
+
+  const host = resolveWebHost(options);
+  const port = resolveWebPort(options);
+  const passwordInfo = resolveWebPassword(options);
+  const webServerScript = resolveWebServerScriptPath();
 
   console.log(`Web mode enabled for tool "${options.toolName}".`);
   console.log(`tmux session: ${sessionName}`);
@@ -2648,6 +2680,265 @@ async function launchWebModeSession(
         return;
       }
       reject(new Error(`Web server exited with code ${code}`));
+    });
+  });
+}
+
+function resolveWebhubServerScriptPath(): string {
+  const scriptPath = path.resolve(__dirname, '..', 'web', 'hub-server.js');
+  if (!existsSync(scriptPath)) {
+    throw new Error(
+      `Webhub server script not found at ${scriptPath}. Ensure the package includes the "web/" directory.`,
+    );
+  }
+  return scriptPath;
+}
+
+function resolveWebhubAllowListInput(input: string, cwd: string): string[] {
+  if (!input || input.trim().length === 0) {
+    return [];
+  }
+  return input
+    .split(path.delimiter)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+    .map((entry) => path.resolve(cwd, entry));
+}
+
+function parseWebhubArgs(args: string[], cwd: string): WebhubOptions {
+  const allowSet = new Set<string>();
+  let host = process.env.DEVCON_WEBHUB_HOST ?? WEB_DEFAULT_HOST;
+  let port = parsePositiveIntEnv(process.env.DEVCON_WEBHUB_PORT, WEBHUB_DEFAULT_PORT);
+  let password = process.env.DEVCON_WEBHUB_PASSWORD;
+
+  const envAllow = resolveWebhubAllowListInput(process.env.DEVCON_WEBHUB_ALLOWLIST ?? '', cwd);
+  for (const entry of envAllow) {
+    allowSet.add(entry);
+  }
+
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+
+    if (arg === '--allow') {
+      const next = args[i + 1];
+      if (!next) {
+        throw new Error('--allow requires a path, e.g. devcon webhub --allow ~/work/project-a');
+      }
+      allowSet.add(path.resolve(cwd, next));
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--allow=')) {
+      const value = arg.slice('--allow='.length);
+      if (!value) {
+        throw new Error('--allow requires a path, e.g. devcon webhub --allow ~/work/project-a');
+      }
+      allowSet.add(path.resolve(cwd, value));
+      continue;
+    }
+
+    if (arg === '--host') {
+      const next = args[i + 1];
+      if (!next) {
+        throw new Error('--host requires a value, e.g. devcon webhub --host 0.0.0.0');
+      }
+      host = next;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--host=')) {
+      host = arg.slice('--host='.length);
+      continue;
+    }
+
+    if (arg === '--port') {
+      const next = args[i + 1];
+      if (!next) {
+        throw new Error('--port requires a value, e.g. devcon webhub --port 7690');
+      }
+      const parsed = Number.parseInt(next, 10);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        throw new Error('--port must be a positive integer.');
+      }
+      port = parsed;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--port=')) {
+      const value = arg.slice('--port='.length);
+      const parsed = Number.parseInt(value, 10);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        throw new Error('--port must be a positive integer.');
+      }
+      port = parsed;
+      continue;
+    }
+
+    if (arg === '--password') {
+      const next = args[i + 1];
+      if (!next) {
+        throw new Error('--password requires a value.');
+      }
+      password = next;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--password=')) {
+      password = arg.slice('--password='.length);
+      continue;
+    }
+
+    if (arg === '--help' || arg === '-h') {
+      throw new Error(
+        [
+          'Usage: devcon webhub --allow <path> [--allow <path> ...] [--host 0.0.0.0] [--port 7690] [--password <pass>]',
+          'Examples:',
+          '  devcon webhub --allow ~/work/project-a --allow ~/work/project-b',
+          '  devcon webhub --allow /workspace --host 0.0.0.0 --port 7690 --password strong-pass',
+          'Env:',
+          '  DEVCON_WEBHUB_ALLOWLIST=/path/a:/path/b',
+          '  DEVCON_WEBHUB_HOST=0.0.0.0',
+          '  DEVCON_WEBHUB_PORT=7690',
+          '  DEVCON_WEBHUB_PASSWORD=strong-pass',
+        ].join('\n'),
+      );
+    }
+
+    throw new Error(`Unknown webhub argument "${arg}". Use "devcon webhub --help" for usage.`);
+  }
+
+  const allowDirs = [...allowSet];
+  if (allowDirs.length === 0) {
+    throw new Error(
+      'No webhub allowlist configured. Use --allow PATH (repeatable) or DEVCON_WEBHUB_ALLOWLIST.',
+    );
+  }
+
+  const validated: string[] = [];
+  for (const dir of allowDirs) {
+    if (!existsSync(dir)) {
+      throw new Error(`Webhub allowlist path does not exist: ${dir}`);
+    }
+    if (!statSync(dir).isDirectory()) {
+      throw new Error(`Webhub allowlist path must be a directory: ${dir}`);
+    }
+    validated.push(path.resolve(dir));
+  }
+
+  const trimmedHost = host.trim();
+  if (!trimmedHost) {
+    throw new Error('--host must not be empty.');
+  }
+
+  return {
+    host: trimmedHost,
+    port,
+    password: password && password.length > 0 ? password : undefined,
+    allowDirs: Array.from(new Set(validated)),
+  };
+}
+
+function resolveWebhubDevconCommand(): string[] {
+  const compiledEntry = path.resolve(__dirname, 'index.js');
+  if (existsSync(compiledEntry)) {
+    return [process.execPath, compiledEntry];
+  }
+  return ['devcon'];
+}
+
+async function handleWebhubCommand(
+  commandArgs: string[],
+  cwd: string,
+  dryRun: boolean,
+  toolNames: string[],
+): Promise<void> {
+  ensureTmuxAvailable();
+  const options = parseWebhubArgs(commandArgs, cwd);
+  const hubServerScript = resolveWebhubServerScriptPath();
+  const devconCommand = resolveWebhubDevconCommand();
+  const launchableTools = Array.from(new Set([...toolNames, 'run']));
+  const password = options.password ?? randomBytes(9).toString('base64url');
+  const generatedPassword = !options.password;
+
+  if (dryRun) {
+    console.log(`[dry-run] Starting webhub on http://${formatHostForUrl(options.host)}:${options.port}`);
+    console.log(`[dry-run] Allowlist:`);
+    for (const dir of options.allowDirs) {
+      console.log(`  ${dir}`);
+    }
+    console.log(`[dry-run] Devcon launcher command: ${buildShellCommand(devconCommand[0], devconCommand.slice(1))}`);
+    if (generatedPassword) {
+      console.log('[dry-run] A one-time random webhub password would be generated at runtime.');
+    }
+    return;
+  }
+
+  console.log('Devcon webhub starting...');
+  console.log(`Webhub bind URL: http://${formatHostForUrl(options.host)}:${options.port}`);
+  if (options.host === '0.0.0.0' || options.host === '::') {
+    const localIps = getLocalNetworkIpv4Addresses();
+    if (localIps.length > 0) {
+      console.log('Local network URLs:');
+      for (const ip of localIps) {
+        console.log(`  http://${ip}:${options.port}`);
+      }
+    }
+  }
+  if (generatedPassword) {
+    console.log(`Webhub password (generated): ${password}`);
+  } else {
+    console.log('Webhub password: using provided value.');
+  }
+  console.log('Whitelisted directories:');
+  for (const dir of options.allowDirs) {
+    console.log(`  ${dir}`);
+  }
+
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    WEBHUB_HOST: options.host,
+    WEBHUB_PORT: String(options.port),
+    WEBHUB_PASSWORD: password,
+    WEBHUB_ALLOWLIST_JSON: JSON.stringify(options.allowDirs),
+    WEBHUB_DEVCON_CMD_JSON: JSON.stringify(devconCommand),
+    WEBHUB_TOOLS_JSON: JSON.stringify(launchableTools),
+  };
+
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(process.execPath, [hubServerScript], {
+      stdio: 'inherit',
+      env,
+    });
+    let interrupted = false;
+
+    const terminate = (): void => {
+      interrupted = true;
+      child.kill('SIGINT');
+    };
+    process.on('SIGINT', terminate);
+    process.on('SIGTERM', terminate);
+
+    const clearHandlers = (): void => {
+      process.off('SIGINT', terminate);
+      process.off('SIGTERM', terminate);
+    };
+
+    child.on('error', (error) => {
+      clearHandlers();
+      reject(error);
+    });
+
+    child.on('exit', (code) => {
+      clearHandlers();
+      if (interrupted || code === 0 || code === null) {
+        resolve();
+        return;
+      }
+      reject(new Error(`Webhub exited with code ${code}`));
     });
   });
 }
@@ -2838,6 +3129,7 @@ function printHelp(tools: ToolMap): void {
   console.log('  devcon sensitive <list|add|remove> [pattern]');
   console.log('  devcon skip-scan <list|add|remove> [dir]\n');
   console.log('  devcon conscious <list|inspect|tree|wipe-project|wipe-all> [options]\n');
+  console.log('  devcon webhub --allow <path> [--allow <path> ...] [--host 0.0.0.0] [--port 7690] [--password <pass>]\n');
   console.log('Flags:');
   console.log('  --dry-run     Print the docker command without executing it');
   console.log('  --home        Share your host home directory with the container (disabled by default)');
@@ -2863,6 +3155,7 @@ function printHelp(tools: ToolMap): void {
   console.log('  sensitive     List/add/remove sensitive-path patterns that get masked in containers');
   console.log('  skip-scan     List/add/remove directory names skipped during sensitive-pattern scanning');
   console.log('  conscious     Inspect or wipe conscious memory storage (project or global scope)');
+  console.log('  webhub        Start a browser hub that can launch/manage --web sessions in whitelisted directories');
   console.log('  run           Launch an interactive container shell (default image)');
   console.log('\nTools:');
   for (const [name, tool] of Object.entries(tools)) {
@@ -3209,6 +3502,21 @@ async function main(): Promise<void> {
     }
     assertNoExtraMounts(options.mountPaths, 'conscious');
     await handleConsciousCommand(options.toolArgs, cwd, options.consciousStatePath);
+    return;
+  }
+
+  if (options.toolName === 'webhub') {
+    if (options.imageOverride) {
+      throw new Error('The --image flag cannot be used with "devcon webhub".');
+    }
+    if (options.allowGit || options.tempGit || options.forceIpv4 || options.networkHost || options.conscious) {
+      throw new Error('Container runtime flags are not supported with "devcon webhub".');
+    }
+    if (options.webMode) {
+      throw new Error('Do not combine --web with "devcon webhub". Use webhub command arguments instead.');
+    }
+    assertNoExtraMounts(options.mountPaths, 'webhub');
+    await handleWebhubCommand(options.toolArgs, cwd, options.dryRun, Object.keys(tools));
     return;
   }
 

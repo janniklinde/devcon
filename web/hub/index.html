@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Devcon Webhub</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <header class="topbar">
+        <div class="brand">
+          <span class="dot"></span>
+          <h1>Devcon Webhub</h1>
+        </div>
+        <p id="status" class="status">Connecting...</p>
+      </header>
+
+      <section id="auth-card" class="card hidden">
+        <h2>Unlock Webhub</h2>
+        <div class="row">
+          <input
+            id="password-input"
+            type="password"
+            placeholder="Password"
+            autocomplete="current-password"
+          />
+          <button id="login-btn">Unlock</button>
+        </div>
+      </section>
+
+      <section id="hub" class="hub hidden">
+        <div class="panel card">
+          <h2>New Session</h2>
+          <div class="grid">
+            <label>
+              Directory
+              <select id="dir-select"></select>
+            </label>
+            <label>
+              Tool
+              <select id="tool-select"></select>
+            </label>
+            <label class="full">
+              Tool Args
+              <input id="args-input" type="text" placeholder="Optional args (e.g. --profile fast)" />
+            </label>
+          </div>
+          <div class="actions">
+            <button id="create-btn">Start Session</button>
+          </div>
+        </div>
+
+        <div class="panel card">
+          <h2>Sessions</h2>
+          <div id="sessions-list" class="sessions-list"></div>
+        </div>
+
+        <div class="panel card">
+          <h2 id="terminal-title">Terminal</h2>
+          <div id="terminal" class="terminal" tabindex="0">
+            <pre id="screen"></pre>
+          </div>
+          <div class="command-row">
+            <input
+              id="line-input"
+              type="text"
+              placeholder="Type command and press Send"
+              spellcheck="false"
+              autocomplete="off"
+            />
+            <button id="send-btn">Send</button>
+            <button id="enter-btn">Enter</button>
+          </div>
+          <div class="keys" id="keys">
+            <button data-key="C-c">Ctrl+C</button>
+            <button data-key="Escape">Esc</button>
+            <button data-key="Tab">Tab</button>
+            <button data-key="ArrowUp">Up</button>
+            <button data-key="ArrowDown">Down</button>
+            <button data-key="ArrowLeft">Left</button>
+            <button data-key="ArrowRight">Right</button>
+            <button data-key="Backspace">Backspace</button>
+            <button id="ctrl-btn" class="toggle">Ctrl</button>
+            <button id="paste-btn">Paste</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
+

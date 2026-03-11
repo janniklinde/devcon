@@ -35,6 +35,7 @@ devcon update
 devcon update codex
 devcon rebuild         # full no-cache rebuild for all auto-build tools
 devcon rebuild codex   # full no-cache rebuild of a single tool/image
+devcon webhub --allow ~/work/project-a --allow ~/work/project-b
 devcon sensitive list          # show effective sensitive patterns and matches
 devcon sensitive add secrets/** # add a custom sensitive pattern
 devcon sensitive remove secrets/**
@@ -99,6 +100,35 @@ Notes:
 Manual mode is still available via `npm run web` if you want to attach the web UI to an existing tmux session (`TMUX_TARGET=...`).
 
 Security note: do not expose the web terminal directly to the public internet without TLS and upstream access control.
+
+## Webhub (multi-session launcher)
+
+`webhub` gives you a single browser UI that can launch and manage multiple tmux-backed devcon web sessions, each in a whitelisted directory.
+
+Launch:
+
+```bash
+devcon webhub --allow ~/work/project-a --allow ~/work/project-b
+```
+
+Optional host/port/password:
+
+```bash
+devcon webhub --allow /workspace --host 0.0.0.0 --port 7690 --password 'strong-password'
+```
+
+Behavior:
+
+- Webhub only allows launching sessions inside directories passed with `--allow` (repeatable).
+- It launches sessions via internal `devcon --web --web-no-server ...` and streams tmux output directly.
+- When webhub exits (`Ctrl+C`), it stops hub-managed tmux sessions.
+
+Environment alternatives:
+
+- `DEVCON_WEBHUB_ALLOWLIST=/path/a:/path/b`
+- `DEVCON_WEBHUB_HOST=0.0.0.0`
+- `DEVCON_WEBHUB_PORT=7690`
+- `DEVCON_WEBHUB_PASSWORD=strong-password`
 
 Useful flags (place before `--` that separates devcon flags from tool args):
 

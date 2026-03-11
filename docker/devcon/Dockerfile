@@ -6,9 +6,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     SHELL=/bin/bash
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git tini locales ca-certificates ripgrep \
+    && apt-get install -y --no-install-recommends git tini locales ca-certificates ripgrep python3 python3-pip python3-venv \
     && echo "en_US.UTF-8 UTF-8" > /etc/locale.gen \
     && locale-gen \
+    && python3 -m pip install --break-system-packages --no-cache-dir numpy scikit-learn pandas pyarrow catboost optuna polars \
     && rm -rf /var/lib/apt/lists/*
 
 ARG DEVCON_UPDATE_TOKEN=0
