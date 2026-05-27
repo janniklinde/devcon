@@ -13,7 +13,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 ARG DEVCON_UPDATE_TOKEN=0
-RUN npm install -g @openai/codex@latest @anthropic-ai/claude-code@latest \
+RUN npm install -g @openai/codex@latest @anthropic-ai/claude-code@latest opencode-ai@latest \
     && npm cache clean --force \
     && echo "devcon update token: ${DEVCON_UPDATE_TOKEN}" > /dev/null
 

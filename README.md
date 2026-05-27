@@ -1,6 +1,6 @@
 # devcon
 
-`devcon` is a Linux-only CLI that launches AI coding agents like Codex CLI or Claude Code in fresh Docker containers that already have your working directory wired up. Install globally (`npm install -g devcon`) and run `devcon codex` (or `devcon claude`) from any project to get a locked-down shell within seconds. If no image is configured, Devcon defaults to a local `devcon:latest` image that bundles both Codex CLI and Claude Code; the first time you run a tool the CLI offers to build this image for you.
+`devcon` is a Linux-only CLI that launches AI coding agents like Codex CLI, Claude Code, or OpenCode in fresh Docker containers that already have your working directory wired up. Install globally (`npm install -g devcon`) and run `devcon codex` (or `devcon claude` / `devcon opencode`) from any project to get a locked-down shell within seconds. If no image is configured, Devcon defaults to a local `devcon:latest` image that bundles all three CLIs; the first time you run a tool the CLI offers to build this image for you.
 
 ## What it does
 
@@ -10,8 +10,8 @@
 - Keep the host home directory private by default. Opt in with `--home` or `DEVCON_SHARE_HOME=1`, or whitelist individual directories via `writablePaths` so credentials like `~/.codex` can still be shared.
 - Hide `.env*`, `.git-credentials`, and other critical Git metadata from the container by overlaying empty bind mounts before the container starts.
 - Detect when the default `devcon:latest` docker image is missing and (after a `y` confirmation) build it automatically from `docker/devcon/Dockerfile`.
-- Provide a simple tool registry (`codex`, `claude` by default) allowing you to define which Docker image and command should run for each agent.
-- Optional `--conscious` mode that boots a persistent local archive and wires memory tools into Codex/Claude via MCP.
+- Provide a simple tool registry (`codex`, `claude`, `opencode` by default) allowing you to define which Docker image and command should run for each agent.
+- Optional `--conscious` mode that boots a persistent local archive and wires memory tools into Codex, Claude, or OpenCode via MCP.
 
 ## Installation
 
@@ -171,7 +171,7 @@ devcon codex -- --dry-run "my prompt"
 - Persists the chosen project identifier under `.git/devcon/project-id` (git-internal, not tracked).
 - Initializes archive storage (`archive-db.json`) for that project if missing.
 - Generates a per-session retrieval snapshot under `sessions/`.
-- Starts (or reuses) a persistent per-project memory sidecar container and auto-registers MCP access for Codex/Claude as `devcon-archive`.
+- Starts (or reuses) a persistent per-project memory sidecar container and auto-registers MCP access for supported tools as `devcon-archive`.
 - Removes that MCP registration again when the CLI process exits to avoid stale config drift.
 
 Container isolation notes:
@@ -237,7 +237,7 @@ Notes:
 
 ## Default image (`devcon:latest`)
 
-The bundled tools (`codex`, `claude`) point to an image named `devcon:latest` that bakes in both CLIs. On the first run Devcon checks whether that tag exists locally; if not, you’ll see a short explanation plus a `Build it now? [y/N]` prompt. Answer `y` and the CLI runs:
+The bundled tools (`codex`, `claude`, `opencode`) point to an image named `devcon:latest` that bakes in all three CLIs. On the first run Devcon checks whether that tag exists locally; if not, you’ll see a short explanation plus a `Build it now? [y/N]` prompt. Answer `y` and the CLI runs:
 
 ```bash
 docker build -f docker/devcon/Dockerfile -t devcon:latest docker/devcon
@@ -245,7 +245,7 @@ docker build -f docker/devcon/Dockerfile -t devcon:latest docker/devcon
 
 The build context lives inside the npm package, so everything works even if you run `devcon codex` from a random project. If you prefer a custom image, pass `--image my/tag` or set `image` in `~/.config/devcon/tools.json`—auto-build only triggers for the default image.
 
-To manually refresh the bundled images (for example to pick up new Codex CLI releases), run:
+To manually refresh the bundled image (for example to pick up new Codex CLI or OpenCode releases), run:
 
 ```bash
 devcon update        # rebuilds every tool with an auto-build config
@@ -258,7 +258,7 @@ When you need a clean slate (ignore every cached layer), use:
 
 ```bash
 devcon rebuild         # fully rebuilds every tool with an auto-build config
-devcon rebuild codex   # fully rebuild just the Codex/Claude base image
+devcon rebuild codex   # fully rebuild just the bundled Codex/Claude/OpenCode base image
 ```
 
 Additional handy invocations:
@@ -291,6 +291,16 @@ Devcon merges the built-in tools with an optional JSON file. Create `~/.config/d
     "command": ["claude"],
     "writablePaths": ["~/.config/claude"]
   },
+  "opencode": {
+    "image": "devcon:latest",
+    "command": ["opencode"],
+    "writablePaths": [
+      "~/.config/opencode",
+      "~/.local/share/opencode",
+      "~/.local/state/opencode",
+      "~/.cache/opencode"
+    ]
+  },
   "custom-codex": {
     "image": "ghcr.io/my-org/codex-cli:latest",
     "command": ["/bin/bash", "-lc", "codex --full-auto"],
@@ -313,6 +323,7 @@ Fields per tool:
 - `shareHome` – Override the CLI default for sharing the host home directory (default is `false`).
 - `homeReadOnly` – When `true`, the home directory mount is forced read-only; pair with `writablePaths` to selectively re-enable write access to specific paths.
 - `writablePaths` – Array of directories (absolute or `~/`-prefixed) that should remain mounted read/write even if the home directory is not mounted. The directories must live under your host home directory; missing directories are created automatically.
+- Built-in OpenCode mounts `~/.config/opencode`, `~/.local/share/opencode`, `~/.local/state/opencode`, and `~/.cache/opencode` by default so it can reuse your host config, auth, local state, and cache without sharing your entire home directory.
 
 Environment toggles:
 
@@ -327,7 +338,7 @@ Environment toggles:
 - Containers inherit your host UID/GID so they have no more privileges than you already do.
 - Each invocation runs with `--rm` and without Docker daemon side-effects, ensuring there is no long-lived state.
 - The host home directory is unmounted by default; opt in explicitly and/or keep it read-only (`DEVCON_HOME_READONLY=1`) while allowing write access only to trusted locations via `writablePaths`.
-- The default Codex/Claude image builds locally and never ships secrets to a registry.
+- The default bundled agent image builds locally and never ships secrets to a registry.
 
 ### Sensitive file patterns
 

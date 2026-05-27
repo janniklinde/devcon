@@ -53,16 +53,16 @@ function parseDevconCommand() {
 }
 
 function parseToolList() {
-  const raw = process.env.WEBHUB_TOOLS_JSON || '["codex","claude","run"]';
+  const raw = process.env.WEBHUB_TOOLS_JSON || '["codex","claude","opencode","run"]';
   try {
     const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return ["codex", "claude", "run"];
+    if (!Array.isArray(parsed)) return ["codex", "claude", "opencode", "run"];
     const tools = parsed
       .filter((entry) => typeof entry === "string" && entry.trim().length > 0)
       .map((entry) => entry.trim());
-    return tools.length > 0 ? Array.from(new Set(tools)) : ["codex", "claude", "run"];
+    return tools.length > 0 ? Array.from(new Set(tools)) : ["codex", "claude", "opencode", "run"];
   } catch {
-    return ["codex", "claude", "run"];
+    return ["codex", "claude", "opencode", "run"];
   }
 }
 

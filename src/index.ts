@@ -125,7 +125,7 @@ const WEBHUB_DEFAULT_PORT = 7690;
 const DEFAULT_AUTO_BUILD: AutoBuildConfig = {
   dockerfile: DEFAULT_IMAGE_DOCKERFILE,
   tag: DEFAULT_IMAGE_TAG,
-  description: 'Builds the devcon base image with Codex CLI and Claude Code preinstalled.',
+  description: 'Builds the devcon base image with Codex CLI, Claude Code, and OpenCode preinstalled.',
 };
 const DEFAULT_SENSITIVE_PATTERNS = [
   '.env',
@@ -168,7 +168,27 @@ const BUILT_IN_TOOLS: ToolMap = {
     description: 'Runs Claude Code inside a container and mounts your workspace',
     autoBuild: DEFAULT_AUTO_BUILD,
   },
+  opencode: {
+    image: DEFAULT_IMAGE_TAG,
+    command: ['opencode'],
+    description: 'Runs OpenCode inside a container and reuses host config, auth, and local state',
+    writablePaths: ['~/.config/opencode', '~/.local/share/opencode', '~/.local/state/opencode', '~/.cache/opencode'],
+    autoBuild: DEFAULT_AUTO_BUILD,
+  },
 };
+
+function buildOpenCodeConsciousConfig(serverCommand: string[]): string {
+  return JSON.stringify({
+    $schema: 'https://opencode.ai/config.json',
+    mcp: {
+      [CONSCIOUS_MCP_NAME]: {
+        type: 'local',
+        command: serverCommand,
+        enabled: true,
+      },
+    },
+  });
+}
 
 function parseBooleanEnv(value: string | undefined): boolean {
   if (!value) {
@@ -3327,15 +3347,16 @@ function buildDockerArgs(options: {
       options.conscious.sidecarHost,
       '--port',
       String(options.conscious.sidecarPort),
-    ].map(shellQuote).join(' ');
-    const warmupCommand = buildConsciousWarmupCommand(serverArgs, CONSCIOUS_SIDECAR_READY_TIMEOUT_MS);
+    ];
+    const serverArgsString = serverArgs.map(shellQuote).join(' ');
+    const warmupCommand = buildConsciousWarmupCommand(serverArgsString, CONSCIOUS_SIDECAR_READY_TIMEOUT_MS);
     const warmupGuard = `if ! ${warmupCommand}; then echo "devcon conscious: MCP sidecar warmup failed for ${CONSCIOUS_MCP_NAME}." >&2; exit 86; fi`;
 
     if (options.toolName === 'codex') {
       initScriptLines.push(
         `if command -v codex >/dev/null 2>&1; then`,
         `  codex mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`,
-        `  codex mcp add ${CONSCIOUS_MCP_NAME} -- ${serverArgs} >/dev/null 2>&1 || true`,
+        `  codex mcp add ${CONSCIOUS_MCP_NAME} -- ${serverArgsString} >/dev/null 2>&1 || true`,
         `  ${warmupGuard}`,
         'fi',
       );
@@ -3344,11 +3365,18 @@ function buildDockerArgs(options: {
       initScriptLines.push(
         'if command -v claude >/dev/null 2>&1; then',
         `  claude mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`,
-        `  claude mcp add --transport stdio ${CONSCIOUS_MCP_NAME} -- ${serverArgs} >/dev/null 2>&1 || true`,
+        `  claude mcp add --transport stdio ${CONSCIOUS_MCP_NAME} -- ${serverArgsString} >/dev/null 2>&1 || true`,
         `  ${warmupGuard}`,
         'fi',
       );
       postRunCleanupLines.push(`claude mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`);
+    } else if (options.toolName === 'opencode') {
+      dockerArgs.push('-e', `OPENCODE_CONFIG_CONTENT=${buildOpenCodeConsciousConfig(serverArgs)}`);
+      initScriptLines.push(
+        'if command -v opencode >/dev/null 2>&1; then',
+        `  ${warmupGuard}`,
+        'fi',
+      );
     }
   } else if (options.toolName === 'codex') {
     initScriptLines.push(
