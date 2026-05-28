@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Devcon Web Terminal</title>
-    <link rel="stylesheet" href="/vendor/xterm/xterm.css" />
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=20260528c" />
+    <link rel="stylesheet" href="/styles.css?v=20260528c" />
   </head>
   <body>
     <main class="shell">
@@ -33,17 +33,17 @@
 
       <section id="terminal-wrap" class="terminal-wrap hidden">
         <div class="toolbar">
-          <button id="paste-btn">Paste</button>
-          <button id="ctrlc-btn">Ctrl+C</button>
-          <button id="clear-btn">Clear</button>
-          <button id="reconnect-btn">Reconnect</button>
+          <button id="paste-btn" title="Paste clipboard">Paste</button>
+          <button id="ctrlc-btn" title="Send Ctrl+C">^C</button>
+          <button id="clear-btn" title="Clear visible terminal">Clear</button>
+          <button id="reconnect-btn" title="Reconnect websocket">Retry</button>
         </div>
         <div id="terminal" class="terminal"></div>
       </section>
     </main>
 
-    <script src="/vendor/xterm/xterm.js"></script>
-    <script src="/vendor/xterm-addon-fit/addon-fit.js"></script>
-    <script src="/app.js"></script>
+    <script src="/vendor/xterm/xterm.js?v=20260528c"></script>
+    <script src="/vendor/xterm-addon-fit/addon-fit.js?v=20260528c"></script>
+    <script src="/app.js?v=20260528c"></script>
   </body>
 </html>

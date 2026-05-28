@@ -27,6 +27,9 @@ const terminal = new Terminal({
   fontSize: 13,
   lineHeight: 1.18,
   scrollback: 5000,
+  fastScrollModifier: "alt",
+  fastScrollSensitivity: 4,
+  scrollSensitivity: 2,
   theme: {
     background: "#05111b",
     foreground: "#e7f5ff",
@@ -178,6 +181,22 @@ function scheduleReconnect() {
   }, 1000);
 }
 
+function installTerminalScrollIsolation() {
+  const viewport = terminalHostEl.querySelector(".xterm-viewport");
+  if (!viewport) return;
+
+  const stopBubble = (event) => {
+    event.stopPropagation();
+  };
+
+  viewport.addEventListener("wheel", stopBubble, { passive: true });
+  viewport.addEventListener("touchmove", stopBubble, { passive: true });
+
+  if (typeof terminal.attachCustomWheelEventHandler === "function") {
+    terminal.attachCustomWheelEventHandler(() => true);
+  }
+}
+
 function connectTerminal(isReconnect = false) {
   clearReconnectTimer();
   if (socket) {
@@ -212,6 +231,12 @@ function connectTerminal(isReconnect = false) {
       scheduleFit();
       return;
     }
+    if (payload.type === "error" && typeof payload.message === "string") {
+      setStatus("Terminal attach failed", true);
+      terminal.writeln("");
+      terminal.writeln(payload.message);
+      return;
+    }
     if (payload.type === "exit") {
       setStatus("Session exited", true);
       return;
@@ -231,6 +256,7 @@ function connectTerminal(isReconnect = false) {
 function ensureTerminalMounted() {
   if (terminalReady) return;
   terminal.open(terminalHostEl);
+  installTerminalScrollIsolation();
   terminal.onData((data) => {
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     socket.send(JSON.stringify({ type: "input", data }));

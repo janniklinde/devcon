@@ -2546,6 +2546,13 @@ function tmuxSessionExists(sessionName: string): boolean {
   return check.status === 0;
 }
 
+function enableTmuxMouse(sessionName: string): void {
+  const setMouse = spawnSync('tmux', ['set-option', '-t', sessionName, 'mouse', 'on'], { stdio: 'ignore' });
+  if (setMouse.status !== 0) {
+    console.warn(`Failed to enable tmux mouse mode for session "${sessionName}".`);
+  }
+}
+
 function startWebTmuxSession(sessionName: string, cwd: string, scriptPath: string): void {
   if (tmuxSessionExists(sessionName)) {
     throw new Error(`tmux session "${sessionName}" already exists. Pick another name via --web-session.`);
@@ -2558,6 +2565,7 @@ function startWebTmuxSession(sessionName: string, cwd: string, scriptPath: strin
   if (create.status !== 0) {
     throw new Error(`Failed to create tmux session "${sessionName}" for web mode.`);
   }
+  enableTmuxMouse(sessionName);
 }
 
 function killTmuxSession(sessionName: string): void {

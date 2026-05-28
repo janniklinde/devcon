@@ -30,6 +30,7 @@ const CONTENT_TYPES = {
 const VENDOR_FILES = {
   "/vendor/xterm/xterm.css": path.join(__dirname, "..", "node_modules", "xterm", "css", "xterm.css"),
   "/vendor/xterm/xterm.js": path.join(__dirname, "..", "node_modules", "xterm", "lib", "xterm.js"),
+  "/vendor/xterm/xterm.js.map": path.join(__dirname, "..", "node_modules", "xterm", "lib", "xterm.js.map"),
   "/vendor/xterm-addon-fit/addon-fit.js": path.join(
     __dirname,
     "..",
@@ -38,6 +39,15 @@ const VENDOR_FILES = {
     "addon-fit",
     "lib",
     "addon-fit.js"
+  ),
+  "/vendor/xterm-addon-fit/addon-fit.js.map": path.join(
+    __dirname,
+    "..",
+    "node_modules",
+    "@xterm",
+    "addon-fit",
+    "lib",
+    "addon-fit.js.map"
   ),
 };
 
@@ -208,12 +218,23 @@ function tmux(args) {
   });
 }
 
+async function enableTmuxMouse(sessionName) {
+  const result = await tmux(["set-option", "-t", sessionName, "mouse", "on"]);
+  if (result.code !== 0) {
+    process.stderr.write(
+      `Web mode note: failed to enable tmux mouse mode for "${sessionName}": ${result.stderr.trim() || "unknown error"}\n`
+    );
+  }
+}
+
 async function ensureSession() {
   const has = await tmux(["has-session", "-t", TMUX_TARGET]);
   if (has.code === 0) return true;
   if (!AUTO_CREATE_SESSION) return false;
   const create = await tmux(["new-session", "-d", "-s", TMUX_TARGET]);
-  return create.code === 0;
+  if (create.code !== 0) return false;
+  await enableTmuxMouse(TMUX_TARGET);
+  return true;
 }
 
 function getSessionId(req) {
@@ -256,7 +277,7 @@ async function serveStatic(req, res) {
   const reqPath = new URL(req.url, `http://${req.headers.host}`).pathname;
 
   if (VENDOR_FILES[reqPath]) {
-    await serveFile(res, VENDOR_FILES[reqPath], "public, max-age=300");
+    await serveFile(res, VENDOR_FILES[reqPath], "no-store");
     return;
   }
 
@@ -271,7 +292,7 @@ async function serveStatic(req, res) {
   await serveFile(
     res,
     filePath,
-    path.extname(filePath).toLowerCase() === ".html" ? "no-store" : "public, max-age=300"
+    "no-store"
   );
 }
 
