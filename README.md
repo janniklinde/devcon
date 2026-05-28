@@ -94,6 +94,7 @@ devcon --web --web-host 0.0.0.0 --web-port 7682 --web-password 'strong-password'
 Notes:
 
 - `--web` requires `tmux` on the host.
+- The browser terminal uses `xterm.js` over a websocket-backed PTY attachment to the tmux session, so full-screen TUIs, ANSI colors, cursor movement, and interactive prompts render much closer to a native terminal.
 - If no password is provided (`--web-password` or `WEB_PASSWORD`), devcon generates one-time credentials and prints them.
 - When binding to `0.0.0.0` or `::`, the printed local-network URLs include `?pwd=...` so opening the link on another device logs in automatically once and then removes the password from the address bar.
 - By default devcon auto-generates a tmux session name. Override via `--web-session NAME`.

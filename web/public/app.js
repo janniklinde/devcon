@@ -1,22 +1,58 @@
 const statusEl = document.getElementById("status");
 const authCardEl = document.getElementById("auth-card");
 const terminalWrapEl = document.getElementById("terminal-wrap");
-const terminalEl = document.getElementById("terminal");
-const screenEl = document.getElementById("screen");
-const lineInputEl = document.getElementById("line-input");
-const sendBtnEl = document.getElementById("send-btn");
-const enterBtnEl = document.getElementById("enter-btn");
+const terminalHostEl = document.getElementById("terminal");
 const loginBtnEl = document.getElementById("login-btn");
 const passwordInputEl = document.getElementById("password-input");
-const keysEl = document.getElementById("keys");
-const ctrlBtnEl = document.getElementById("ctrl-btn");
 const pasteBtnEl = document.getElementById("paste-btn");
+const ctrlcBtnEl = document.getElementById("ctrlc-btn");
+const clearBtnEl = document.getElementById("clear-btn");
+const reconnectBtnEl = document.getElementById("reconnect-btn");
 
-let eventSource = null;
-let ctrlLatch = false;
-let textBuffer = "";
-let textFlushTimer = null;
 let autoLoginAttempted = false;
+let socket = null;
+let resizeObserver = null;
+let reconnectTimer = null;
+let terminalReady = false;
+let fitScheduled = false;
+let lastMeasuredWidth = 0;
+let lastMeasuredHeight = 0;
+let lastCols = 0;
+let lastRows = 0;
+
+const terminal = new Terminal({
+  cursorBlink: true,
+  convertEol: false,
+  fontFamily: "Iosevka Web, JetBrains Mono, Menlo, monospace",
+  fontSize: 13,
+  lineHeight: 1.18,
+  scrollback: 5000,
+  theme: {
+    background: "#05111b",
+    foreground: "#e7f5ff",
+    cursor: "#7bf1a8",
+    cursorAccent: "#05111b",
+    selectionBackground: "rgba(123, 241, 168, 0.22)",
+    black: "#05111b",
+    red: "#ff7a90",
+    green: "#7bf1a8",
+    yellow: "#ffbc6d",
+    blue: "#77c3ff",
+    magenta: "#dba8ff",
+    cyan: "#73f0ff",
+    white: "#e7f5ff",
+    brightBlack: "#557287",
+    brightRed: "#ff9cae",
+    brightGreen: "#a0ffc0",
+    brightYellow: "#ffd394",
+    brightBlue: "#9bd4ff",
+    brightMagenta: "#ebc2ff",
+    brightCyan: "#9af7ff",
+    brightWhite: "#ffffff",
+  },
+});
+const fitAddon = new FitAddon.FitAddon();
+terminal.loadAddon(fitAddon);
 
 function setStatus(text, warn = false) {
   statusEl.textContent = text;
@@ -46,42 +82,11 @@ async function api(path, method = "GET", body) {
 function showTerminal() {
   authCardEl.classList.add("hidden");
   terminalWrapEl.classList.remove("hidden");
-  terminalEl.focus();
 }
 
 function showAuth() {
   terminalWrapEl.classList.add("hidden");
   authCardEl.classList.remove("hidden");
-}
-
-function updateScreen(nextText) {
-  const atBottom =
-    terminalEl.scrollTop + terminalEl.clientHeight >= terminalEl.scrollHeight - 30;
-  screenEl.textContent = nextText;
-  if (atBottom) {
-    terminalEl.scrollTop = terminalEl.scrollHeight;
-  }
-}
-
-function flushTextBuffer() {
-  if (!textBuffer) return;
-  const text = textBuffer;
-  textBuffer = "";
-  textFlushTimer = null;
-  sendInput({ text }).catch((err) => {
-    setStatus(`Input error: ${err.message}`, true);
-  });
-}
-
-function queueText(str) {
-  textBuffer += str;
-  if (!textFlushTimer) {
-    textFlushTimer = setTimeout(flushTextBuffer, 35);
-  }
-}
-
-async function sendInput(payload) {
-  await api("/api/input", "POST", payload);
 }
 
 async function login() {
@@ -119,24 +124,124 @@ async function maybeAutoLoginFromUrl() {
   }
 }
 
-function closeStream() {
-  if (eventSource) {
-    eventSource.close();
-    eventSource = null;
-  }
+function clearReconnectTimer() {
+  if (!reconnectTimer) return;
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
 }
 
-function connectStream() {
-  closeStream();
-  eventSource = new EventSource("/api/stream");
-  eventSource.addEventListener("screen", (ev) => {
-    const payload = JSON.parse(ev.data);
-    updateScreen(payload.screen || "");
+function websocketUrl() {
+  const url = new URL(window.location.href);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.pathname = "/ws";
+  url.search = "";
+  return url.toString();
+}
+
+function sendResizeIfNeeded() {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  if (terminal.cols === lastCols && terminal.rows === lastRows) return;
+  lastCols = terminal.cols;
+  lastRows = terminal.rows;
+  socket.send(JSON.stringify({ type: "resize", cols: terminal.cols, rows: terminal.rows }));
+}
+
+function fitTerminal() {
+  fitScheduled = false;
+  if (!terminalReady) return;
+  const nextWidth = terminalHostEl.clientWidth;
+  const nextHeight = terminalHostEl.clientHeight;
+  if (nextWidth <= 0 || nextHeight <= 0) return;
+  if (nextWidth === lastMeasuredWidth && nextHeight === lastMeasuredHeight) {
+    sendResizeIfNeeded();
+    return;
+  }
+  lastMeasuredWidth = nextWidth;
+  lastMeasuredHeight = nextHeight;
+  fitAddon.fit();
+  sendResizeIfNeeded();
+}
+
+function scheduleFit() {
+  if (fitScheduled) return;
+  fitScheduled = true;
+  window.requestAnimationFrame(() => {
+    fitTerminal();
+  });
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectTerminal(true);
+  }, 1000);
+}
+
+function connectTerminal(isReconnect = false) {
+  clearReconnectTimer();
+  if (socket) {
+    socket.onclose = null;
+    socket.onerror = null;
+    socket.onmessage = null;
+    socket.close();
+  }
+
+  setStatus(isReconnect ? "Reconnecting..." : "Connecting...");
+  socket = new WebSocket(websocketUrl());
+
+  socket.addEventListener("open", () => {
     setStatus("Connected");
+    scheduleFit();
+    terminal.focus();
   });
-  eventSource.addEventListener("error", () => {
+
+  socket.addEventListener("message", (event) => {
+    let payload = null;
+    try {
+      payload = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    if (!payload || typeof payload !== "object") return;
+    if (payload.type === "output" && typeof payload.data === "string") {
+      terminal.write(payload.data);
+      return;
+    }
+    if (payload.type === "ready") {
+      scheduleFit();
+      return;
+    }
+    if (payload.type === "exit") {
+      setStatus("Session exited", true);
+      return;
+    }
+  });
+
+  socket.addEventListener("close", () => {
     setStatus("Disconnected, retrying...", true);
+    scheduleReconnect();
   });
+
+  socket.addEventListener("error", () => {
+    setStatus("Websocket error", true);
+  });
+}
+
+function ensureTerminalMounted() {
+  if (terminalReady) return;
+  terminal.open(terminalHostEl);
+  terminal.onData((data) => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ type: "input", data }));
+  });
+  resizeObserver = new ResizeObserver(() => {
+    scheduleFit();
+  });
+  resizeObserver.observe(terminalWrapEl);
+  window.addEventListener("resize", scheduleFit);
+  terminalReady = true;
+  scheduleFit();
 }
 
 async function bootstrap() {
@@ -145,7 +250,8 @@ async function bootstrap() {
     const info = await api("/api/session");
     if (!info.ok) throw new Error(info.message || "Session unavailable");
     showTerminal();
-    connectStream();
+    ensureTerminalMounted();
+    connectTerminal(false);
     setStatus(`Connected to tmux target "${info.tmuxTarget}"`);
   } catch (err) {
     if (String(err.message || "").includes("Not authenticated")) {
@@ -161,59 +267,6 @@ async function bootstrap() {
     setStatus(err.message || "Failed to connect", true);
   }
 }
-
-function mapKeyFromEvent(ev) {
-  if (ev.key === "Enter") return "Enter";
-  if (ev.key === "Backspace") return "Backspace";
-  if (ev.key === "Tab") return "Tab";
-  if (ev.key === "Escape") return "Escape";
-  if (ev.key === "ArrowUp") return "ArrowUp";
-  if (ev.key === "ArrowDown") return "ArrowDown";
-  if (ev.key === "ArrowLeft") return "ArrowLeft";
-  if (ev.key === "ArrowRight") return "ArrowRight";
-  if (ev.key === "Delete") return "Delete";
-  if (ev.key === "Home") return "Home";
-  if (ev.key === "End") return "End";
-  if (ev.key === "PageUp") return "PageUp";
-  if (ev.key === "PageDown") return "PageDown";
-  return "";
-}
-
-terminalEl.addEventListener("click", () => {
-  terminalEl.focus();
-});
-
-lineInputEl.addEventListener("keydown", async (ev) => {
-  if (ev.key !== "Enter") return;
-  ev.preventDefault();
-  const value = lineInputEl.value;
-  if (!value) return;
-  lineInputEl.value = "";
-  try {
-    await sendInput({ text: value, key: "Enter" });
-  } catch (err) {
-    setStatus(`Input error: ${err.message}`, true);
-  }
-});
-
-sendBtnEl.addEventListener("click", async () => {
-  const value = lineInputEl.value;
-  if (!value) return;
-  lineInputEl.value = "";
-  try {
-    await sendInput({ text: value });
-  } catch (err) {
-    setStatus(`Input error: ${err.message}`, true);
-  }
-});
-
-enterBtnEl.addEventListener("click", async () => {
-  try {
-    await sendInput({ key: "Enter" });
-  } catch (err) {
-    setStatus(`Input error: ${err.message}`, true);
-  }
-});
 
 loginBtnEl.addEventListener("click", async () => {
   try {
@@ -235,91 +288,41 @@ passwordInputEl.addEventListener("keydown", async (ev) => {
   }
 });
 
-keysEl.addEventListener("click", async (ev) => {
-  const btn = ev.target.closest("button");
-  if (!btn) return;
-  const key = btn.dataset.key;
-  if (!key) return;
-  try {
-    await sendInput({ key });
-    terminalEl.focus();
-  } catch (err) {
-    setStatus(`Input error: ${err.message}`, true);
-  }
-});
-
-ctrlBtnEl.addEventListener("click", () => {
-  ctrlLatch = !ctrlLatch;
-  ctrlBtnEl.classList.toggle("active", ctrlLatch);
-  terminalEl.focus();
-});
-
 pasteBtnEl.addEventListener("click", async () => {
   try {
     const text = await navigator.clipboard.readText();
-    if (!text) return;
-    await sendInput({ text });
-    terminalEl.focus();
+    if (!text || !socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ type: "input", data: text }));
+    terminal.focus();
   } catch (err) {
     setStatus(`Paste error: ${err.message}`, true);
   }
 });
 
-document.addEventListener("keydown", async (ev) => {
-  if (document.activeElement === lineInputEl || document.activeElement === passwordInputEl) {
-    return;
-  }
-  if (!terminalWrapEl.classList.contains("hidden")) {
-    terminalEl.focus();
-  } else {
-    return;
-  }
+ctrlcBtnEl.addEventListener("click", () => {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({ type: "input", data: "\u0003" }));
+  terminal.focus();
+});
 
-  if (ev.metaKey) return;
-  if (ev.ctrlKey && ev.key.toLowerCase() === "r") return;
+clearBtnEl.addEventListener("click", () => {
+  terminal.clear();
+  terminal.focus();
+});
 
-  const special = mapKeyFromEvent(ev);
-  if (special) {
-    ev.preventDefault();
-    try {
-      await sendInput({ key: special });
-    } catch (err) {
-      setStatus(`Input error: ${err.message}`, true);
-    }
-    return;
-  }
-
-  if (ev.ctrlKey && ev.key.length === 1) {
-    ev.preventDefault();
-    const key = `C-${ev.key.toLowerCase()}`;
-    try {
-      await sendInput({ key });
-    } catch (err) {
-      setStatus(`Input error: ${err.message}`, true);
-    }
-    return;
-  }
-
-  if (ctrlLatch && ev.key.length === 1) {
-    ev.preventDefault();
-    ctrlLatch = false;
-    ctrlBtnEl.classList.remove("active");
-    try {
-      await sendInput({ key: `C-${ev.key.toLowerCase()}` });
-    } catch (err) {
-      setStatus(`Input error: ${err.message}`, true);
-    }
-    return;
-  }
-
-  if (ev.key.length === 1 && !ev.altKey && !ev.ctrlKey) {
-    ev.preventDefault();
-    queueText(ev.key);
-  }
+reconnectBtnEl.addEventListener("click", () => {
+  connectTerminal(true);
 });
 
 window.addEventListener("beforeunload", () => {
-  closeStream();
+  clearReconnectTimer();
+  if (resizeObserver) {
+    resizeObserver.disconnect();
+  }
+  window.removeEventListener("resize", scheduleFit);
+  if (socket) {
+    socket.close();
+  }
 });
 
 bootstrap();

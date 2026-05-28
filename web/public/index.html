@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Devcon Web Terminal</title>
+    <link rel="stylesheet" href="/vendor/xterm/xterm.css" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -31,38 +32,18 @@
       </section>
 
       <section id="terminal-wrap" class="terminal-wrap hidden">
-        <div id="terminal" class="terminal" tabindex="0">
-          <pre id="screen"></pre>
-        </div>
-
-        <div class="command-row">
-          <input
-            id="line-input"
-            type="text"
-            placeholder="Type command and press Send"
-            spellcheck="false"
-            autocomplete="off"
-          />
-          <button id="send-btn">Send</button>
-          <button id="enter-btn">Enter</button>
-        </div>
-
-        <div class="keys" id="keys">
-          <button data-key="C-c">Ctrl+C</button>
-          <button data-key="Escape">Esc</button>
-          <button data-key="Tab">Tab</button>
-          <button data-key="ArrowUp">Up</button>
-          <button data-key="ArrowDown">Down</button>
-          <button data-key="ArrowLeft">Left</button>
-          <button data-key="ArrowRight">Right</button>
-          <button data-key="Backspace">Backspace</button>
-          <button id="ctrl-btn" class="toggle">Ctrl</button>
+        <div class="toolbar">
           <button id="paste-btn">Paste</button>
+          <button id="ctrlc-btn">Ctrl+C</button>
+          <button id="clear-btn">Clear</button>
+          <button id="reconnect-btn">Reconnect</button>
         </div>
+        <div id="terminal" class="terminal"></div>
       </section>
     </main>
 
+    <script src="/vendor/xterm/xterm.js"></script>
+    <script src="/vendor/xterm-addon-fit/addon-fit.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>
-

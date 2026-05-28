@@ -4,14 +4,14 @@ const fsp = require("fs/promises");
 const path = require("path");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
+const pty = require("node-pty");
+const { WebSocketServer } = require("ws");
 
 const HOST = process.env.HOST || "0.0.0.0";
 const PORT = Number(process.env.PORT || 7682);
 const TMUX_TARGET = process.env.TMUX_TARGET || "devcon";
 const AUTH_TOKEN = process.env.WEB_PASSWORD || process.env.AUTH_TOKEN || "";
 const AUTO_CREATE_SESSION = process.env.AUTO_CREATE_SESSION === "1";
-const HISTORY_LINES = Number(process.env.HISTORY_LINES || 250);
-const POLL_MS = Math.max(120, Number(process.env.POLL_MS || 180));
 const STATIC_DIR = path.join(__dirname, "public");
 
 const sessions = new Map();
@@ -24,6 +24,20 @@ const CONTENT_TYPES = {
   ".txt": "text/plain; charset=utf-8",
   ".svg": "image/svg+xml",
   ".ico": "image/x-icon",
+};
+
+const VENDOR_FILES = {
+  "/vendor/xterm/xterm.css": path.join(__dirname, "..", "node_modules", "xterm", "css", "xterm.css"),
+  "/vendor/xterm/xterm.js": path.join(__dirname, "..", "node_modules", "xterm", "lib", "xterm.js"),
+  "/vendor/xterm-addon-fit/addon-fit.js": path.join(
+    __dirname,
+    "..",
+    "node_modules",
+    "@xterm",
+    "addon-fit",
+    "lib",
+    "addon-fit.js"
+  ),
 };
 
 function sendJson(res, statusCode, payload) {
@@ -123,92 +137,7 @@ function isAuthed(req) {
   return Boolean(getSessionId(req));
 }
 
-async function capturePane() {
-  const result = await tmux([
-    "capture-pane",
-    "-p",
-    "-t",
-    TMUX_TARGET,
-    "-S",
-    `-${HISTORY_LINES}`,
-  ]);
-  if (result.code !== 0) {
-    return {
-      ok: false,
-      error:
-        result.stderr.trim() ||
-        "Unable to capture tmux pane. Is the target session running?",
-    };
-  }
-  return { ok: true, screen: result.stdout.replace(/\n$/, "") };
-}
-
-function tmuxKeyFromClient(key) {
-  if (!key || typeof key !== "string") return "";
-  const normalized = key.trim();
-  if (!normalized) return "";
-  if (/^C-[a-z]$/i.test(normalized)) return `C-${normalized.slice(2).toLowerCase()}`;
-  if (/^M-[a-z]$/i.test(normalized)) return `M-${normalized.slice(2).toLowerCase()}`;
-
-  const map = {
-    Enter: "Enter",
-    Escape: "Escape",
-    Tab: "Tab",
-    Backspace: "BSpace",
-    Delete: "DC",
-    ArrowUp: "Up",
-    ArrowDown: "Down",
-    ArrowLeft: "Left",
-    ArrowRight: "Right",
-    Home: "Home",
-    End: "End",
-    PageUp: "PageUp",
-    PageDown: "PageDown",
-  };
-  return map[normalized] || normalized;
-}
-
-async function sendInput(body) {
-  const text = typeof body.text === "string" ? body.text : "";
-  const key = typeof body.key === "string" ? body.key : "";
-  const keys = Array.isArray(body.keys) ? body.keys.filter((k) => typeof k === "string") : [];
-
-  if (!text && !key && !keys.length) {
-    return { ok: false, error: "No input provided" };
-  }
-
-  if (text) {
-    const r = await tmux(["send-keys", "-t", TMUX_TARGET, "-l", text]);
-    if (r.code !== 0) return { ok: false, error: r.stderr.trim() || "Failed to send text" };
-  }
-
-  const allKeys = [];
-  if (key) allKeys.push(key);
-  allKeys.push(...keys);
-
-  for (const k of allKeys) {
-    const tmuxKey = tmuxKeyFromClient(k);
-    if (!tmuxKey) continue;
-    const r = await tmux(["send-keys", "-t", TMUX_TARGET, tmuxKey]);
-    if (r.code !== 0) {
-      return { ok: false, error: r.stderr.trim() || `Failed to send key ${tmuxKey}` };
-    }
-  }
-
-  return { ok: true };
-}
-
-async function serveStatic(req, res) {
-  const reqPath = new URL(req.url, `http://${req.headers.host}`).pathname;
-  let target = reqPath === "/" ? "/index.html" : reqPath;
-  target = path.normalize(target).replace(/^(\.\.[/\\])+/, "");
-
-  const filePath = path.join(STATIC_DIR, target);
-  if (!filePath.startsWith(STATIC_DIR)) {
-    sendJson(res, 403, { error: "Forbidden" });
-    return;
-  }
-
+async function serveFile(res, filePath, cacheControl) {
   try {
     const stat = await fsp.stat(filePath);
     if (!stat.isFile()) {
@@ -220,12 +149,35 @@ async function serveStatic(req, res) {
     res.writeHead(200, {
       "Content-Type": type,
       "Content-Length": stat.size,
-      "Cache-Control": ext === ".html" ? "no-store" : "public, max-age=300",
+      "Cache-Control": cacheControl,
     });
     fs.createReadStream(filePath).pipe(res);
   } catch {
     sendJson(res, 404, { error: "Not found" });
   }
+}
+
+async function serveStatic(req, res) {
+  const reqPath = new URL(req.url, `http://${req.headers.host}`).pathname;
+
+  if (VENDOR_FILES[reqPath]) {
+    await serveFile(res, VENDOR_FILES[reqPath], "public, max-age=300");
+    return;
+  }
+
+  let target = reqPath === "/" ? "/index.html" : reqPath;
+  target = path.normalize(target).replace(/^(\.\.[/\\])+/, "");
+  const filePath = path.join(STATIC_DIR, target);
+  if (!filePath.startsWith(STATIC_DIR)) {
+    sendJson(res, 403, { error: "Forbidden" });
+    return;
+  }
+
+  await serveFile(
+    res,
+    filePath,
+    path.extname(filePath).toLowerCase() === ".html" ? "no-store" : "public, max-age=300"
+  );
 }
 
 async function handleApi(req, res) {
@@ -236,6 +188,7 @@ async function handleApi(req, res) {
       ok: true,
       tmuxTarget: TMUX_TARGET,
       authEnabled: Boolean(AUTH_TOKEN),
+      transport: "websocket",
     });
     return;
   }
@@ -288,119 +241,92 @@ async function handleApi(req, res) {
     return;
   }
 
-  if (pathname === "/api/input" && req.method === "POST") {
-    let body = {};
-    try {
-      body = await parseBody(req);
-    } catch (err) {
-      sendJson(res, 400, { error: err.message || "Invalid request" });
-      return;
-    }
-    const exists = await ensureSession();
-    if (!exists) {
-      sendJson(res, 409, { error: `tmux session "${TMUX_TARGET}" not found` });
-      return;
-    }
-    const result = await sendInput(body);
-    sendJson(res, result.ok ? 200 : 400, result);
-    return;
-  }
-
-  if (pathname === "/api/resize" && req.method === "POST") {
-    let body = {};
-    try {
-      body = await parseBody(req);
-    } catch (err) {
-      sendJson(res, 400, { error: err.message || "Invalid request" });
-      return;
-    }
-    const cols = Number(body.cols);
-    const rows = Number(body.rows);
-    if (!Number.isFinite(cols) || !Number.isFinite(rows)) {
-      sendJson(res, 400, { error: "cols and rows must be numbers" });
-      return;
-    }
-
-    const exists = await ensureSession();
-    if (!exists) {
-      sendJson(res, 409, { error: `tmux session "${TMUX_TARGET}" not found` });
-      return;
-    }
-    const r = await tmux([
-      "resize-pane",
-      "-t",
-      TMUX_TARGET,
-      "-x",
-      String(Math.max(40, Math.round(cols))),
-      "-y",
-      String(Math.max(10, Math.round(rows))),
-    ]);
-    if (r.code !== 0) {
-      sendJson(res, 400, { ok: false, error: r.stderr.trim() || "Resize failed" });
-      return;
-    }
-    sendJson(res, 200, { ok: true });
-    return;
-  }
-
-  if (pathname === "/api/stream" && req.method === "GET") {
-    const exists = await ensureSession();
-    if (!exists) {
-      sendJson(res, 409, { error: `tmux session "${TMUX_TARGET}" not found` });
-      return;
-    }
-
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-store",
-      Connection: "keep-alive",
-      "X-Accel-Buffering": "no",
-    });
-    res.write("\n");
-
-    let closed = false;
-    let lastScreen = "";
-    let inFlight = false;
-
-    const sendEvent = (event, data) => {
-      if (closed) return;
-      res.write(`event: ${event}\n`);
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
-    };
-
-    const tick = async () => {
-      if (closed || inFlight) return;
-      inFlight = true;
-      try {
-        const snap = await capturePane();
-        if (!snap.ok) {
-          sendEvent("error", { message: snap.error });
-          return;
-        }
-        if (snap.screen !== lastScreen) {
-          lastScreen = snap.screen;
-          sendEvent("screen", { screen: snap.screen, ts: Date.now() });
-        }
-      } finally {
-        inFlight = false;
-      }
-    };
-
-    await tick();
-    const interval = setInterval(tick, POLL_MS);
-    const keepAlive = setInterval(() => {
-      sendEvent("ping", { ts: Date.now() });
-    }, 10000);
-
-    req.on("close", () => {
-      closed = true;
-      clearInterval(interval);
-      clearInterval(keepAlive);
-    });
-    return;
-  }
-
   sendJson(res, 404, { error: "Not found" });
+}
+
+function replyUpgradeError(socket, statusCode, statusText, body) {
+  socket.write(
+    [
+      `HTTP/1.1 ${statusCode} ${statusText}`,
+      "Connection: close",
+      "Content-Type: text/plain; charset=utf-8",
+      `Content-Length: ${Buffer.byteLength(body)}`,
+      "",
+      body,
+    ].join("\r\n")
+  );
+  socket.destroy();
+}
+
+function clampDimension(value, fallback, min, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, Math.round(parsed)));
+}
+
+function attachTmuxClient(ws, req) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const cols = clampDimension(url.searchParams.get("cols"), 120, 40, 400);
+  const rows = clampDimension(url.searchParams.get("rows"), 32, 10, 200);
+
+  const ptyProcess = pty.spawn("tmux", ["attach-session", "-t", TMUX_TARGET], {
+    name: "xterm-256color",
+    cols,
+    rows,
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      TERM: "xterm-256color",
+    },
+  });
+
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    try {
+      ptyProcess.kill();
+    } catch {}
+  };
+
+  ptyProcess.onData((data) => {
+    if (ws.readyState !== ws.OPEN) return;
+    ws.send(JSON.stringify({ type: "output", data }));
+  });
+
+  ptyProcess.onExit(({ exitCode, signal }) => {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: "exit", exitCode, signal }));
+      ws.close();
+    }
+    close();
+  });
+
+  ws.on("message", (raw) => {
+    let payload;
+    try {
+      payload = JSON.parse(raw.toString("utf8"));
+    } catch {
+      return;
+    }
+    if (!payload || typeof payload !== "object") return;
+    if (payload.type === "input" && typeof payload.data === "string") {
+      ptyProcess.write(payload.data);
+      return;
+    }
+    if (payload.type === "resize") {
+      const nextCols = clampDimension(payload.cols, cols, 40, 400);
+      const nextRows = clampDimension(payload.rows, rows, 10, 200);
+      ptyProcess.resize(nextCols, nextRows);
+    }
+  });
+
+  ws.on("close", close);
+  ws.on("error", close);
+
+  ws.send(JSON.stringify({ type: "ready", cols, rows }));
 }
 
 const server = http.createServer(async (req, res) => {
@@ -417,6 +343,40 @@ const server = http.createServer(async (req, res) => {
   await serveStatic(req, res);
 });
 
+const wss = new WebSocketServer({ noServer: true });
+
+wss.on("connection", (ws, req) => {
+  attachTmuxClient(ws, req);
+});
+
+server.on("upgrade", async (req, socket, head) => {
+  if (!req.url) {
+    replyUpgradeError(socket, 400, "Bad Request", "Missing request URL.");
+    return;
+  }
+
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (url.pathname !== "/ws") {
+    replyUpgradeError(socket, 404, "Not Found", "Unknown websocket endpoint.");
+    return;
+  }
+
+  if (!isAuthed(req)) {
+    replyUpgradeError(socket, 401, "Unauthorized", "Authentication required.");
+    return;
+  }
+
+  const exists = await ensureSession();
+  if (!exists) {
+    replyUpgradeError(socket, 409, "Conflict", `tmux session "${TMUX_TARGET}" not found.`);
+    return;
+  }
+
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection", ws, req);
+  });
+});
+
 server.listen(PORT, HOST, () => {
   const auth = AUTH_TOKEN ? "enabled" : "disabled";
   process.stdout.write(
@@ -425,6 +385,7 @@ server.listen(PORT, HOST, () => {
       `tmux target: ${TMUX_TARGET}`,
       `auth: ${auth}`,
       `auto create session: ${AUTO_CREATE_SESSION ? "yes" : "no"}`,
+      "transport: xterm.js + websocket + node-pty",
     ].join("\n") + "\n"
   );
 });
