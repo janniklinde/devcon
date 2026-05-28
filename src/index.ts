@@ -167,6 +167,7 @@ const BUILT_IN_TOOLS: ToolMap = {
     image: DEFAULT_IMAGE_TAG,
     command: ['claude'],
     description: 'Runs Claude Code inside a container and mounts your workspace',
+    writablePaths: ['~/.config/claude', '~/.claude', '~/.claude.json'],
     autoBuild: DEFAULT_AUTO_BUILD,
   },
   opencode: {
@@ -249,6 +250,13 @@ function detectPathType(target: string): SensitivePath['type'] {
 function ensureWritablePath(target: string): SensitivePath['type'] {
   if (existsSync(target)) {
     return detectPathType(target);
+  }
+
+  const basename = path.basename(target);
+  if (path.extname(basename) !== '') {
+    mkdirSync(path.dirname(target), { recursive: true });
+    closeSync(openSync(target, 'a'));
+    return 'file';
   }
 
   mkdirSync(target, { recursive: true });
@@ -3401,12 +3409,6 @@ function buildDockerArgs(options: {
     initScriptLines.push(
       'if command -v codex >/dev/null 2>&1; then',
       `  codex mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`,
-      'fi',
-    );
-  } else if (options.toolName === 'claude') {
-    initScriptLines.push(
-      'if command -v claude >/dev/null 2>&1; then',
-      `  claude mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`,
       'fi',
     );
   }
