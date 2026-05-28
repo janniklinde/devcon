@@ -13,6 +13,7 @@ const TMUX_TARGET = process.env.TMUX_TARGET || "devcon";
 const AUTH_TOKEN = process.env.WEB_PASSWORD || process.env.AUTH_TOKEN || "";
 const AUTO_CREATE_SESSION = process.env.AUTO_CREATE_SESSION === "1";
 const STATIC_DIR = path.join(__dirname, "public");
+const TMUX_BIN = resolveTmuxBinary();
 
 const sessions = new Map();
 
@@ -39,6 +40,100 @@ const VENDOR_FILES = {
     "addon-fit.js"
   ),
 };
+
+function isExecutable(filePath) {
+  try {
+    fs.accessSync(filePath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveTmuxBinary() {
+  const pathValue = process.env.PATH || "";
+  for (const entry of pathValue.split(path.delimiter)) {
+    if (!entry) continue;
+    const candidate = path.join(entry, "tmux");
+    if (isExecutable(candidate)) {
+      return candidate;
+    }
+  }
+  return "tmux";
+}
+
+function resolveNodePtySpawnHelperPath() {
+  if (process.platform !== "darwin") {
+    return "";
+  }
+
+  try {
+    const nodePtyPackageJson = require.resolve("node-pty/package.json");
+    return path.join(
+      path.dirname(nodePtyPackageJson),
+      "prebuilds",
+      `darwin-${process.arch}`,
+      "spawn-helper"
+    );
+  } catch {
+    return "";
+  }
+}
+
+function ensureNodePtyBackendReady() {
+  if (process.platform !== "darwin") {
+    return;
+  }
+
+  const helperPath = resolveNodePtySpawnHelperPath();
+  if (!helperPath || !fs.existsSync(helperPath)) {
+    return;
+  }
+
+  if (isExecutable(helperPath)) {
+    return;
+  }
+
+  try {
+    fs.chmodSync(helperPath, 0o755);
+    process.stdout.write(
+      `Web mode note: repaired executable bit on node-pty helper at ${helperPath}\n`
+    );
+  } catch (err) {
+    const detail = err && err.message ? err.message : String(err);
+    throw new Error(
+      [
+        `node-pty helper is not executable: ${helperPath}`,
+        "",
+        "This breaks browser attach on macOS with errors like \"posix_spawnp failed\".",
+        "Repair it with:",
+        `  chmod +x ${helperPath}`,
+        "  npm rebuild node-pty",
+        "",
+        `Details: ${detail}`,
+      ].join("\n")
+    );
+  }
+}
+
+function formatAttachError(err) {
+  const detail = err && err.message ? err.message : String(err);
+  const lines = [`Failed to attach browser terminal to tmux: ${detail}`];
+
+  if (process.platform === "darwin") {
+    const helperPath = resolveNodePtySpawnHelperPath();
+    if (helperPath) {
+      lines.push("");
+      lines.push("macOS note: node-pty uses a spawn-helper binary.");
+      lines.push(`Check it here: ${helperPath}`);
+      lines.push("If needed, run:");
+      lines.push(`  chmod +x ${helperPath}`);
+      lines.push("  npm rebuild node-pty");
+    }
+  }
+
+  return lines.join("\n");
+}
 
 function sendJson(res, statusCode, payload) {
   const body = JSON.stringify(payload);
@@ -96,7 +191,7 @@ function parseBody(req, maxBytes = 1024 * 1024) {
 
 function tmux(args) {
   return new Promise((resolve) => {
-    const proc = spawn("tmux", args, { stdio: ["ignore", "pipe", "pipe"] });
+    const proc = spawn(TMUX_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
 
@@ -270,17 +365,27 @@ function attachTmuxClient(ws, req) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const cols = clampDimension(url.searchParams.get("cols"), 120, 40, 400);
   const rows = clampDimension(url.searchParams.get("rows"), 32, 10, 200);
-
-  const ptyProcess = pty.spawn("tmux", ["attach-session", "-t", TMUX_TARGET], {
-    name: "xterm-256color",
-    cols,
-    rows,
-    cwd: process.cwd(),
-    env: {
-      ...process.env,
-      TERM: "xterm-256color",
-    },
-  });
+  let ptyProcess;
+  try {
+    ptyProcess = pty.spawn(TMUX_BIN, ["attach-session", "-t", TMUX_TARGET], {
+      name: "xterm-256color",
+      cols,
+      rows,
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        TERM: "xterm-256color",
+      },
+    });
+  } catch (err) {
+    const message = formatAttachError(err);
+    process.stderr.write(`${message}\n`);
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: "error", message }));
+      ws.close();
+    }
+    return;
+  }
 
   let closed = false;
   const close = () => {
@@ -376,6 +481,13 @@ server.on("upgrade", async (req, socket, head) => {
     wss.emit("connection", ws, req);
   });
 });
+
+try {
+  ensureNodePtyBackendReady();
+} catch (err) {
+  process.stderr.write(`${err.message || String(err)}\n`);
+  process.exit(1);
+}
 
 server.listen(PORT, HOST, () => {
   const auth = AUTH_TOKEN ? "enabled" : "disabled";

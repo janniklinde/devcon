@@ -2461,7 +2461,26 @@ async function maybeEnableHostNetwork(
 function ensureTmuxAvailable(): void {
   const check = spawnSync('tmux', ['-V'], { stdio: 'ignore' });
   if (check.status !== 0) {
-    throw new Error('tmux is required for --web mode but was not found in PATH.');
+    const installHint = process.platform === 'darwin'
+      ? [
+        'tmux is required for --web mode but was not found in PATH.',
+        '',
+        'On macOS, install and verify it with:',
+        '  brew install tmux',
+        '  command -v tmux',
+        '  tmux -V',
+        '',
+        'If tmux is already installed, ensure your PATH includes your Homebrew bin directory.',
+        'Common locations: /opt/homebrew/bin (Apple Silicon) or /usr/local/bin (Intel).',
+      ].join('\n')
+      : [
+        'tmux is required for --web mode but was not found in PATH.',
+        '',
+        'Install it with your system package manager, then verify:',
+        '  command -v tmux',
+        '  tmux -V',
+      ].join('\n');
+    throw new Error(installHint);
   }
 }
 
