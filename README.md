@@ -11,6 +11,7 @@
 - Hide `.env*`, `.git-credentials`, and other critical Git metadata from the container by overlaying empty bind mounts before the container starts.
 - Detect when the default `devcon:latest` docker image is missing and (after a `y` confirmation) build it automatically from `docker/devcon/Dockerfile`.
 - Provide a simple tool registry (`codex`, `claude`, `opencode` by default) allowing you to define which Docker image and command should run for each agent.
+- Built-in `codex` launches with `--sandbox danger-full-access --ask-for-approval never` by default because Devcon already provides the outer container boundary.
 - Optional `--conscious` mode that boots a persistent local archive and wires memory tools into Codex, Claude, or OpenCode via MCP.
 
 ## Installation
@@ -133,6 +134,7 @@ Environment alternatives:
 Useful flags (place before `--` that separates devcon flags from tool args):
 
 - `--dry-run` – Print the assembled `docker run` invocation instead of executing it.
+- `--strict` – Use Docker's stricter default seccomp/AppArmor sandbox instead of Devcon's bwrap-friendly default.
 - `--home` / `--no-home` – Force-enable or force-disable home-directory sharing for this run.
 - `--image=NAME` – Override the docker image configured for the tool.
 - `--with-git` – Unmask `.git` and inject a sandboxed git identity (`devcon-bot <devcon@example.com>`) inside the container.
@@ -176,6 +178,9 @@ devcon codex -- --dry-run "my prompt"
 
 Container isolation notes:
 
+- By default, tool containers run with `seccomp=unconfined` and `apparmor=unconfined` so nested tools like `bubblewrap` can create user/mount namespaces.
+- `--strict` restores Docker's stricter default seccomp/AppArmor sandbox for a single run.
+- Bubblewrap still depends on the Docker host allowing unprivileged user namespaces (for example `kernel.unprivileged_userns_clone=1` on Linux hosts that gate it).
 - The tool container does not mount the persistent archive directly in conscious mode.
 - Persistent archive storage is mounted into the sidecar only (`~/.config/devcon/conscious` -> `/state`).
 - Conscious sidecar mode is not compatible with `--network-host`.
@@ -283,7 +288,7 @@ Devcon merges the built-in tools with an optional JSON file. Create `~/.config/d
 {
   "codex": {
     "image": "devcon:latest",
-    "command": ["codex"],
+    "command": ["codex", "--sandbox", "danger-full-access", "--ask-for-approval", "never"],
     "writablePaths": ["~/.codex"]
   },
   "claude": {

@@ -49,6 +49,7 @@ interface CliOptions {
   imageOverride?: string;
   mountPaths: string[];
   shareHome: boolean;
+  strictSandbox: boolean;
   helpRequested: boolean;
   allowGit: boolean;
   tempGit: boolean;
@@ -157,8 +158,8 @@ const DEFAULT_SKIP_SCAN_DIRS = [
 const BUILT_IN_TOOLS: ToolMap = {
   codex: {
     image: DEFAULT_IMAGE_TAG,
-    command: ['codex'],
-    description: 'Launches the Codex CLI inside a devcontainers base image',
+    command: ['codex', '--sandbox', 'danger-full-access', '--ask-for-approval', 'never'],
+    description: 'Launches the Codex CLI inside a devcontainers base image with full-access defaults',
     writablePaths: ['~/.codex'],
     autoBuild: DEFAULT_AUTO_BUILD,
   },
@@ -405,6 +406,7 @@ function parseArgs(argv: string[]): CliOptions {
   let dryRun = false;
   let imageOverride: string | undefined;
   let shareHome = SHARE_HOME_DEFAULT;
+  let strictSandbox = false;
   let allowGit = false;
   let tempGit = false;
   let exportPatchPath: string | undefined;
@@ -441,6 +443,11 @@ function parseArgs(argv: string[]): CliOptions {
 
     if (arg === '--dry-run') {
       dryRun = true;
+      continue;
+    }
+
+    if (arg === '--strict') {
+      strictSandbox = true;
       continue;
     }
 
@@ -652,6 +659,7 @@ function parseArgs(argv: string[]): CliOptions {
     imageOverride,
     mountPaths,
     shareHome,
+    strictSandbox,
     helpRequested,
     allowGit,
     tempGit,
@@ -3152,6 +3160,7 @@ function printHelp(tools: ToolMap): void {
   console.log('  devcon webhub --allow <path> [--allow <path> ...] [--host 0.0.0.0] [--port 7690] [--password <pass>]\n');
   console.log('Flags:');
   console.log('  --dry-run     Print the docker command without executing it');
+  console.log('  --strict      Use Docker\'s stricter default sandbox profile instead of the bwrap-friendly default');
   console.log('  --home        Share your host home directory with the container (disabled by default)');
   console.log('  --no-home     Do not share your host home directory with the container');
   console.log('  --image=IMG   Override the docker image for this run');
@@ -3190,6 +3199,7 @@ function buildDockerArgs(options: {
   toolArgs: string[];
   extraMounts: ExtraMount[];
   shareHome: boolean;
+  strictSandbox: boolean;
   image: string;
   allowGit: boolean;
   tempGit: boolean;
@@ -3208,6 +3218,15 @@ function buildDockerArgs(options: {
 
   if (typeof process.getuid === 'function' && typeof process.getgid === 'function') {
     dockerArgs.push('-u', `${process.getuid()}:${process.getgid()}`);
+  }
+
+  if (!options.strictSandbox) {
+    // Relax Docker's default seccomp/AppArmor profiles so unprivileged user namespaces
+    // and the mount namespace setup used by bubblewrap can succeed in the tool container.
+    dockerArgs.push('--security-opt', 'seccomp=unconfined');
+    dockerArgs.push('--security-opt', 'apparmor=unconfined');
+    console.log('Bwrap-compatible sandbox enabled: Docker seccomp/AppArmor restrictions relaxed for this container.');
+    console.log('Host note: bubblewrap still requires unprivileged user namespaces to be enabled on the Docker host.');
   }
 
   if (options.networkHost) {
@@ -3588,6 +3607,7 @@ async function main(): Promise<void> {
       toolArgs: options.toolArgs,
       extraMounts,
       shareHome: options.shareHome,
+      strictSandbox: options.strictSandbox,
       image,
       allowGit: options.allowGit,
       tempGit: options.tempGit,
@@ -3676,6 +3696,7 @@ async function main(): Promise<void> {
     toolArgs: options.toolArgs,
     extraMounts,
     shareHome: options.shareHome && tool.shareHome !== false,
+    strictSandbox: options.strictSandbox,
     image,
     allowGit: options.allowGit,
     tempGit: options.tempGit,
