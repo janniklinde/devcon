@@ -209,7 +209,7 @@ Write flow constraints:
 - `archive_bootstrap` can satisfy that same session bootstrap requirement.
 - `archive_write` now requires both `overview_token` and `path_id`.
 - `archive_update` requires `overview_token` and `id`.
-- Tokens are short-lived and tied to taxonomy version; if stale, call `archive_overview` again.
+- Tokens stay valid for the current MCP session until a newer overview replaces them or the taxonomy changes; if stale, call `archive_overview` again.
 - For durable user preferences, write entries under `/user/preferences` with label `user-preference`.
 - Storage is already scoped to the current conscious project. Avoid redundant folders like `engineering/<project-name>`.
 - Internally, `archive-db.json` is a hot index and full per-finding details are stored in `records/*.json`.

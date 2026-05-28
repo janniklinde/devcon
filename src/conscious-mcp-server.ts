@@ -43,8 +43,6 @@ const SUPPORTED_PROTOCOL_VERSIONS = [
   '2024-11-05',
 ];
 
-const OVERVIEW_TOKEN_TTL_MS = 10 * 60 * 1000;
-
 function parseArgs(argv: string[]): RuntimeConfig {
   let stateDir = process.env.DEVCON_CONSCIOUS_STATE_DIR;
   let defaultRepo = process.env.DEVCON_CONSCIOUS_REPO;
@@ -217,7 +215,6 @@ class StdioJsonRpcServer {
   private activeOverviewToken?: {
     token: string;
     taxonomyVersion: number;
-    issuedAt: number;
   };
 
   private memoryReadCount = 0;
@@ -1134,22 +1131,17 @@ class StdioJsonRpcServer {
     this.activeOverviewToken = {
       token,
       taxonomyVersion,
-      issuedAt: Date.now(),
     };
     return token;
   }
 
-  private validateOverviewToken(token: string): { token: string; taxonomyVersion: number; issuedAt: number } {
+  private validateOverviewToken(token: string): { token: string; taxonomyVersion: number } {
     if (!this.activeOverviewToken) {
       throw new Error('Call archive_bootstrap or archive_overview before archive_write or archive_create_path.');
     }
 
     if (this.activeOverviewToken.token !== token) {
       throw new Error('Stale overview_token. Call archive_overview again.');
-    }
-
-    if ((Date.now() - this.activeOverviewToken.issuedAt) > OVERVIEW_TOKEN_TTL_MS) {
-      throw new Error('overview_token expired. Call archive_overview again.');
     }
 
     const currentTaxonomyVersion = this.archive.getTaxonomyVersion();
