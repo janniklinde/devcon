@@ -8,6 +8,12 @@ const pasteBtnEl = document.getElementById("paste-btn");
 const ctrlcBtnEl = document.getElementById("ctrlc-btn");
 const clearBtnEl = document.getElementById("clear-btn");
 const reconnectBtnEl = document.getElementById("reconnect-btn");
+const scrollUpBtnEl = document.getElementById("scroll-up-btn");
+const scrollDownBtnEl = document.getElementById("scroll-down-btn");
+const arrowUpBtnEl = document.getElementById("arrow-up-btn");
+const arrowDownBtnEl = document.getElementById("arrow-down-btn");
+const arrowLeftBtnEl = document.getElementById("arrow-left-btn");
+const arrowRightBtnEl = document.getElementById("arrow-right-btn");
 
 let autoLoginAttempted = false;
 let socket = null;
@@ -24,7 +30,7 @@ const terminal = new Terminal({
   cursorBlink: true,
   convertEol: false,
   fontFamily: "Iosevka Web, JetBrains Mono, Menlo, monospace",
-  fontSize: 13,
+  fontSize: 10,
   lineHeight: 1.18,
   scrollback: 5000,
   fastScrollModifier: "alt",
@@ -90,6 +96,16 @@ function showTerminal() {
 function showAuth() {
   terminalWrapEl.classList.add("hidden");
   authCardEl.classList.remove("hidden");
+}
+
+function sendInputData(data) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  socket.send(JSON.stringify({ type: "input", data }));
+  return true;
+}
+
+function getTerminalViewport() {
+  return terminalHostEl.querySelector(".xterm-viewport");
 }
 
 async function login() {
@@ -182,15 +198,96 @@ function scheduleReconnect() {
 }
 
 function installTerminalScrollIsolation() {
-  const viewport = terminalHostEl.querySelector(".xterm-viewport");
-  if (!viewport) return;
+  const terminalRoot = terminal.element || terminalHostEl;
+  const viewport = getTerminalViewport();
+  if (!terminalRoot || !viewport) return;
+  let lastTouchY = null;
+  let activeTouchId = null;
+  let touchScrollRemainder = 0;
 
   const stopBubble = (event) => {
     event.stopPropagation();
   };
 
+  const resolveTrackedTouch = (touchList) => {
+    if (activeTouchId === null) return null;
+    for (let i = 0; i < touchList.length; i += 1) {
+      const touch = touchList[i];
+      if (touch.identifier === activeTouchId) {
+        return touch;
+      }
+    }
+    return null;
+  };
+
   viewport.addEventListener("wheel", stopBubble, { passive: true });
-  viewport.addEventListener("touchmove", stopBubble, { passive: true });
+  terminalRoot.addEventListener("touchstart", (event) => {
+    if (event.touches.length !== 1) {
+      activeTouchId = null;
+      lastTouchY = null;
+      return;
+    }
+    activeTouchId = event.touches[0].identifier;
+    lastTouchY = event.touches[0].pageY;
+    event.stopPropagation();
+  }, { passive: true, capture: true });
+  terminalRoot.addEventListener("touchmove", (event) => {
+    const touch = resolveTrackedTouch(event.touches);
+    if (!touch || lastTouchY === null) {
+      activeTouchId = null;
+      lastTouchY = null;
+      return;
+    }
+
+    const nextTouchY = touch.pageY;
+    const deltaY = lastTouchY - nextTouchY;
+    lastTouchY = nextTouchY;
+
+    if (deltaY === 0) {
+      event.stopPropagation();
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    const lineHeight = terminal.rows > 0 ? viewport.clientHeight / terminal.rows : 0;
+    if (lineHeight > 0) {
+      touchScrollRemainder += deltaY;
+      const lineDelta = touchScrollRemainder > 0
+        ? Math.floor(touchScrollRemainder / lineHeight)
+        : Math.ceil(touchScrollRemainder / lineHeight);
+      if (lineDelta !== 0) {
+        terminal.scrollLines(lineDelta);
+        touchScrollRemainder -= lineDelta * lineHeight;
+      }
+    } else {
+      viewport.scrollTop += deltaY;
+    }
+  }, { passive: false, capture: true });
+  terminalRoot.addEventListener("touchend", (event) => {
+    if (resolveTrackedTouch(event.changedTouches)) {
+      activeTouchId = null;
+      lastTouchY = null;
+      touchScrollRemainder = 0;
+    }
+  }, { passive: true, capture: true });
+  terminalRoot.addEventListener("touchcancel", (event) => {
+    if (resolveTrackedTouch(event.changedTouches)) {
+      activeTouchId = null;
+      lastTouchY = null;
+      touchScrollRemainder = 0;
+    }
+  }, { passive: true, capture: true });
+  terminalRoot.addEventListener("touchend", () => {
+    if (activeTouchId !== null) return;
+    lastTouchY = null;
+    touchScrollRemainder = 0;
+  }, { passive: true });
+  terminalRoot.addEventListener("touchcancel", () => {
+    if (activeTouchId !== null) return;
+    lastTouchY = null;
+    touchScrollRemainder = 0;
+  }, { passive: true });
 
   if (typeof terminal.attachCustomWheelEventHandler === "function") {
     terminal.attachCustomWheelEventHandler(() => true);
@@ -258,8 +355,7 @@ function ensureTerminalMounted() {
   terminal.open(terminalHostEl);
   installTerminalScrollIsolation();
   terminal.onData((data) => {
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    socket.send(JSON.stringify({ type: "input", data }));
+    sendInputData(data);
   });
   resizeObserver = new ResizeObserver(() => {
     scheduleFit();
@@ -268,6 +364,75 @@ function ensureTerminalMounted() {
   window.addEventListener("resize", scheduleFit);
   terminalReady = true;
   scheduleFit();
+}
+
+async function scrollTerminalPage(direction) {
+  const action = direction > 0 ? "page-down" : "page-up";
+  try {
+    await api("/api/tmux-action", "POST", { action });
+  } catch (err) {
+    setStatus(err.message || "Scroll failed", true);
+  }
+  terminal.focus();
+}
+
+function sendArrowKey(sequence) {
+  if (!sendInputData(sequence)) return;
+  terminal.focus();
+}
+
+function bindRepeatButton(button, action) {
+  if (!button) return;
+
+  let repeatTimer = null;
+  let repeatInterval = null;
+  let lastInvokeAt = 0;
+
+  const clearRepeat = () => {
+    if (repeatTimer) {
+      clearTimeout(repeatTimer);
+      repeatTimer = null;
+    }
+    if (repeatInterval) {
+      clearInterval(repeatInterval);
+      repeatInterval = null;
+    }
+  };
+
+  const invokeAction = () => {
+    lastInvokeAt = Date.now();
+    action();
+  };
+
+  const startRepeat = (event) => {
+    event.preventDefault();
+    invokeAction();
+    clearRepeat();
+    repeatTimer = setTimeout(() => {
+      repeatInterval = setInterval(invokeAction, 80);
+    }, 320);
+  };
+
+  const supportsPointer = "PointerEvent" in window;
+  if (supportsPointer) {
+    button.addEventListener("pointerdown", startRepeat);
+    button.addEventListener("pointerup", clearRepeat);
+    button.addEventListener("pointercancel", clearRepeat);
+    button.addEventListener("pointerleave", clearRepeat);
+  } else {
+    button.addEventListener("touchstart", startRepeat, { passive: false });
+    button.addEventListener("touchend", clearRepeat);
+    button.addEventListener("touchcancel", clearRepeat);
+    button.addEventListener("mousedown", startRepeat);
+    button.addEventListener("mouseup", clearRepeat);
+    button.addEventListener("mouseleave", clearRepeat);
+  }
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    if (Date.now() - lastInvokeAt > 250) {
+      invokeAction();
+    }
+  });
 }
 
 async function bootstrap() {
@@ -317,8 +482,8 @@ passwordInputEl.addEventListener("keydown", async (ev) => {
 pasteBtnEl.addEventListener("click", async () => {
   try {
     const text = await navigator.clipboard.readText();
-    if (!text || !socket || socket.readyState !== WebSocket.OPEN) return;
-    socket.send(JSON.stringify({ type: "input", data: text }));
+    if (!text) return;
+    if (!sendInputData(text)) return;
     terminal.focus();
   } catch (err) {
     setStatus(`Paste error: ${err.message}`, true);
@@ -326,8 +491,7 @@ pasteBtnEl.addEventListener("click", async () => {
 });
 
 ctrlcBtnEl.addEventListener("click", () => {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  socket.send(JSON.stringify({ type: "input", data: "\u0003" }));
+  if (!sendInputData("\u0003")) return;
   terminal.focus();
 });
 
@@ -338,6 +502,30 @@ clearBtnEl.addEventListener("click", () => {
 
 reconnectBtnEl.addEventListener("click", () => {
   connectTerminal(true);
+});
+
+bindRepeatButton(scrollUpBtnEl, () => {
+  void scrollTerminalPage(-1);
+});
+
+bindRepeatButton(scrollDownBtnEl, () => {
+  void scrollTerminalPage(1);
+});
+
+bindRepeatButton(arrowUpBtnEl, () => {
+  sendArrowKey("\u001b[A");
+});
+
+bindRepeatButton(arrowDownBtnEl, () => {
+  sendArrowKey("\u001b[B");
+});
+
+bindRepeatButton(arrowLeftBtnEl, () => {
+  sendArrowKey("\u001b[D");
+});
+
+bindRepeatButton(arrowRightBtnEl, () => {
+  sendArrowKey("\u001b[C");
 });
 
 window.addEventListener("beforeunload", () => {

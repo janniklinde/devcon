@@ -37,8 +37,18 @@
           <button id="ctrlc-btn" title="Send Ctrl+C">^C</button>
           <button id="clear-btn" title="Clear visible terminal">Clear</button>
           <button id="reconnect-btn" title="Reconnect websocket">Retry</button>
+          <button id="arrow-up-btn" class="mobile-arrow hidden-desktop" title="Arrow up">Up</button>
+          <button id="arrow-down-btn" class="mobile-arrow hidden-desktop" title="Arrow down">Dn</button>
+          <button id="arrow-left-btn" class="mobile-arrow hidden-desktop" title="Arrow left">Lt</button>
+          <button id="arrow-right-btn" class="mobile-arrow hidden-desktop" title="Arrow right">Rt</button>
         </div>
-        <div id="terminal" class="terminal"></div>
+        <div class="terminal-shell">
+          <div id="terminal" class="terminal"></div>
+          <aside class="mobile-rail" aria-label="Mobile terminal controls">
+            <button id="scroll-up-btn" class="mobile-btn" title="Scroll up">˄</button>
+            <button id="scroll-down-btn" class="mobile-btn" title="Scroll down">˅</button>
+          </aside>
+        </div>
       </section>
     </main>
 

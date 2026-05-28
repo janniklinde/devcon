@@ -237,6 +237,33 @@ async function ensureSession() {
   return true;
 }
 
+async function runTmuxScrollAction(action) {
+  if (action === "page-up") {
+    const enter = await tmux(["copy-mode", "-e", "-t", TMUX_TARGET]);
+    if (enter.code !== 0) {
+      return { ok: false, error: enter.stderr.trim() || 'failed to enter tmux copy mode' };
+    }
+    const page = await tmux(["send-keys", "-t", TMUX_TARGET, "-X", "page-up"]);
+    if (page.code !== 0) {
+      return { ok: false, error: page.stderr.trim() || 'failed to scroll tmux page up' };
+    }
+    return { ok: true, mode: "copy-mode", action };
+  }
+
+  if (action === "page-down") {
+    const page = await tmux(["send-keys", "-t", TMUX_TARGET, "-X", "page-down"]);
+    if (page.code === 0) {
+      return { ok: true, mode: "copy-mode", action };
+    }
+    if ((page.stderr || "").includes("not in a mode")) {
+      return { ok: true, mode: "live", action };
+    }
+    return { ok: false, error: page.stderr.trim() || 'failed to scroll tmux page down' };
+  }
+
+  return { ok: false, error: `unsupported tmux action "${action}"` };
+}
+
 function getSessionId(req) {
   const cookies = parseCookies(req);
   if (cookies.sid && sessions.has(cookies.sid)) return cookies.sid;
@@ -354,6 +381,31 @@ async function handleApi(req, res) {
         ? "Session available"
         : `tmux session "${TMUX_TARGET}" not found`,
     });
+    return;
+  }
+
+  if (pathname === "/api/tmux-action" && req.method === "POST") {
+    const exists = await ensureSession();
+    if (!exists) {
+      sendJson(res, 409, { error: `tmux session "${TMUX_TARGET}" not found` });
+      return;
+    }
+
+    let body = {};
+    try {
+      body = await parseBody(req);
+    } catch (err) {
+      sendJson(res, 400, { error: err.message || "Invalid request" });
+      return;
+    }
+
+    const action = typeof body.action === "string" ? body.action : "";
+    const result = await runTmuxScrollAction(action);
+    if (!result.ok) {
+      sendJson(res, 400, { error: result.error || "tmux action failed" });
+      return;
+    }
+    sendJson(res, 200, result);
     return;
   }
 
