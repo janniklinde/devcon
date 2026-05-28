@@ -16,6 +16,7 @@ let eventSource = null;
 let ctrlLatch = false;
 let textBuffer = "";
 let textFlushTimer = null;
+let autoLoginAttempted = false;
 
 function setStatus(text, warn = false) {
   statusEl.textContent = text;
@@ -89,6 +90,35 @@ async function login() {
   passwordInputEl.value = "";
 }
 
+function readPasswordFromUrl() {
+  const url = new URL(window.location.href);
+  const password = url.searchParams.get("pwd");
+  return password && password.length > 0 ? password : "";
+}
+
+function clearPasswordFromUrl() {
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has("pwd")) return;
+  url.searchParams.delete("pwd");
+  const nextUrl = `${url.pathname}${url.search}${url.hash}`;
+  window.history.replaceState({}, "", nextUrl);
+}
+
+async function maybeAutoLoginFromUrl() {
+  if (autoLoginAttempted) return false;
+  autoLoginAttempted = true;
+  const password = readPasswordFromUrl();
+  if (!password) return false;
+  try {
+    await api("/api/login", "POST", { password });
+    clearPasswordFromUrl();
+    return true;
+  } catch (err) {
+    setStatus(err.message || "Login failed", true);
+    return false;
+  }
+}
+
 function closeStream() {
   if (eventSource) {
     eventSource.close();
@@ -119,6 +149,11 @@ async function bootstrap() {
     setStatus(`Connected to tmux target "${info.tmuxTarget}"`);
   } catch (err) {
     if (String(err.message || "").includes("Not authenticated")) {
+      const loggedIn = await maybeAutoLoginFromUrl();
+      if (loggedIn) {
+        await bootstrap();
+        return;
+      }
       showAuth();
       setStatus("Authentication required", true);
       return;
@@ -288,4 +323,3 @@ window.addEventListener("beforeunload", () => {
 });
 
 bootstrap();
-

@@ -95,6 +95,7 @@ Notes:
 
 - `--web` requires `tmux` on the host.
 - If no password is provided (`--web-password` or `WEB_PASSWORD`), devcon generates one-time credentials and prints them.
+- When binding to `0.0.0.0` or `::`, the printed local-network URLs include `?pwd=...` so opening the link on another device logs in automatically once and then removes the password from the address bar.
 - By default devcon auto-generates a tmux session name. Override via `--web-session NAME`.
 - The container keeps running in tmux until it exits or you stop it (`tmux kill-session -t <name>`).
 

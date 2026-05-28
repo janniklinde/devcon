@@ -2595,6 +2595,12 @@ function resolveWebPassword(options: CliOptions): { password: string; generated:
   return { password: randomBytes(9).toString('base64url'), generated: true };
 }
 
+function buildWebPasswordUrl(baseUrl: string, password: string): string {
+  const url = new URL(baseUrl);
+  url.searchParams.set('pwd', password);
+  return url.toString();
+}
+
 async function launchWebModeSession(
   options: CliOptions,
   cwd: string,
@@ -2661,7 +2667,7 @@ async function launchWebModeSession(
     if (localIps.length > 0) {
       console.log('Local network URLs:');
       for (const ip of localIps) {
-        console.log(`  http://${ip}:${port}`);
+        console.log(`  ${buildWebPasswordUrl(`http://${ip}:${port}`, passwordInfo.password)}`);
       }
     } else {
       console.log('Local network URL: unable to detect a non-loopback IPv4 address.');
