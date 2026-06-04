@@ -118,6 +118,9 @@ const HOME_READONLY_DEFAULT = parseBooleanEnv(process.env.DEVCON_HOME_READONLY);
 const SHARE_HOME_DEFAULT = parseBooleanEnv(process.env.DEVCON_SHARE_HOME);
 const DEFAULT_IMAGE_TAG = 'devcon:latest';
 const DEFAULT_IMAGE_DOCKERFILE = path.resolve(__dirname, '..', 'docker', 'devcon', 'Dockerfile');
+const DEVCON_PACKAGE_ROOT = path.resolve(__dirname, '..');
+const DEVCON_REPO_URL = process.env.DEVCON_UPGRADE_REPO || 'https://github.com/janniklinde/devcon.git';
+const DEVCON_UPGRADE_DEFAULT_BRANCH = 'main';
 const NETWORK_CHECK_HOST = 'api.openai.com';
 const NETWORK_PROBE_TIMEOUT_MS = parsePositiveIntEnv(process.env.DEVCON_NETWORK_PROBE_TIMEOUT_MS, 2500);
 const WEB_DEFAULT_HOST = '0.0.0.0';
@@ -3163,6 +3166,201 @@ async function handleRebuildCommand(
   }
 }
 
+interface UpgradeOptions {
+  branch: string;
+}
+
+function parseUpgradeArgs(args: string[]): UpgradeOptions {
+  let branch = DEVCON_UPGRADE_DEFAULT_BRANCH;
+
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg.startsWith('--branch=')) {
+      branch = arg.substring('--branch='.length);
+      continue;
+    }
+
+    if (arg === '--branch') {
+      const next = args[i + 1];
+      if (!next) {
+        throw new Error('--branch flag requires an argument, e.g. devcon upgrade --branch main');
+      }
+      branch = next;
+      i += 1;
+      continue;
+    }
+
+    throw new Error(`Unknown upgrade argument "${arg}". Use "devcon upgrade [--branch main]".`);
+  }
+
+  validateUpgradeBranch(branch);
+  return { branch };
+}
+
+function validateUpgradeBranch(branch: string): void {
+  if (!branch || branch.startsWith('-') || branch.includes('..') || branch.endsWith('/')) {
+    throw new Error(`Invalid branch name "${branch}".`);
+  }
+  if (!/^[A-Za-z0-9._/-]+$/.test(branch)) {
+    throw new Error(`Invalid branch name "${branch}". Use a plain Git branch name like "main" or "release/stable".`);
+  }
+}
+
+function ensureCommandAvailable(command: string, args: string[], installHint: string): void {
+  const result = spawnSync(command, args, { stdio: 'ignore' });
+  if (result.error || result.status !== 0) {
+    throw new Error(`${command} is required for devcon upgrade. ${installHint}`);
+  }
+}
+
+function readPackageName(packageRoot: string): string | undefined {
+  try {
+    const packageJsonPath = path.join(packageRoot, 'package.json');
+    const raw = readFileSync(packageJsonPath, 'utf8');
+    const parsed = JSON.parse(raw) as { name?: unknown };
+    return typeof parsed.name === 'string' ? parsed.name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function assertDevconPackageRoot(packageRoot: string): void {
+  if (path.resolve(packageRoot) === path.parse(packageRoot).root) {
+    throw new Error(`Refusing to upgrade unsafe package root "${packageRoot}".`);
+  }
+
+  const packageName = readPackageName(packageRoot);
+  if (packageName !== 'devcon') {
+    throw new Error(`Refusing to upgrade "${packageRoot}" because it does not look like the devcon package.`);
+  }
+}
+
+function isGitCheckout(packageRoot: string): boolean {
+  const result = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], {
+    cwd: packageRoot,
+    encoding: 'utf8',
+  });
+  return !result.error && result.status === 0 && result.stdout.trim() === 'true';
+}
+
+function ensureCleanGitCheckout(packageRoot: string): void {
+  const status = spawnSync('git', ['status', '--porcelain'], {
+    cwd: packageRoot,
+    encoding: 'utf8',
+  });
+  if (status.error || status.status !== 0) {
+    throw new Error('Unable to inspect the current Git checkout before upgrade.');
+  }
+  if (status.stdout.trim().length > 0) {
+    throw new Error('Current devcon checkout has uncommitted changes. Commit or stash them before running devcon upgrade.');
+  }
+}
+
+function hasLocalGitBranch(packageRoot: string, branch: string): boolean {
+  const result = spawnSync('git', ['rev-parse', '--verify', branch], {
+    cwd: packageRoot,
+    stdio: 'ignore',
+  });
+  return !result.error && result.status === 0;
+}
+
+async function checkoutUpgradeBranch(packageRoot: string, branch: string): Promise<void> {
+  if (hasLocalGitBranch(packageRoot, branch)) {
+    await runCommand('git', ['checkout', branch], { cwd: packageRoot });
+    return;
+  }
+  await runCommand('git', ['checkout', '-b', branch, 'FETCH_HEAD'], { cwd: packageRoot });
+}
+
+function replacePackageContents(sourceRoot: string, targetRoot: string, options: { preserveGit?: boolean } = {}): void {
+  assertDevconPackageRoot(sourceRoot);
+  assertDevconPackageRoot(targetRoot);
+
+  for (const entry of readdirSync(targetRoot, { withFileTypes: true })) {
+    if (options.preserveGit && entry.name === '.git') {
+      continue;
+    }
+    rmSync(path.join(targetRoot, entry.name), { recursive: true, force: true });
+  }
+
+  for (const entry of readdirSync(sourceRoot, { withFileTypes: true })) {
+    if (entry.name === '.git') {
+      continue;
+    }
+    cpSync(path.join(sourceRoot, entry.name), path.join(targetRoot, entry.name), {
+      recursive: true,
+      force: true,
+    });
+  }
+}
+
+async function runReadmeBuildCommands(packageRoot: string, options: { globalInstall: boolean }): Promise<void> {
+  await runCommand('npm', ['install'], { cwd: packageRoot });
+  await runCommand('npm', ['run', 'build'], { cwd: packageRoot });
+  if (options.globalInstall) {
+    await runCommand('npm', ['install', '-g', '.'], { cwd: packageRoot });
+  }
+}
+
+async function rebuildUpgradedContainers(packageRoot: string): Promise<void> {
+  const cliPath = path.join(packageRoot, 'dist', 'index.js');
+  await runCommand(process.execPath, [cliPath, 'rebuild']);
+}
+
+async function handleUpgradeCommand(args: string[], dryRun: boolean): Promise<void> {
+  const options = parseUpgradeArgs(args);
+  const packageRoot = DEVCON_PACKAGE_ROOT;
+  assertDevconPackageRoot(packageRoot);
+
+  console.log(`Upgrading devcon from ${DEVCON_REPO_URL} branch "${options.branch}".`);
+  console.log(`Current package root: ${packageRoot}`);
+
+  if (dryRun) {
+    const mode = isGitCheckout(packageRoot) ? 'git pull --ff-only' : 'temporary clone and in-place replacement';
+    console.log(`[dry-run] Would upgrade using ${mode}.`);
+    console.log('[dry-run] Would run: npm install');
+    console.log('[dry-run] Would run: npm run build');
+    console.log('[dry-run] Would run: npm install -g .');
+    console.log('[dry-run] Would run: devcon rebuild');
+    return;
+  }
+
+  ensureCommandAvailable('git', ['version'], 'Please install Git and try again.');
+  ensureCommandAvailable('npm', ['--version'], 'Please install npm and try again.');
+  ensureDockerAvailable();
+
+  if (isGitCheckout(packageRoot)) {
+    ensureCleanGitCheckout(packageRoot);
+    await runCommand('git', ['fetch', 'origin', options.branch], { cwd: packageRoot });
+    await checkoutUpgradeBranch(packageRoot, options.branch);
+    await runCommand('git', ['pull', '--ff-only', 'origin', options.branch], { cwd: packageRoot });
+    await runReadmeBuildCommands(packageRoot, { globalInstall: true });
+    await rebuildUpgradedContainers(packageRoot);
+    return;
+  }
+
+  const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'devcon-upgrade-'));
+  const cloneRoot = path.join(tempRoot, 'repo');
+  try {
+    await runCommand('git', [
+      'clone',
+      '--depth',
+      '1',
+      '--branch',
+      options.branch,
+      DEVCON_REPO_URL,
+      cloneRoot,
+    ]);
+    await runReadmeBuildCommands(cloneRoot, { globalInstall: false });
+    console.log('Replacing current devcon package with upgraded build...');
+    replacePackageContents(cloneRoot, packageRoot);
+    await runCommand('npm', ['install', '-g', '.'], { cwd: packageRoot });
+    await rebuildUpgradedContainers(packageRoot);
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+}
+
 async function ensureImageAvailable(image: string, autoBuild?: AutoBuildConfig): Promise<void> {
   const inspect = spawnSync('docker', ['image', 'inspect', image], { stdio: 'ignore' });
   if (inspect.status === 0) {
@@ -3193,6 +3391,7 @@ async function ensureImageAvailable(image: string, autoBuild?: AutoBuildConfig):
 function printHelp(tools: ToolMap): void {
   console.log('Usage:');
   console.log('  devcon <tool> [-- tool args]');
+  console.log('  devcon upgrade [--branch main]');
   console.log('  devcon update [tool ...]');
   console.log('  devcon rebuild [tool ...]');
   console.log('  devcon sensitive <list|add|remove> [pattern]');
@@ -3220,6 +3419,7 @@ function printHelp(tools: ToolMap): void {
   console.log('  --conscious-path PATH Override where conscious state is stored (default: ~/.config/devcon/conscious)');
   console.log('  --help        Show this message');
   console.log('\nCommands:');
+  console.log('  upgrade       Pull and install the latest devcon repo, then rebuild bundled containers');
   console.log('  update        Refresh Docker images for one or more tools (pull base, rerun npm install)');
   console.log('  rebuild       Fully rebuild Docker images for one or more tools (no cache)');
   console.log('  sensitive     List/add/remove sensitive-path patterns that get masked in containers');
@@ -3522,6 +3722,21 @@ async function main(): Promise<void> {
     console.error('No tool specified.');
     printHelp(tools);
     process.exitCode = 1;
+    return;
+  }
+
+  if (options.toolName === 'upgrade') {
+    if (options.webMode) {
+      throw new Error('The --web flag cannot be used with "devcon upgrade".');
+    }
+    if (options.imageOverride) {
+      throw new Error('The --image flag cannot be used with "devcon upgrade".');
+    }
+    if (options.allowGit || options.tempGit || options.forceIpv4 || options.networkHost || options.conscious) {
+      throw new Error('Container runtime flags are not supported with "devcon upgrade".');
+    }
+    assertNoExtraMounts(options.mountPaths, 'upgrade');
+    await handleUpgradeCommand(options.toolArgs, options.dryRun);
     return;
   }
 

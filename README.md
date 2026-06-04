@@ -26,12 +26,23 @@ npm run build
 npm install -g .
 ```
 
+To upgrade an existing Devcon install from the upstream repo and rebuild the bundled containers:
+
+```bash
+devcon upgrade
+devcon upgrade --branch main
+```
+
+`devcon upgrade` defaults to the `main` branch. It runs the same local build/install commands shown above, then runs `devcon rebuild` so the bundled Docker image is rebuilt from the upgraded Dockerfile and package contents. You only need `sudo` if your npm global install location or Devcon package directory is owned by root; a user-writable npm prefix does not require it.
+
 ## Usage
 
 ```bash
 devcon <tool> [flags] [-- tool arguments]
 
 # Rebuild the default tool images (all tools or a specific one)
+devcon upgrade
+devcon upgrade --branch main
 devcon update
 devcon update codex
 devcon rebuild         # full no-cache rebuild for all auto-build tools
@@ -255,9 +266,12 @@ The build context lives inside the npm package, so everything works even if you 
 To manually refresh the bundled image (for example to pick up new Codex CLI or OpenCode releases), run:
 
 ```bash
+devcon upgrade       # upgrade Devcon itself and then rebuild bundled images
 devcon update        # rebuilds every tool with an auto-build config
 devcon update codex  # limit the rebuild to a single tool/image
 ```
+
+`devcon upgrade [--branch main]` updates the Devcon package from the GitHub repo, runs `npm install`, `npm run build`, and `npm install -g .`, then runs `devcon rebuild`. In a Git checkout it uses `git pull --ff-only` and refuses to continue over uncommitted changes. In a packaged install without `.git`, it builds a temporary clone first, then replaces the installed package after the build succeeds.
 
 `devcon update` uses a cache-busting build argument to re-run the npm install layer without throwing away the whole Docker cache, so base layers stay hot while the bundled CLIs get refreshed.
 
