@@ -121,6 +121,7 @@ const DEFAULT_IMAGE_DOCKERFILE = path.resolve(__dirname, '..', 'docker', 'devcon
 const DEVCON_PACKAGE_ROOT = path.resolve(__dirname, '..');
 const DEVCON_REPO_URL = process.env.DEVCON_UPGRADE_REPO || 'https://github.com/janniklinde/devcon.git';
 const DEVCON_UPGRADE_DEFAULT_BRANCH = 'main';
+const DEFAULT_DOCKER_REFRESH_STAGE = 'devcon-tools';
 const NETWORK_CHECK_HOST = 'api.openai.com';
 const NETWORK_PROBE_TIMEOUT_MS = parsePositiveIntEnv(process.env.DEVCON_NETWORK_PROBE_TIMEOUT_MS, 2500);
 const WEB_DEFAULT_HOST = '0.0.0.0';
@@ -3038,6 +3039,16 @@ function runCommand(
   });
 }
 
+function dockerSupportsNoCacheFilter(): boolean {
+  const result = spawnSync('docker', ['build', '--help'], {
+    encoding: 'utf8',
+  });
+  if (result.error || result.status !== 0) {
+    return false;
+  }
+  return `${result.stdout}\n${result.stderr}`.includes('--no-cache-filter');
+}
+
 async function runDockerBuild(
   spec: AutoBuildConfig,
   options: { refresh?: boolean; noCache?: boolean; pull?: boolean } = {},
@@ -3055,10 +3066,12 @@ async function runDockerBuild(
   }
 
   if (options.refresh) {
-    args.push(
-      '--build-arg',
-      `DEVCON_UPDATE_TOKEN=${Date.now()}`,
-    );
+    if (dockerSupportsNoCacheFilter()) {
+      args.push('--no-cache-filter', DEFAULT_DOCKER_REFRESH_STAGE);
+    } else {
+      console.warn('Docker does not support --no-cache-filter; falling back to a full no-cache image rebuild.');
+      args.push('--no-cache');
+    }
   }
 
   args.push('.');

@@ -273,7 +273,7 @@ devcon update codex  # limit the rebuild to a single tool/image
 
 `devcon upgrade [--branch main]` updates the Devcon package from the GitHub repo, runs `npm install`, `npm run build`, and `npm install -g .`, then runs `devcon rebuild`. In a Git checkout it uses `git pull --ff-only` and refuses to continue over uncommitted changes. In a packaged install without `.git`, it builds a temporary clone first, then replaces the installed package after the build succeeds.
 
-`devcon update` uses a cache-busting build argument to re-run the npm install layer without throwing away the whole Docker cache, so base layers stay hot while the bundled CLIs get refreshed.
+`devcon update` refreshes the Dockerfile stage that installs the bundled CLIs without throwing away the whole Docker cache, so base layers stay hot while Codex CLI, Claude Code, and OpenCode get refreshed. On older Docker versions without stage-level cache filtering, it falls back to a full no-cache rebuild.
 
 When you need a clean slate (ignore every cached layer), use:
 

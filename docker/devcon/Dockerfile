@@ -1,4 +1,4 @@
-FROM node:20-bookworm
+FROM node:20-bookworm AS devcon-base
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=en_US.UTF-8 \
@@ -12,10 +12,10 @@ RUN apt-get update \
     && python3 -m pip install --break-system-packages --no-cache-dir numpy scikit-learn pandas pyarrow catboost optuna polars \
     && rm -rf /var/lib/apt/lists/*
 
-ARG DEVCON_UPDATE_TOKEN=0
+FROM devcon-base AS devcon-tools
+
 RUN npm install -g @openai/codex@latest @anthropic-ai/claude-code@latest opencode-ai@latest \
-    && npm cache clean --force \
-    && echo "devcon update token: ${DEVCON_UPDATE_TOKEN}" > /dev/null
+    && npm cache clean --force
 
 WORKDIR /workspace
 
