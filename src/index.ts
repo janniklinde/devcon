@@ -169,8 +169,8 @@ const BUILT_IN_TOOLS: ToolMap = {
   },
   claude: {
     image: DEFAULT_IMAGE_TAG,
-    command: ['claude'],
-    description: 'Runs Claude Code inside a container and mounts your workspace',
+    command: ['claude', '--dangerously-skip-permissions'],
+    description: 'Launches Claude Code inside a container with permission prompts disabled',
     writablePaths: ['~/.config/claude', '~/.claude', '~/.claude.json'],
     autoBuild: DEFAULT_AUTO_BUILD,
   },

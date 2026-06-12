@@ -309,7 +309,7 @@ Devcon merges the built-in tools with an optional JSON file. Create `~/.config/d
   },
   "claude": {
     "image": "devcon:latest",
-    "command": ["claude"],
+    "command": ["claude", "--dangerously-skip-permissions"],
     "writablePaths": ["~/.config/claude", "~/.claude", "~/.claude.json"]
   },
   "opencode": {
@@ -344,6 +344,7 @@ Fields per tool:
 - `shareHome` – Override the CLI default for sharing the host home directory (default is `false`).
 - `homeReadOnly` – When `true`, the home directory mount is forced read-only; pair with `writablePaths` to selectively re-enable write access to specific paths.
 - `writablePaths` – Array of paths (absolute or `~/`-prefixed) that should remain mounted read/write even if the home directory is not mounted. The paths must live under your host home directory; missing directories are created automatically, and missing file-looking paths (for example `~/.tool.json`) are created as empty files.
+- Built-in Claude passes `--dangerously-skip-permissions` by default because it already runs inside the Devcon container. Override the `claude` command in `tools.json` to restore permission prompts.
 - Built-in Claude mounts `~/.config/claude`, `~/.claude`, and `~/.claude.json` by default so it can reuse its host auth/config and writable state without sharing your entire home directory.
 - Built-in OpenCode mounts `~/.config/opencode`, `~/.local/share/opencode`, `~/.local/state/opencode`, and `~/.cache/opencode` by default so it can reuse your host config, auth, local state, and cache without sharing your entire home directory.
 
