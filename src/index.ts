@@ -283,6 +283,46 @@ function resolveExtraMountInput(input: string, cwd: string, homeDir: string): st
   return path.resolve(cwd, input);
 }
 
+function validateExtraMountName(mountName: string): void {
+  if (
+    mountName.trim().length === 0
+    || mountName !== mountName.trim()
+    || mountName === '.'
+    || mountName === '..'
+    || mountName.includes('/')
+  ) {
+    throw new Error(`Invalid mount name "${mountName}". Use a single directory name, e.g. --mount ../shared:shared-data`);
+  }
+}
+
+function resolveExtraMountSpec(input: string, cwd: string, homeDir: string): ExtraMount {
+  // Preserve support for literal directory names containing a colon. When the
+  // complete input is not a directory, the final colon separates PATH:NAME.
+  const literalHostPath = resolveExtraMountInput(input, cwd, homeDir);
+  if (existsSync(literalHostPath)) {
+    return {
+      hostPath: literalHostPath,
+      mountName: path.basename(literalHostPath),
+    };
+  }
+
+  const separatorIndex = input.lastIndexOf(':');
+  if (separatorIndex <= 0) {
+    return {
+      hostPath: literalHostPath,
+      mountName: path.basename(literalHostPath),
+    };
+  }
+
+  const pathInput = input.substring(0, separatorIndex);
+  const mountName = input.substring(separatorIndex + 1);
+  validateExtraMountName(mountName);
+  return {
+    hostPath: resolveExtraMountInput(pathInput, cwd, homeDir),
+    mountName,
+  };
+}
+
 function resolveExtraMounts(mountInputs: string[], cwd: string): ExtraMount[] {
   if (mountInputs.length === 0) {
     return [];
@@ -293,8 +333,9 @@ function resolveExtraMounts(mountInputs: string[], cwd: string): ExtraMount[] {
   const resolved: ExtraMount[] = [];
 
   for (const input of mountInputs) {
-    const hostPath = resolveExtraMountInput(input, cwd, homeDir);
-    if (unique.has(hostPath)) {
+    const { hostPath, mountName } = resolveExtraMountSpec(input, cwd, homeDir);
+    const mountKey = `${hostPath}\0${mountName}`;
+    if (unique.has(mountKey)) {
       continue;
     }
     if (!existsSync(hostPath)) {
@@ -303,11 +344,10 @@ function resolveExtraMounts(mountInputs: string[], cwd: string): ExtraMount[] {
     if (!statSync(hostPath).isDirectory()) {
       throw new Error(`Mount path ${hostPath} must be a directory.`);
     }
-    const mountName = path.basename(hostPath);
     if (!mountName || mountName === '.' || mountName === path.sep) {
       throw new Error(`Mount path ${hostPath} must have a valid directory name.`);
     }
-    unique.add(hostPath);
+    unique.add(mountKey);
     resolved.push({
       hostPath,
       mountName,
@@ -1684,7 +1724,7 @@ function resolveExtraMountContainerPaths(extraMounts: ExtraMount[], workspaceTar
   for (const extra of extraMounts) {
     const containerPath = path.posix.join(WORKSPACE_ROOT, extra.mountName);
     if (seenTargets.has(containerPath)) {
-      throw new Error(`Mount target collision at ${containerPath}. Choose a mount directory with a unique name.`);
+      throw new Error(`Mount target collision at ${containerPath}. Use PATH:NAME to choose a unique mount name.`);
     }
     seenTargets.add(containerPath);
     resolved.push({ hostPath: extra.hostPath, containerPath });
@@ -3419,7 +3459,7 @@ function printHelp(tools: ToolMap): void {
   console.log('  --image=IMG   Override the docker image for this run');
   console.log('  --with-git    Unmask .git and inject a sandboxed git user inside the container');
   console.log('  --temp-git    Mask host .git but provide a temporary git repo/worktree inside the container');
-  console.log('  --mount PATH  Bind-mount an extra host directory under /workspace/<folder-name> (repeatable)');
+  console.log('  --mount PATH[:NAME] Bind-mount an extra host directory under /workspace/NAME (repeatable)');
   console.log('  --export-patch[=PATH] Export changes from temp-git repo after run (defaults to .devcon/drafts/<ts>.patch)');
   console.log('  --network-host, -network-host Use host networking (helps with VPNs that block Docker bridge DNS/NAT)');
   console.log('  --ipv4, -ipv4 Force IPv4-only networking by disabling IPv6 inside the container');
