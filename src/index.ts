@@ -130,7 +130,7 @@ const WEBHUB_DEFAULT_PORT = 7690;
 const DEFAULT_AUTO_BUILD: AutoBuildConfig = {
   dockerfile: DEFAULT_IMAGE_DOCKERFILE,
   tag: DEFAULT_IMAGE_TAG,
-  description: 'Builds the devcon base image with Codex CLI, Claude Code, and OpenCode preinstalled.',
+  description: 'Builds the devcon base image with Codex CLI, Claude Code, OpenCode, and Pi preinstalled.',
 };
 const DEFAULT_SENSITIVE_PATTERNS = [
   '.env',
@@ -179,6 +179,13 @@ const BUILT_IN_TOOLS: ToolMap = {
     command: ['opencode'],
     description: 'Runs OpenCode inside a container and reuses host config, auth, and local state',
     writablePaths: ['~/.config/opencode', '~/.local/share/opencode', '~/.local/state/opencode', '~/.cache/opencode'],
+    autoBuild: DEFAULT_AUTO_BUILD,
+  },
+  pi: {
+    image: DEFAULT_IMAGE_TAG,
+    command: ['pi'],
+    description: 'Runs the Pi coding agent inside a container and reuses host config and login state',
+    writablePaths: ['~/.pi/agent'],
     autoBuild: DEFAULT_AUTO_BUILD,
   },
 };

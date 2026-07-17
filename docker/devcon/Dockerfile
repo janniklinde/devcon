@@ -1,4 +1,4 @@
-FROM node:20-bookworm AS devcon-base
+FROM node:22-bookworm AS devcon-base
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=en_US.UTF-8 \
@@ -14,7 +14,7 @@ RUN apt-get update \
 
 FROM devcon-base AS devcon-tools
 
-RUN npm install -g @openai/codex@latest @anthropic-ai/claude-code@latest opencode-ai@latest \
+RUN npm install -g --ignore-scripts @openai/codex@latest @anthropic-ai/claude-code@latest opencode-ai@latest @earendil-works/pi-coding-agent@latest \
     && npm cache clean --force
 
 WORKDIR /workspace

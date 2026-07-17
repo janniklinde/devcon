@@ -1,6 +1,6 @@
 # devcon
 
-`devcon` is a Linux-only CLI that launches AI coding agents like Codex CLI, Claude Code, or OpenCode in fresh Docker containers that already have your working directory wired up. Install globally (`npm install -g devcon`) and run `devcon codex` (or `devcon claude` / `devcon opencode`) from any project to get a locked-down shell within seconds. If no image is configured, Devcon defaults to a local `devcon:latest` image that bundles all three CLIs; the first time you run a tool the CLI offers to build this image for you.
+`devcon` is a Linux-only CLI that launches AI coding agents like Codex CLI, Claude Code, OpenCode, or Pi in fresh Docker containers that already have your working directory wired up. Install globally (`npm install -g devcon`) and run `devcon codex` (or `devcon claude`, `devcon opencode`, or `devcon pi`) from any project to get a locked-down shell within seconds. If no image is configured, Devcon defaults to a local `devcon:latest` image that bundles all four CLIs; the first time you run a tool the CLI offers to build this image for you.
 
 ## What it does
 
@@ -10,7 +10,7 @@
 - Keep the host home directory private by default. Opt in with `--home` or `DEVCON_SHARE_HOME=1`, or whitelist individual directories via `writablePaths` so credentials like `~/.codex` can still be shared.
 - Hide `.env*`, `.git-credentials`, and other critical Git metadata from the container by overlaying empty bind mounts before the container starts.
 - Detect when the default `devcon:latest` docker image is missing and (after a `y` confirmation) build it automatically from `docker/devcon/Dockerfile`.
-- Provide a simple tool registry (`codex`, `claude`, `opencode` by default) allowing you to define which Docker image and command should run for each agent.
+- Provide a simple tool registry (`codex`, `claude`, `opencode`, `pi` by default) allowing you to define which Docker image and command should run for each agent.
 - Built-in `codex` launches with `--sandbox danger-full-access --ask-for-approval never` by default because Devcon already provides the outer container boundary.
 - Optional `--conscious` mode that boots a persistent local archive and wires memory tools into Codex, Claude, or OpenCode via MCP.
 
@@ -259,7 +259,7 @@ Notes:
 
 ## Default image (`devcon:latest`)
 
-The bundled tools (`codex`, `claude`, `opencode`) point to an image named `devcon:latest` that bakes in all three CLIs. On the first run Devcon checks whether that tag exists locally; if not, you’ll see a short explanation plus a `Build it now? [y/N]` prompt. Answer `y` and the CLI runs:
+The bundled tools (`codex`, `claude`, `opencode`, `pi`) point to an image named `devcon:latest` that bakes in all four CLIs. The image uses Node.js 22 because current Pi releases require it. On the first run Devcon checks whether that tag exists locally; if not, you’ll see a short explanation plus a `Build it now? [y/N]` prompt. Answer `y` and the CLI runs:
 
 ```bash
 docker build -f docker/devcon/Dockerfile -t devcon:latest docker/devcon
@@ -277,13 +277,13 @@ devcon update codex  # limit the rebuild to a single tool/image
 
 `devcon upgrade [--branch main]` updates the Devcon package from the GitHub repo, runs `npm install`, `npm run build`, and `npm install -g .`, then runs `devcon rebuild`. In a Git checkout it uses `git pull --ff-only` and refuses to continue over uncommitted changes. In a packaged install without `.git`, it builds a temporary clone first, then replaces the installed package after the build succeeds.
 
-`devcon update` refreshes the Dockerfile stage that installs the bundled CLIs without throwing away the whole Docker cache, so base layers stay hot while Codex CLI, Claude Code, and OpenCode get refreshed. On older Docker versions without stage-level cache filtering, it falls back to a full no-cache rebuild.
+`devcon update` refreshes the Dockerfile stage that installs the bundled CLIs without throwing away the whole Docker cache, so base layers stay hot while Codex CLI, Claude Code, OpenCode, and Pi get refreshed. On older Docker versions without stage-level cache filtering, it falls back to a full no-cache rebuild.
 
 When you need a clean slate (ignore every cached layer), use:
 
 ```bash
 devcon rebuild         # fully rebuilds every tool with an auto-build config
-devcon rebuild codex   # fully rebuild just the bundled Codex/Claude/OpenCode base image
+devcon rebuild codex   # fully rebuild just the bundled Codex/Claude/OpenCode/Pi base image
 ```
 
 Additional handy invocations:
@@ -326,6 +326,11 @@ Devcon merges the built-in tools with an optional JSON file. Create `~/.config/d
       "~/.cache/opencode"
     ]
   },
+  "pi": {
+    "image": "devcon:latest",
+    "command": ["pi"],
+    "writablePaths": ["~/.pi/agent"]
+  },
   "custom-codex": {
     "image": "ghcr.io/my-org/codex-cli:latest",
     "command": ["/bin/bash", "-lc", "codex --full-auto"],
@@ -351,6 +356,7 @@ Fields per tool:
 - Built-in Claude passes `--dangerously-skip-permissions` by default because it already runs inside the Devcon container. Override the `claude` command in `tools.json` to restore permission prompts.
 - Built-in Claude mounts `~/.config/claude`, `~/.claude`, and `~/.claude.json` by default so it can reuse its host auth/config and writable state without sharing your entire home directory.
 - Built-in OpenCode mounts `~/.config/opencode`, `~/.local/share/opencode`, `~/.local/state/opencode`, and `~/.cache/opencode` by default so it can reuse your host config, auth, local state, and cache without sharing your entire home directory.
+- Built-in Pi mounts `~/.pi/agent` by default so `/login` credentials, settings, sessions, and installed Pi packages persist without sharing your entire home directory.
 
 Environment toggles:
 
