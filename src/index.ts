@@ -7,6 +7,7 @@ import {
   readdirSync,
   rmSync,
   statSync,
+  lstatSync,
   closeSync,
   openSync,
   writeFileSync,
@@ -52,6 +53,7 @@ interface CliOptions {
   strictSandbox: boolean;
   helpRequested: boolean;
   allowGit: boolean;
+  hideGit: boolean;
   tempGit: boolean;
   exportPatchPath?: string;
   forceIpv4: boolean;
@@ -138,8 +140,18 @@ const DEFAULT_SENSITIVE_PATTERNS = [
   '**/.env',
   '**/.env.*',
   '.git',
+  '.git/config',
+  '.git/config.worktree',
+  '.git/credentials',
+  '.git/hooks',
+  '.git/logs',
+  '.git/modules',
+  '.git/worktrees',
   '.git-credentials',
 ];
+const DEFAULT_GIT_METADATA_PATTERNS = new Set(
+  DEFAULT_SENSITIVE_PATTERNS.filter((pattern) => pattern === '.git' || pattern.startsWith('.git/')),
+);
 const DEFAULT_SKIP_SCAN_DIRS = [
   'node_modules',
   '.git',
@@ -467,6 +479,7 @@ function parseArgs(argv: string[]): CliOptions {
   let shareHome = SHARE_HOME_DEFAULT;
   let strictSandbox = false;
   let allowGit = false;
+  let hideGit = false;
   let tempGit = false;
   let exportPatchPath: string | undefined;
   let forceIpv4 = false;
@@ -632,6 +645,11 @@ function parseArgs(argv: string[]): CliOptions {
       continue;
     }
 
+    if (arg === '--no-git') {
+      hideGit = true;
+      continue;
+    }
+
     if (arg === '--temp-git') {
       tempGit = true;
       continue;
@@ -721,6 +739,7 @@ function parseArgs(argv: string[]): CliOptions {
     strictSandbox,
     helpRequested,
     allowGit,
+    hideGit,
     tempGit,
     exportPatchPath,
     forceIpv4,
@@ -1700,9 +1719,21 @@ function resolveDefaultWorkspaceTarget(cwd: string): string {
   return path.posix.join(WORKSPACE_ROOT, workspaceDirname);
 }
 
-function discoverSensitivePaths(cwd: string, targetBase: string, options: { allowGit: boolean }): SensitivePath[] {
-  const patterns = compileSensitivePatterns(getEffectiveSensitivePatterns())
-    .filter((pattern) => (options.allowGit ? pattern.raw !== '.git' : true));
+type GitExposure = 'none' | 'readonly' | 'writable';
+
+function discoverSensitivePaths(cwd: string, targetBase: string, options: { gitExposure: GitExposure }): SensitivePath[] {
+  const defaultPatterns = DEFAULT_SENSITIVE_PATTERNS.filter((pattern) => {
+    if (options.gitExposure === 'writable') {
+      return !DEFAULT_GIT_METADATA_PATTERNS.has(pattern);
+    }
+    if (options.gitExposure === 'readonly') {
+      return pattern !== '.git';
+    }
+    return true;
+  });
+  // Custom patterns always win, including a custom ".git" pattern that disables
+  // the default read-only exposure for a particular user's threat model.
+  const patterns = compileSensitivePatterns([...defaultPatterns, ...loadSensitivePatterns()]);
   const matches = findSensitiveMatches(cwd, patterns, getEffectiveSkipDirs());
   return matches.map((match) => ({
     hostPath: path.join(cwd, match.relPath),
@@ -1712,13 +1743,28 @@ function discoverSensitivePaths(cwd: string, targetBase: string, options: { allo
 }
 
 function dedupeSensitivePaths(paths: SensitivePath[]): SensitivePath[] {
+  const byDepth = [...paths].sort((a, b) => a.containerPath.length - b.containerPath.length);
   const unique = new Map<string, SensitivePath>();
-  for (const entry of paths) {
-    if (!unique.has(entry.containerPath)) {
+  for (const entry of byDepth) {
+    const hiddenByParent = [...unique.values()].some((parent) => (
+      parent.type === 'dir'
+      && entry.containerPath.startsWith(`${parent.containerPath}${path.sep}`)
+    ));
+    if (!hiddenByParent && !unique.has(entry.containerPath)) {
       unique.set(entry.containerPath, entry);
     }
   }
   return [...unique.values()];
+}
+
+function hasStandardGitDirectory(workspacePath: string): boolean {
+  const gitPath = path.join(workspacePath, '.git');
+  try {
+    // Do not follow a .git symlink to metadata outside the explicitly mounted workspace.
+    return lstatSync(gitPath).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function resolveExtraMountContainerPaths(extraMounts: ExtraMount[], workspaceTarget: string): Array<{
@@ -3464,7 +3510,8 @@ function printHelp(tools: ToolMap): void {
   console.log('  --home        Share your host home directory with the container (disabled by default)');
   console.log('  --no-home     Do not share your host home directory with the container');
   console.log('  --image=IMG   Override the docker image for this run');
-  console.log('  --with-git    Unmask .git and inject a sandboxed git user inside the container');
+  console.log('  --with-git    Make the host .git writable (read-only history access is the default)');
+  console.log('  --no-git      Fully mask host .git, including its history');
   console.log('  --temp-git    Mask host .git but provide a temporary git repo/worktree inside the container');
   console.log('  --mount PATH[:NAME] Bind-mount an extra host directory under /workspace/NAME (repeatable)');
   console.log('  --export-patch[=PATH] Export changes from temp-git repo after run (defaults to .devcon/drafts/<ts>.patch)');
@@ -3503,6 +3550,7 @@ function buildDockerArgs(options: {
   strictSandbox: boolean;
   image: string;
   allowGit: boolean;
+  hideGit: boolean;
   tempGit: boolean;
   forceIpv4: boolean;
   networkHost: boolean;
@@ -3583,6 +3631,11 @@ function buildDockerArgs(options: {
     console.warn('Writable paths were provided but the home directory is not mounted read-only. Ignoring writablePaths.');
   }
 
+  const requestedGitExposure: GitExposure = options.allowGit
+    ? 'writable'
+    : options.tempGit || options.hideGit
+      ? 'none'
+      : 'readonly';
   const scanTargets = [
     {
       label: 'workspace',
@@ -3594,12 +3647,35 @@ function buildDockerArgs(options: {
       hostPath: extra.hostPath,
       containerPath: extra.containerPath,
     })),
-  ];
+  ].map((target) => ({
+    ...target,
+    gitExposure: requestedGitExposure === 'readonly' && !hasStandardGitDirectory(target.hostPath)
+      ? 'none' as GitExposure
+      : requestedGitExposure,
+  }));
+
+  if (requestedGitExposure === 'readonly') {
+    let mountedRepos = 0;
+    for (const target of scanTargets) {
+      if (target.gitExposure !== 'readonly') {
+        continue;
+      }
+      const hostGitPath = path.join(target.hostPath, '.git');
+      const containerGitPath = path.posix.join(target.containerPath, '.git');
+      dockerArgs.push('--mount', `type=bind,source=${hostGitPath},target=${containerGitPath},readonly`);
+      mountedRepos += 1;
+    }
+    if (mountedRepos > 0) {
+      dockerArgs.push('-e', 'GIT_OPTIONAL_LOCKS=0');
+      console.log(`Read-only git history enabled for ${mountedRepos} workspace mount(s); private local metadata remains masked.`);
+    }
+  }
+
   let sensitivePaths: SensitivePath[] = [];
   for (const target of scanTargets) {
     const scanStart = Date.now();
     console.log(`Scanning ${target.label} for sensitive paths...`);
-    const discovered = discoverSensitivePaths(target.hostPath, target.containerPath, { allowGit: options.allowGit });
+    const discovered = discoverSensitivePaths(target.hostPath, target.containerPath, { gitExposure: target.gitExposure });
     console.log(`Found ${discovered.length} sensitive path(s) to mask in ${target.label} (in ${Date.now() - scanStart}ms)`);
     sensitivePaths = sensitivePaths.concat(discovered);
   }
@@ -3637,15 +3713,19 @@ function buildDockerArgs(options: {
     );
   }
 
-  if (options.allowGit) {
+  if (!options.hideGit) {
     const gitCfgDir = mkdtempSync(path.join(os.tmpdir(), 'devcon-gitcfg-'));
     cleanupTargets.push(gitCfgDir);
     const gitCfgPath = path.join(gitCfgDir, 'config');
-    const gitConfigContents = '[user]\n\tname = devcon-bot\n\temail = devcon@example.com\n';
+    const gitConfigContents = '[user]\n\tname = devcon-bot\n\temail = devcon@example.com\n[credential]\n\thelper =\n';
     writeFileSync(gitCfgPath, gitConfigContents, 'utf8');
     dockerArgs.push('--mount', `type=bind,source=${gitCfgPath},target=/tmp/devcon/gitconfig,readonly`);
     dockerArgs.push('-e', 'GIT_CONFIG_GLOBAL=/tmp/devcon/gitconfig');
-    console.log('Git access enabled: .git unmasked and sandboxed identity configured (devcon-bot).');
+    dockerArgs.push('-e', 'GIT_CONFIG_NOSYSTEM=1');
+    dockerArgs.push('-e', 'GIT_TERMINAL_PROMPT=0');
+    if (options.allowGit) {
+      console.log('Writable git access enabled with sandboxed global identity (devcon-bot).');
+    }
   }
 
   if (options.conscious) {
@@ -3766,8 +3846,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (options.allowGit && options.tempGit) {
-    throw new Error('Use either --with-git or --temp-git, not both.');
+  const gitModeFlags = Number(options.allowGit) + Number(options.hideGit) + Number(options.tempGit);
+  if (gitModeFlags > 1) {
+    throw new Error('Use only one of --with-git, --no-git, or --temp-git.');
   }
 
   if (options.exportPatchPath !== undefined && !options.tempGit) {
@@ -3792,7 +3873,7 @@ async function main(): Promise<void> {
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon upgrade".');
     }
-    if (options.allowGit || options.tempGit || options.forceIpv4 || options.networkHost || options.conscious) {
+    if (options.allowGit || options.hideGit || options.tempGit || options.forceIpv4 || options.networkHost || options.conscious) {
       throw new Error('Container runtime flags are not supported with "devcon upgrade".');
     }
     assertNoExtraMounts(options.mountPaths, 'upgrade');
@@ -3866,7 +3947,7 @@ async function main(): Promise<void> {
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon webhub".');
     }
-    if (options.allowGit || options.tempGit || options.forceIpv4 || options.networkHost || options.conscious) {
+    if (options.allowGit || options.hideGit || options.tempGit || options.forceIpv4 || options.networkHost || options.conscious) {
       throw new Error('Container runtime flags are not supported with "devcon webhub".');
     }
     if (options.webMode) {
@@ -3920,6 +4001,7 @@ async function main(): Promise<void> {
       strictSandbox: options.strictSandbox,
       image,
       allowGit: options.allowGit,
+      hideGit: options.hideGit,
       tempGit: options.tempGit,
       forceIpv4: options.forceIpv4,
       networkHost,
@@ -4009,6 +4091,7 @@ async function main(): Promise<void> {
     strictSandbox: options.strictSandbox,
     image,
     allowGit: options.allowGit,
+    hideGit: options.hideGit,
     tempGit: options.tempGit,
     forceIpv4: options.forceIpv4,
     networkHost,

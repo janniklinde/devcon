@@ -8,7 +8,7 @@
 - Bind-mount the current working directory at `/workspace/<current-folder-name>` and run as your host UID/GID so file permissions stay intact.
 - Optionally bind-mount extra host directories for a single run via `--mount PATH[:NAME]` (repeatable), mounted under `/workspace/<folder-name>` by default or `/workspace/NAME` when an alias is supplied.
 - Keep the host home directory private by default. Opt in with `--home` or `DEVCON_SHARE_HOME=1`, or whitelist individual directories via `writablePaths` so credentials like `~/.codex` can still be shared.
-- Hide `.env*`, `.git-credentials`, and other critical Git metadata from the container by overlaying empty bind mounts before the container starts.
+- Hide `.env*`, `.git-credentials`, and private local Git metadata. A standard repository's `.git` is exposed read-only by default for history/status/diff inspection, with local config, hooks, reflogs, submodule metadata, and linked-worktree metadata masked.
 - Detect when the default `devcon:latest` docker image is missing and (after a `y` confirmation) build it automatically from `docker/devcon/Dockerfile`.
 - Provide a simple tool registry (`codex`, `claude`, `opencode`, `pi` by default) allowing you to define which Docker image and command should run for each agent.
 - Built-in `codex` launches with `--sandbox danger-full-access --ask-for-approval never` by default because Devcon already provides the outer container boundary.
@@ -56,7 +56,7 @@ devcon skip-scan add .cache    # add a directory name to skip during scans
 devcon skip-scan remove .cache
 devcon --mount ../shared codex # add one extra host directory for this run only
 devcon --mount ../other/devcon:reference codex # mount a same-named directory as /workspace/reference
-devcon run --with-git -- ls    # open an interactive shell (default image) and run a command
+devcon run -- git log --oneline # inspect history using the default read-only Git access
 devcon --conscious codex       # enable persistent archive memory for this run
 ```
 
@@ -154,7 +154,8 @@ Useful flags (place before `--` that separates devcon flags from tool args):
 - `--strict` – Use Docker's stricter default seccomp/AppArmor sandbox instead of Devcon's bwrap-friendly default.
 - `--home` / `--no-home` – Force-enable or force-disable home-directory sharing for this run.
 - `--image=NAME` – Override the docker image configured for the tool.
-- `--with-git` – Unmask `.git` and inject a sandboxed git identity (`devcon-bot <devcon@example.com>`) inside the container.
+- `--with-git` – Make the host `.git` writable for staging/committing; a sandboxed global identity (`devcon-bot <devcon@example.com>`) is injected. The default is read-only Git history access.
+- `--no-git` – Fully mask the host `.git`, including repository history.
 - `--temp-git` – Keep host `.git` masked but mount a temporary git repo/worktree in the container (sandboxed identity pre-configured).
 - `--mount PATH[:NAME]` – Add an extra bind mount for the current run only (repeatable). By default it is mounted under `/workspace/<folder-name>`; append `:NAME` to choose another name (e.g. `--mount ../other/devcon:reference` => `/workspace/reference`). Extra mounts are scanned/masked with the same sensitive-path rules as the main project mount.
 - `--export-patch[=PATH]` – With `--temp-git`, export patches after the run to PATH (or `.devcon/drafts/<timestamp>.patch`).
@@ -174,7 +175,9 @@ Useful flags (place before `--` that separates devcon flags from tool args):
 Pass tool arguments after `--` so they are not parsed by devcon. Examples:
 
 ```bash
-devcon codex --with-git -- git status
+devcon codex -- git status
+# Opt in only when the agent needs to stage or commit:
+devcon codex --with-git -- git add src/index.ts
 devcon codex -- --dry-run "my prompt"
 ```
 
@@ -289,8 +292,9 @@ devcon rebuild codex   # fully rebuild just the bundled Codex/Claude/OpenCode/Pi
 Additional handy invocations:
 
 ```bash
-devcon run --with-git -- ls    # open an interactive shell (default image) and run a command
-devcon run --temp-git          # open a shell with a temp git repo (host .git stays masked)
+devcon run -- git log --oneline # inspect host history (host .git is read-only)
+devcon run --with-git           # open a shell with writable host git metadata
+devcon run --temp-git           # open a shell with a temp git repo (host .git stays masked)
 devcon run --temp-git --export-patch   # auto-export patch to .devcon/drafts on exit
 ```
 
@@ -365,9 +369,12 @@ Environment toggles:
 
 ## Security defaults
 
-- Every run masks `.env`, `.env.*`, `.git/config`, `.git/index`, `.git/HEAD`, `.git-credentials`, and `.git/credentials` from the container by mounting empty placeholders over those paths after the workspace volume is attached.
-- To keep host repo metadata private by default, the entire `.git` directory is hidden inside the container unless you opt in (e.g., via a custom tool definition).
-- Opt-in git access: pass `--with-git` to unmask `.git` for a run; Devcon injects a sandboxed git identity (`devcon-bot <devcon@example.com>`) inside the container.
+- Every run masks `.env`, `.env.*`, `.git-credentials`, and `.git/credentials` from the container by mounting empty placeholders after the workspace volume is attached.
+- For a standard checkout with a `.git` directory, Git metadata is mounted read-only by default so `git status`, `git diff`, `git log`, `git blame`, and similar inspection commands work without allowing changes to the host index, refs, or objects. Local `.git/config`, `config.worktree`, hooks, reflogs, submodule metadata, and linked-worktree metadata remain masked.
+- Git receives an isolated global config, no system config, no credential helper, disabled terminal prompting, and the identity `devcon-bot <devcon@example.com>`. The host home remains unmounted unless explicitly shared.
+- Use `--no-git` to hide `.git` completely, `--temp-git` for disposable writable metadata, or `--with-git` to explicitly make the host `.git` writable.
+- Linked worktrees use a `.git` pointer file rather than a self-contained directory; Devcon masks that file by default because safely remapping its external metadata is not currently supported.
+- Read-only does not mean non-sensitive: commit objects can expose author names/emails and files (including secrets) deleted from the current tree. Reflogs and local config are masked, but use `--no-git` when repository history itself is outside the agent's allowed data scope.
 - Containers inherit your host UID/GID so they have no more privileges than you already do.
 - Each invocation runs with `--rm` and without Docker daemon side-effects, ensuring there is no long-lived state.
 - The host home directory is unmounted by default; opt in explicitly and/or keep it read-only (`DEVCON_HOME_READONLY=1`) while allowing write access only to trusted locations via `writablePaths`.
@@ -375,7 +382,7 @@ Environment toggles:
 
 ### Sensitive file patterns
 
-- Default sensitive patterns: `.env`, `.env.*`, `**/.env`, `**/.env.*`, `.git`, `.git-credentials`.
+- Default sensitive patterns: `.env`, `.env.*`, `**/.env`, `**/.env.*`, `.git`, selected private `.git/*` metadata, and `.git-credentials`. Devcon selectively exposes the non-private parts of a standard `.git` read-only unless `--no-git` is used.
 - Manage additional patterns in `~/.config/devcon/sensitive.json` via `devcon sensitive`:
   - `devcon sensitive list` – show defaults, custom patterns, and what matches in the current workspace.
   - `devcon sensitive add "<pattern>"` – add a glob-style pattern (e.g. `secrets/**`).
