@@ -8,6 +8,7 @@
 - Bind-mount the current working directory at `/workspace/<current-folder-name>` and run as your host UID/GID so file permissions stay intact.
 - Optionally bind-mount extra host directories for a single run via `--mount PATH[:NAME]` (repeatable), mounted under `/workspace/<folder-name>` by default or `/workspace/NAME` when an alias is supplied.
 - Keep the host home directory private by default. Opt in with `--home` or `DEVCON_SHARE_HOME=1`, or whitelist individual directories via `writablePaths` so credentials like `~/.codex` can still be shared.
+- Automatically attach a persistent, non-root development environment to each workspace so agents can retain Python environments, JDKs, user binaries, and build caches without retaining the container root filesystem.
 - Hide `.env*`, `.git-credentials`, and private local Git metadata. A standard repository's `.git` is exposed read-only by default for history/status/diff inspection, with local config, hooks, reflogs, submodule metadata, and linked-worktree metadata masked.
 - Detect when the default `devcon:latest` docker image is missing and (after a `y` confirmation) build it automatically from `docker/devcon/Dockerfile`.
 - Provide a simple tool registry (`codex`, `claude`, `opencode`, `pi` by default) allowing you to define which Docker image and command should run for each agent.
@@ -54,6 +55,11 @@ devcon sensitive remove secrets/**
 devcon skip-scan list          # show skip-scan directories (defaults + custom)
 devcon skip-scan add .cache    # add a directory name to skip during scans
 devcon skip-scan remove .cache
+devcon env list               # list persistent development environments
+devcon env create java-21 --size 15G
+devcon env use java-21        # make it this workspace's default
+devcon --env java-21 pi       # select one environment for a run
+devcon --no-env codex         # run without persistent environment state
 devcon --mount ../shared codex # add one extra host directory for this run only
 devcon --mount ../other/devcon:reference codex # mount a same-named directory as /workspace/reference
 devcon run -- git log --oneline # inspect history using the default read-only Git access
@@ -157,6 +163,8 @@ Useful flags (place before `--` that separates devcon flags from tool args):
 - `--with-git` – Make the host `.git` writable for staging/committing; a sandboxed global identity (`devcon-bot <devcon@example.com>`) is injected. The default is read-only Git history access.
 - `--no-git` – Fully mask the host `.git`, including repository history.
 - `--temp-git` – Keep host `.git` masked but mount a temporary git repo/worktree in the container (sandboxed identity pre-configured).
+- `--env NAME` – Use an existing named persistent development environment for this run instead of the workspace default.
+- `--no-env` – Disable persistent development state for this run.
 - `--mount PATH[:NAME]` – Add an extra bind mount for the current run only (repeatable). By default it is mounted under `/workspace/<folder-name>`; append `:NAME` to choose another name (e.g. `--mount ../other/devcon:reference` => `/workspace/reference`). Extra mounts are scanned/masked with the same sensitive-path rules as the main project mount.
 - `--export-patch[=PATH]` – With `--temp-git`, export patches after the run to PATH (or `.devcon/drafts/<timestamp>.patch`).
 - `--network-host` / `-network-host` – Use host networking (often required on VPNs that block Docker bridge DNS/NAT).
@@ -180,6 +188,44 @@ devcon codex -- git status
 devcon codex --with-git -- git add src/index.ts
 devcon codex -- --dry-run "my prompt"
 ```
+
+## Persistent development environments
+
+Devcon automatically creates one persistent environment for each workspace on its first tool launch. The container itself remains disposable; only the dedicated environment directory under `~/.local/share/devcon/environments/` persists. Workspace-to-environment assignments are stored in `~/.config/devcon/environments.json`.
+
+Inside the container, the environment is mounted at `/opt/devcon/env`. Devcon configures `PATH`, `VIRTUAL_ENV`, `JAVA_HOME`, and Python, uv, Maven, Gradle, npm, Cargo, and Rustup cache/install locations to use it. Built-in agents receive explicit system instructions to run `devcon-env info` before installing anything and not to retry `sudo`, `apt`, or system `pip`. `sudo`, `apt`, and `apt-get` are replaced with explanatory shims that point agents back to `devcon-env` instead of returning an ambiguous permission error.
+
+Common flows:
+
+```bash
+# Inspect exact paths, current usage, and installation instructions (inside a tool container)
+devcon-env info
+devcon-env info --json       # machine-readable status for agents/scripts
+
+# Persistent Python using the image's Python version
+devcon-env python ensure
+python -m pip install pytest
+
+# Persistent Eclipse Temurin JDK (downloaded from the Adoptium API)
+devcon-env java ensure 21
+java -version
+
+# Manage environments from the host
+devcon env list
+devcon env create java-21 --size 15G
+devcon env use java-21
+devcon env clone java-21 java-experiment
+devcon env attach java-21 /path/to/another/workspace
+devcon env set-size java-21 20G
+devcon env inspect java-21
+devcon env delete java-experiment
+```
+
+Use `--env NAME` to select another environment for one run, `devcon env use NAME` to change the current workspace default, or `--no-env` for a fully disposable run. Sharing an environment with another workspace also shares executable package state; clone it instead when the workspaces do not share the same trust boundary.
+
+The default budget is 10 GiB, configurable for newly auto-created environments with `DEVCON_ENV_MAX_GB`. `--size` controls explicitly created environments. This is currently a **soft limit** because portable Docker bind-mount quotas are not available: Devcon blocks future launches when an environment is over budget and warns after a session that crosses it, but it cannot prevent a running process from temporarily exceeding the limit.
+
+The environment runs as the host UID/GID but has no `sudo` and does not receive the host home or Docker socket. Persistent package state is executable and therefore trusted state: a malicious dependency can affect later sessions using that environment. Authentication mounts and the writable workspace retain their existing security implications.
 
 ## Conscious mode (`--conscious`)
 

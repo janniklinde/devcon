@@ -15,6 +15,7 @@ import {
   Dirent,
   mkdirSync,
   cpSync,
+  chmodSync,
 } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -60,6 +61,8 @@ interface CliOptions {
   networkHost: boolean;
   conscious: boolean;
   consciousStatePath?: string;
+  environmentName?: string;
+  disableEnvironment: boolean;
   webMode: boolean;
   webHost?: string;
   webPort?: number;
@@ -77,6 +80,23 @@ interface AutoBuildConfig {
 interface ExtraMount {
   hostPath: string;
   mountName: string;
+}
+
+interface EnvironmentRecord {
+  id: string;
+  name: string;
+  createdAt: string;
+  maxBytes: number;
+}
+
+interface EnvironmentRegistry {
+  version: 1;
+  environments: EnvironmentRecord[];
+  workspaceDefaults: Record<string, string>;
+}
+
+interface PersistentEnvironment extends EnvironmentRecord {
+  hostPath: string;
 }
 
 interface DockerLaunchPlan {
@@ -99,6 +119,13 @@ const CONFIG_PATH = process.env.DEVCON_TOOLS_FILE
 const SENSITIVE_CONFIG_PATH = path.join(os.homedir(), '.config', 'devcon', 'sensitive.json');
 const SKIP_SCAN_CONFIG_PATH = path.join(os.homedir(), '.config', 'devcon', 'skip-scan.json');
 const CONSCIOUS_ROOT_PATH = path.join(os.homedir(), '.config', 'devcon', 'conscious');
+const ENVIRONMENT_REGISTRY_PATH = path.join(os.homedir(), '.config', 'devcon', 'environments.json');
+const ENVIRONMENT_STORAGE_PATH = path.join(os.homedir(), '.local', 'share', 'devcon', 'environments');
+const ENVIRONMENT_CONTAINER_PATH = '/opt/devcon/env';
+const ENVIRONMENT_HELPER_HOST_PATH = path.resolve(__dirname, '..', 'docker', 'devcon', 'devcon-env');
+const ENVIRONMENT_HELPER_CONTAINER_PATH = '/usr/local/bin/devcon-env';
+const ENVIRONMENT_INSTRUCTIONS_CONTAINER_PATH = '/tmp/devcon/environment-instructions.md';
+const DEFAULT_ENVIRONMENT_MAX_BYTES = parsePositiveIntEnv(process.env.DEVCON_ENV_MAX_GB, 10) * 1024 * 1024 * 1024;
 const CONSCIOUS_CONTAINER_MCP_CLIENT = '/tmp/devcon/conscious-mcp-tcp-client.js';
 const CONSCIOUS_SIDECAR_SERVER_SCRIPT = '/opt/devcon/conscious-mcp-tcp-server.js';
 const CONSCIOUS_SIDECAR_MCP_SERVER_SCRIPT = '/opt/devcon/conscious-mcp-server.js';
@@ -202,17 +229,34 @@ const BUILT_IN_TOOLS: ToolMap = {
   },
 };
 
-function buildOpenCodeConsciousConfig(serverCommand: string[]): string {
-  return JSON.stringify({
+function buildOpenCodeRuntimeConfig(serverCommand?: string[], instructionPath?: string): string {
+  const config: Record<string, unknown> = {
     $schema: 'https://opencode.ai/config.json',
-    mcp: {
+  };
+  if (instructionPath) {
+    config.instructions = [instructionPath];
+  }
+  if (serverCommand) {
+    config.mcp = {
       [CONSCIOUS_MCP_NAME]: {
         type: 'local',
         command: serverCommand,
         enabled: true,
       },
-    },
-  });
+    };
+  }
+  return JSON.stringify(config);
+}
+
+function buildEnvironmentAgentInstructions(environment: PersistentEnvironment): string {
+  return [
+    'You are running in a Devcon container with a persistent, non-root development environment.',
+    `The active environment is "${environment.name}" at ${ENVIRONMENT_CONTAINER_PATH}.`,
+    'Before installing any runtime or dependency, run `devcon-env info` and follow its installation contract.',
+    'Do not repeatedly try sudo, apt, apt-get, or system pip; they are intentionally unavailable.',
+    'Use `devcon-env python ensure` before pip installs and `devcon-env java ensure 21` (or another major) for a JDK.',
+    `Install standalone tools under ${ENVIRONMENT_CONTAINER_PATH}/bin. Content there persists across sessions and counts toward a soft size budget.`,
+  ].join('\n');
 }
 
 function parseBooleanEnv(value: string | undefined): boolean {
@@ -470,6 +514,284 @@ function saveSensitivePatterns(patterns: string[]): void {
   writeFileSync(SENSITIVE_CONFIG_PATH, `${payload}\n`, 'utf8');
 }
 
+function emptyEnvironmentRegistry(): EnvironmentRegistry {
+  return { version: 1, environments: [], workspaceDefaults: {} };
+}
+
+function loadEnvironmentRegistry(): EnvironmentRegistry {
+  if (!existsSync(ENVIRONMENT_REGISTRY_PATH)) {
+    return emptyEnvironmentRegistry();
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(ENVIRONMENT_REGISTRY_PATH, 'utf8')) as Partial<EnvironmentRegistry>;
+    if (parsed.version !== 1 || !Array.isArray(parsed.environments) || !parsed.workspaceDefaults) {
+      throw new Error('expected a version 1 environment registry');
+    }
+    return parsed as EnvironmentRegistry;
+  } catch (error) {
+    throw new Error(`Unable to read ${ENVIRONMENT_REGISTRY_PATH}: ${error instanceof Error ? error.message : error}`);
+  }
+}
+
+function saveEnvironmentRegistry(registry: EnvironmentRegistry): void {
+  mkdirSync(path.dirname(ENVIRONMENT_REGISTRY_PATH), { recursive: true, mode: 0o700 });
+  writeFileSync(ENVIRONMENT_REGISTRY_PATH, `${JSON.stringify(registry, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+}
+
+function validateEnvironmentName(name: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) {
+    throw new Error('Environment names must be 1-64 characters using letters, numbers, dot, underscore, or dash.');
+  }
+}
+
+function parseEnvironmentSize(raw: string | undefined): number {
+  if (!raw) {
+    return DEFAULT_ENVIRONMENT_MAX_BYTES;
+  }
+  const match = raw.trim().match(/^(\d+)([KMGTP]?)(?:i?B)?$/i);
+  if (!match) {
+    throw new Error(`Invalid environment size "${raw}". Use a value such as 10G or 2048M.`);
+  }
+  const powers: Record<string, number> = { '': 0, K: 1, M: 2, G: 3, T: 4, P: 5 };
+  return Number(match[1]) * (1024 ** powers[match[2].toUpperCase()]);
+}
+
+function formatBytes(bytes: number): string {
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function environmentDiskUsage(root: string): number {
+  if (!existsSync(root)) {
+    return 0;
+  }
+  let total = 0;
+  const stack = [root];
+  while (stack.length > 0) {
+    const current = stack.pop() as string;
+    let stats;
+    try {
+      stats = lstatSync(current);
+    } catch {
+      continue;
+    }
+    total += stats.size;
+    if (!stats.isDirectory() || stats.isSymbolicLink()) {
+      continue;
+    }
+    try {
+      for (const entry of readdirSync(current)) {
+        stack.push(path.join(current, entry));
+      }
+    } catch {
+      // A concurrently removed cache entry is harmless for a best-effort budget check.
+    }
+  }
+  return total;
+}
+
+function environmentPath(id: string): string {
+  return path.join(ENVIRONMENT_STORAGE_PATH, id);
+}
+
+function materializeEnvironment(record: EnvironmentRecord): PersistentEnvironment {
+  const hostPath = environmentPath(record.id);
+  mkdirSync(hostPath, { recursive: true, mode: 0o700 });
+  chmodSync(hostPath, 0o700);
+  for (const relative of ['bin', 'cache', 'java', 'npm', 'cargo', 'rustup', 'maven', 'gradle']) {
+    mkdirSync(path.join(hostPath, relative), { recursive: true });
+  }
+  return { ...record, hostPath };
+}
+
+function findEnvironment(registry: EnvironmentRegistry, reference: string): EnvironmentRecord {
+  const matches = registry.environments.filter((entry) => entry.name === reference || entry.id === reference);
+  if (matches.length !== 1) {
+    throw new Error(`Unknown environment "${reference}". Run "devcon env list".`);
+  }
+  return matches[0];
+}
+
+function createEnvironment(registry: EnvironmentRegistry, name: string, maxBytes: number, createStorage = true): EnvironmentRecord {
+  validateEnvironmentName(name);
+  if (registry.environments.some((entry) => entry.name === name)) {
+    throw new Error(`Environment "${name}" already exists.`);
+  }
+  const record: EnvironmentRecord = {
+    id: randomBytes(8).toString('hex'),
+    name,
+    createdAt: new Date().toISOString(),
+    maxBytes,
+  };
+  registry.environments.push(record);
+  if (createStorage) {
+    materializeEnvironment(record);
+  }
+  return record;
+}
+
+function workspaceEnvironmentKey(cwd: string): string {
+  return path.resolve(cwd);
+}
+
+function defaultEnvironmentName(cwd: string): string {
+  const base = path.basename(path.resolve(cwd)).replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 48) || 'workspace';
+  const suffix = createHash('sha256').update(path.resolve(cwd)).digest('hex').slice(0, 8);
+  return `${base}-${suffix}`;
+}
+
+function warnEnvironmentBudget(environment: PersistentEnvironment | undefined): void {
+  if (!environment) return;
+  const used = environmentDiskUsage(environment.hostPath);
+  if (used > environment.maxBytes) {
+    console.warn(`Environment "${environment.name}" now uses ${formatBytes(used)}, above its ${formatBytes(environment.maxBytes)} soft limit. The next launch will be blocked until it is cleaned.`);
+  } else if (used >= environment.maxBytes * 0.9) {
+    console.warn(`Environment "${environment.name}" is at ${formatBytes(used)} of its ${formatBytes(environment.maxBytes)} soft limit.`);
+  }
+}
+
+function resolvePersistentEnvironment(cwd: string, requestedName: string | undefined, disabled: boolean, dryRun = false): PersistentEnvironment | undefined {
+  if (disabled) {
+    return undefined;
+  }
+  const registry = loadEnvironmentRegistry();
+  const workspaceKey = workspaceEnvironmentKey(cwd);
+  let record: EnvironmentRecord;
+  if (requestedName) {
+    record = findEnvironment(registry, requestedName);
+  } else {
+    const defaultId = registry.workspaceDefaults[workspaceKey];
+    const existing = defaultId ? registry.environments.find((entry) => entry.id === defaultId) : undefined;
+    if (existing) {
+      record = existing;
+    } else {
+      let name = defaultEnvironmentName(cwd);
+      let counter = 2;
+      while (registry.environments.some((entry) => entry.name === name)) {
+        name = `${defaultEnvironmentName(cwd).slice(0, 60)}-${counter}`;
+        counter += 1;
+      }
+      record = createEnvironment(registry, name, DEFAULT_ENVIRONMENT_MAX_BYTES, !dryRun);
+      if (!dryRun) {
+        registry.workspaceDefaults[workspaceKey] = record.id;
+        saveEnvironmentRegistry(registry);
+        console.log(`Created persistent environment "${record.name}" for this workspace.`);
+      } else {
+        console.log(`[dry-run] Would create persistent environment "${record.name}" for this workspace.`);
+      }
+    }
+  }
+  const environment = dryRun
+    ? { ...record, hostPath: environmentPath(record.id) }
+    : materializeEnvironment(record);
+  const used = environmentDiskUsage(environment.hostPath);
+  if (used > environment.maxBytes) {
+    throw new Error(`Environment "${environment.name}" uses ${formatBytes(used)}, above its ${formatBytes(environment.maxBytes)} soft limit. Clean it or increase the limit before launching.`);
+  }
+  return environment;
+}
+
+function parseEnvironmentCommandSize(args: string[]): number {
+  const index = args.findIndex((arg) => arg === '--size' || arg.startsWith('--size='));
+  if (index < 0) {
+    return DEFAULT_ENVIRONMENT_MAX_BYTES;
+  }
+  const raw = args[index] === '--size' ? args[index + 1] : args[index].substring('--size='.length);
+  if (!raw) {
+    throw new Error('--size requires a value such as 10G.');
+  }
+  return parseEnvironmentSize(raw);
+}
+
+function handleEnvironmentCommand(args: string[], cwd: string): void {
+  const subcommand = args[0] ?? 'list';
+  const registry = loadEnvironmentRegistry();
+  if (subcommand === 'list') {
+    const currentId = registry.workspaceDefaults[workspaceEnvironmentKey(cwd)];
+    if (registry.environments.length === 0) {
+      console.log('No persistent environments. One will be created automatically on the next tool launch.');
+      return;
+    }
+    for (const record of registry.environments) {
+      const used = environmentDiskUsage(environmentPath(record.id));
+      const marker = record.id === currentId ? '*' : ' ';
+      console.log(`${marker} ${record.name}  ${formatBytes(used)} / ${formatBytes(record.maxBytes)}  ${record.id}`);
+    }
+    return;
+  }
+  if (subcommand === 'create') {
+    const name = args[1];
+    if (!name) throw new Error('Usage: devcon env create NAME [--size 10G]');
+    const record = createEnvironment(registry, name, parseEnvironmentCommandSize(args.slice(2)));
+    saveEnvironmentRegistry(registry);
+    console.log(`Created environment "${record.name}". Select it with --env ${record.name} or "devcon env use ${record.name}".`);
+    return;
+  }
+  if (subcommand === 'use' || subcommand === 'attach') {
+    const reference = args[1];
+    if (!reference) throw new Error(`Usage: devcon env ${subcommand} NAME [WORKSPACE]`);
+    const record = findEnvironment(registry, reference);
+    const workspace = args[2] ? path.resolve(args[2]) : cwd;
+    registry.workspaceDefaults[workspaceEnvironmentKey(workspace)] = record.id;
+    saveEnvironmentRegistry(registry);
+    console.log(`Workspace ${workspace} now uses environment "${record.name}".`);
+    return;
+  }
+  if (subcommand === 'clone') {
+    const sourceRef = args[1];
+    const newName = args[2];
+    if (!sourceRef || !newName) throw new Error('Usage: devcon env clone SOURCE NEW_NAME [--size 10G]');
+    const source = findEnvironment(registry, sourceRef);
+    const record = createEnvironment(registry, newName, args.some((arg) => arg.startsWith('--size')) ? parseEnvironmentCommandSize(args.slice(3)) : source.maxBytes);
+    cpSync(environmentPath(source.id), environmentPath(record.id), { recursive: true, force: true });
+    saveEnvironmentRegistry(registry);
+    console.log(`Cloned environment "${source.name}" to "${record.name}".`);
+    return;
+  }
+  if (subcommand === 'set-size') {
+    const reference = args[1];
+    const rawSize = args[2];
+    if (!reference || !rawSize) throw new Error('Usage: devcon env set-size NAME 20G');
+    const record = findEnvironment(registry, reference);
+    record.maxBytes = parseEnvironmentSize(rawSize);
+    saveEnvironmentRegistry(registry);
+    console.log(`Environment "${record.name}" soft limit is now ${formatBytes(record.maxBytes)}.`);
+    return;
+  }
+  if (subcommand === 'inspect') {
+    const reference = args[1] ?? registry.workspaceDefaults[workspaceEnvironmentKey(cwd)];
+    if (!reference) throw new Error('No environment is attached to this workspace.');
+    const record = findEnvironment(registry, reference);
+    const hostPath = environmentPath(record.id);
+    console.log(`Name: ${record.name}\nID: ${record.id}\nPath: ${hostPath}\nUsage: ${formatBytes(environmentDiskUsage(hostPath))} / ${formatBytes(record.maxBytes)}\nCreated: ${record.createdAt}`);
+    return;
+  }
+  if (subcommand === 'delete') {
+    const reference = args[1];
+    if (!reference) throw new Error('Usage: devcon env delete NAME');
+    const record = findEnvironment(registry, reference);
+    const attached = Object.entries(registry.workspaceDefaults).filter(([, id]) => id === record.id);
+    if (attached.length > 0 && !args.includes('--force')) {
+      throw new Error(`Environment "${record.name}" is attached to ${attached.length} workspace(s). Re-run with --force to delete it.`);
+    }
+    registry.environments = registry.environments.filter((entry) => entry.id !== record.id);
+    for (const [workspace, id] of Object.entries(registry.workspaceDefaults)) {
+      if (id === record.id) delete registry.workspaceDefaults[workspace];
+    }
+    rmSync(environmentPath(record.id), { recursive: true, force: true });
+    saveEnvironmentRegistry(registry);
+    console.log(`Deleted environment "${record.name}".`);
+    return;
+  }
+  throw new Error(`Unknown "env" subcommand "${subcommand}". Use list, create, use, attach, clone, set-size, inspect, or delete.`);
+}
+
 function parseArgs(argv: string[]): CliOptions {
   const toolArgs: string[] = [];
   const mountPaths: string[] = [];
@@ -486,6 +808,8 @@ function parseArgs(argv: string[]): CliOptions {
   let networkHost = false;
   let conscious = false;
   let consciousStatePath: string | undefined;
+  let environmentName: string | undefined;
+  let disableEnvironment = false;
   let webMode = false;
   let webHost: string | undefined;
   let webPort: number | undefined;
@@ -692,6 +1016,29 @@ function parseArgs(argv: string[]): CliOptions {
       continue;
     }
 
+    if (arg.startsWith('--env=')) {
+      environmentName = arg.substring('--env='.length);
+      if (!environmentName) {
+        throw new Error('--env requires an environment name.');
+      }
+      continue;
+    }
+
+    if (arg === '--env') {
+      const next = argv[i + 1];
+      if (!next) {
+        throw new Error('--env requires an environment name.');
+      }
+      environmentName = next;
+      i += 1;
+      continue;
+    }
+
+    if (arg === '--no-env') {
+      disableEnvironment = true;
+      continue;
+    }
+
     if (arg === '--export-patch') {
       exportPatchPath = '';
       continue;
@@ -746,6 +1093,8 @@ function parseArgs(argv: string[]): CliOptions {
     networkHost,
     conscious,
     consciousStatePath,
+    environmentName,
+    disableEnvironment,
     webMode,
     webHost,
     webPort,
@@ -3501,7 +3850,8 @@ function printHelp(tools: ToolMap): void {
   console.log('  devcon update [tool ...]');
   console.log('  devcon rebuild [tool ...]');
   console.log('  devcon sensitive <list|add|remove> [pattern]');
-  console.log('  devcon skip-scan <list|add|remove> [dir]\n');
+  console.log('  devcon skip-scan <list|add|remove> [dir]');
+  console.log('  devcon env <list|create|use|attach|clone|set-size|inspect|delete> [options]');
   console.log('  devcon conscious <list|inspect|tree|wipe-project|wipe-all> [options]\n');
   console.log('  devcon webhub --allow <path> [--allow <path> ...] [--host 0.0.0.0] [--port 7690] [--password <pass>]\n');
   console.log('Flags:');
@@ -3513,6 +3863,8 @@ function printHelp(tools: ToolMap): void {
   console.log('  --with-git    Make the host .git writable (read-only history access is the default)');
   console.log('  --no-git      Fully mask host .git, including its history');
   console.log('  --temp-git    Mask host .git but provide a temporary git repo/worktree inside the container');
+  console.log('  --env NAME    Use a named persistent development environment for this run');
+  console.log('  --no-env      Disable the persistent development environment for this run');
   console.log('  --mount PATH[:NAME] Bind-mount an extra host directory under /workspace/NAME (repeatable)');
   console.log('  --export-patch[=PATH] Export changes from temp-git repo after run (defaults to .devcon/drafts/<ts>.patch)');
   console.log('  --network-host, -network-host Use host networking (helps with VPNs that block Docker bridge DNS/NAT)');
@@ -3531,6 +3883,7 @@ function printHelp(tools: ToolMap): void {
   console.log('  rebuild       Fully rebuild Docker images for one or more tools (no cache)');
   console.log('  sensitive     List/add/remove sensitive-path patterns that get masked in containers');
   console.log('  skip-scan     List/add/remove directory names skipped during sensitive-pattern scanning');
+  console.log('  env           Create, select, clone, inspect, or delete persistent development environments');
   console.log('  conscious     Inspect or wipe conscious memory storage (project or global scope)');
   console.log('  webhub        Start a browser hub that can launch/manage --web sessions in whitelisted directories');
   console.log('  run           Launch an interactive container shell (default image)');
@@ -3554,6 +3907,7 @@ function buildDockerArgs(options: {
   tempGit: boolean;
   forceIpv4: boolean;
   networkHost: boolean;
+  environment?: PersistentEnvironment;
   conscious?: ConsciousRuntime;
 }): DockerLaunchPlan {
   const dockerArgs: string[] = ['run', '--rm', '-it'];
@@ -3601,6 +3955,43 @@ function buildDockerArgs(options: {
   for (const extra of resolvedExtraMounts) {
     dockerArgs.push('--mount', `type=bind,source=${extra.hostPath},target=${extra.containerPath}`);
     console.log(`Additional mount enabled: ${extra.hostPath} -> ${extra.containerPath}`);
+  }
+
+  let environmentInstructionPath: string | undefined;
+  let environmentInstructions: string | undefined;
+  if (options.environment) {
+    if (!existsSync(ENVIRONMENT_HELPER_HOST_PATH)) {
+      throw new Error(`Devcon environment helper is missing at ${ENVIRONMENT_HELPER_HOST_PATH}. Reinstall Devcon.`);
+    }
+    dockerArgs.push('--mount', `type=bind,source=${options.environment.hostPath},target=${ENVIRONMENT_CONTAINER_PATH}`);
+    dockerArgs.push('--mount', `type=bind,source=${ENVIRONMENT_HELPER_HOST_PATH},target=${ENVIRONMENT_HELPER_CONTAINER_PATH},readonly`);
+    for (const blockedCommand of ['sudo', 'apt', 'apt-get']) {
+      dockerArgs.push('--mount', `type=bind,source=${ENVIRONMENT_HELPER_HOST_PATH},target=/usr/local/bin/${blockedCommand},readonly`);
+    }
+    dockerArgs.push('-e', `DEVCON_ENV=${ENVIRONMENT_CONTAINER_PATH}`);
+    dockerArgs.push('-e', `DEVCON_ENV_NAME=${options.environment.name}`);
+    dockerArgs.push('-e', `DEVCON_ENV_MAX_BYTES=${options.environment.maxBytes}`);
+    dockerArgs.push('-e', `VIRTUAL_ENV=${ENVIRONMENT_CONTAINER_PATH}/python`);
+    dockerArgs.push('-e', `JAVA_HOME=${ENVIRONMENT_CONTAINER_PATH}/java/current`);
+    dockerArgs.push('-e', `PIP_CACHE_DIR=${ENVIRONMENT_CONTAINER_PATH}/cache/pip`);
+    dockerArgs.push('-e', `UV_CACHE_DIR=${ENVIRONMENT_CONTAINER_PATH}/cache/uv`);
+    dockerArgs.push('-e', `GRADLE_USER_HOME=${ENVIRONMENT_CONTAINER_PATH}/gradle`);
+    dockerArgs.push('-e', `MAVEN_OPTS=-Dmaven.repo.local=${ENVIRONMENT_CONTAINER_PATH}/maven/repository`);
+    dockerArgs.push('-e', `NPM_CONFIG_PREFIX=${ENVIRONMENT_CONTAINER_PATH}/npm`);
+    dockerArgs.push('-e', `CARGO_HOME=${ENVIRONMENT_CONTAINER_PATH}/cargo`);
+    dockerArgs.push('-e', `RUSTUP_HOME=${ENVIRONMENT_CONTAINER_PATH}/rustup`);
+    // Keep Devcon's agent CLIs and helper ahead of persistent binaries so an
+    // environment cannot silently replace the agent executable on the next launch.
+    dockerArgs.push('-e', `PATH=/usr/local/sbin:/usr/local/bin:${ENVIRONMENT_CONTAINER_PATH}/python/bin:${ENVIRONMENT_CONTAINER_PATH}/java/current/bin:${ENVIRONMENT_CONTAINER_PATH}/bin:${ENVIRONMENT_CONTAINER_PATH}/npm/bin:${ENVIRONMENT_CONTAINER_PATH}/cargo/bin:/usr/sbin:/usr/bin:/sbin:/bin`);
+
+    environmentInstructions = buildEnvironmentAgentInstructions(options.environment);
+    const instructionsDir = mkdtempSync(path.join(os.tmpdir(), 'devcon-environment-instructions-'));
+    cleanupTargets.push(instructionsDir);
+    environmentInstructionPath = path.join(instructionsDir, 'AGENT_ENVIRONMENT.md');
+    writeFileSync(environmentInstructionPath, `${environmentInstructions}\n`, 'utf8');
+    dockerArgs.push('--mount', `type=bind,source=${environmentInstructionPath},target=${ENVIRONMENT_INSTRUCTIONS_CONTAINER_PATH},readonly`);
+    dockerArgs.push('-e', `DEVCON_ENV_INSTRUCTIONS=${ENVIRONMENT_INSTRUCTIONS_CONTAINER_PATH}`);
+    console.log(`Persistent environment enabled: ${options.environment.name} (${formatBytes(environmentDiskUsage(options.environment.hostPath))} / ${formatBytes(options.environment.maxBytes)} soft limit).`);
   }
 
   if (shareHome && homeDir && existsSync(homeDir)) {
@@ -3771,7 +4162,7 @@ function buildDockerArgs(options: {
       );
       postRunCleanupLines.push(`claude mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`);
     } else if (options.toolName === 'opencode') {
-      dockerArgs.push('-e', `OPENCODE_CONFIG_CONTENT=${buildOpenCodeConsciousConfig(serverArgs)}`);
+      dockerArgs.push('-e', `OPENCODE_CONFIG_CONTENT=${buildOpenCodeRuntimeConfig(serverArgs, environmentInstructionPath ? ENVIRONMENT_INSTRUCTIONS_CONTAINER_PATH : undefined)}`);
       initScriptLines.push(
         'if command -v opencode >/dev/null 2>&1; then',
         `  ${warmupGuard}`,
@@ -3784,6 +4175,8 @@ function buildDockerArgs(options: {
       `  codex mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`,
       'fi',
     );
+  } else if (options.toolName === 'opencode' && environmentInstructionPath) {
+    dockerArgs.push('-e', `OPENCODE_CONFIG_CONTENT=${buildOpenCodeRuntimeConfig(undefined, ENVIRONMENT_INSTRUCTIONS_CONTAINER_PATH)}`);
   }
 
   if (initScriptLines.length > 0) {
@@ -3801,7 +4194,19 @@ ${initScriptLines.join('\n')}
   dockerArgs.push(options.image);
 
   const toolCommand = options.tool.command ?? [];
-  const commandArgs = [...toolCommand, ...options.toolArgs];
+  const injectedArgs: string[] = [];
+  if (environmentInstructions && toolCommand.length > 0) {
+    if (options.toolName === 'pi') {
+      injectedArgs.push('--append-system-prompt', environmentInstructions);
+    } else if (options.toolName === 'claude') {
+      injectedArgs.push('--append-system-prompt', environmentInstructions);
+    } else if (options.toolName === 'codex') {
+      injectedArgs.push('-c', `developer_instructions=${JSON.stringify(environmentInstructions)}`);
+    }
+  }
+  const commandArgs = toolCommand.length > 0
+    ? [toolCommand[0], ...injectedArgs, ...toolCommand.slice(1), ...options.toolArgs]
+    : [...options.toolArgs];
 
   if (initScriptPath) {
     const commandString = commandArgs.length > 0
@@ -3809,9 +4214,9 @@ ${initScriptLines.join('\n')}
       : '/bin/bash';
     if (postRunCleanupLines.length > 0) {
       const cleanupCommand = postRunCleanupLines.join('\n');
-      dockerArgs.push('/bin/bash', '-lc', `source /tmp/devcon/init.sh && ${commandString}; status=$?; ${cleanupCommand}; exit $status`);
+      dockerArgs.push('/bin/bash', '--noprofile', '--norc', '-c', `source /tmp/devcon/init.sh && ${commandString}; status=$?; ${cleanupCommand}; exit $status`);
     } else {
-      dockerArgs.push('/bin/bash', '-lc', `source /tmp/devcon/init.sh && exec ${commandString}`);
+      dockerArgs.push('/bin/bash', '--noprofile', '--norc', '-c', `source /tmp/devcon/init.sh && exec ${commandString}`);
     }
   } else {
     dockerArgs.push(...commandArgs);
@@ -3850,6 +4255,9 @@ async function main(): Promise<void> {
   if (gitModeFlags > 1) {
     throw new Error('Use only one of --with-git, --no-git, or --temp-git.');
   }
+  if (options.environmentName && options.disableEnvironment) {
+    throw new Error('Use either --env NAME or --no-env, not both.');
+  }
 
   if (options.exportPatchPath !== undefined && !options.tempGit) {
     throw new Error('--export-patch requires --temp-git so the host repository stays masked.');
@@ -3873,7 +4281,7 @@ async function main(): Promise<void> {
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon upgrade".');
     }
-    if (options.allowGit || options.hideGit || options.tempGit || options.forceIpv4 || options.networkHost || options.conscious) {
+    if (options.allowGit || options.hideGit || options.tempGit || options.forceIpv4 || options.networkHost || options.conscious || options.environmentName || options.disableEnvironment) {
       throw new Error('Container runtime flags are not supported with "devcon upgrade".');
     }
     assertNoExtraMounts(options.mountPaths, 'upgrade');
@@ -3906,6 +4314,15 @@ async function main(): Promise<void> {
   }
 
   const cwd = getCurrentWorkingDirectory();
+
+  if (options.toolName === 'env') {
+    if (options.webMode || options.imageOverride || options.environmentName || options.disableEnvironment) {
+      throw new Error('Container runtime flags are not supported with "devcon env".');
+    }
+    assertNoExtraMounts(options.mountPaths, 'env');
+    handleEnvironmentCommand(options.toolArgs, cwd);
+    return;
+  }
 
   if (options.toolName === 'sensitive') {
     if (options.webMode) {
@@ -3947,7 +4364,7 @@ async function main(): Promise<void> {
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon webhub".');
     }
-    if (options.allowGit || options.hideGit || options.tempGit || options.forceIpv4 || options.networkHost || options.conscious) {
+    if (options.allowGit || options.hideGit || options.tempGit || options.forceIpv4 || options.networkHost || options.conscious || options.environmentName || options.disableEnvironment) {
       throw new Error('Container runtime flags are not supported with "devcon webhub".');
     }
     if (options.webMode) {
@@ -3963,6 +4380,7 @@ async function main(): Promise<void> {
 
   if (options.toolName === 'run') {
     ensureDockerAvailable();
+    const persistentEnvironment = resolvePersistentEnvironment(cwd, options.environmentName, options.disableEnvironment, options.dryRun);
     const consciousRuntime = options.conscious
       ? await prepareConsciousRuntime(cwd, options.toolArgs, options.consciousStatePath)
       : undefined;
@@ -4005,6 +4423,7 @@ async function main(): Promise<void> {
       tempGit: options.tempGit,
       forceIpv4: options.forceIpv4,
       networkHost,
+      environment: persistentEnvironment,
       conscious: consciousRuntime,
     });
 
@@ -4031,6 +4450,7 @@ async function main(): Promise<void> {
     process.on('SIGTERM', terminate);
 
     child.on('exit', (code) => {
+      warnEnvironmentBudget(persistentEnvironment);
       const captured = maybeCaptureConsciousLearning(consciousRuntime, cwd, code);
       if (captured) {
         console.log(`Conscious mode captured finding ${captured.id}`);
@@ -4056,6 +4476,7 @@ async function main(): Promise<void> {
 
   ensureDockerAvailable();
 
+  const persistentEnvironment = resolvePersistentEnvironment(cwd, options.environmentName, options.disableEnvironment, options.dryRun);
   const consciousRuntime = options.conscious
     ? await prepareConsciousRuntime(cwd, options.toolArgs, options.consciousStatePath)
     : undefined;
@@ -4095,6 +4516,7 @@ async function main(): Promise<void> {
     tempGit: options.tempGit,
     forceIpv4: options.forceIpv4,
     networkHost,
+    environment: persistentEnvironment,
     conscious: consciousRuntime,
   });
 
@@ -4124,6 +4546,7 @@ async function main(): Promise<void> {
   process.on('SIGTERM', terminate);
 
   child.on('exit', (code) => {
+    warnEnvironmentBudget(persistentEnvironment);
     if (options.tempGit && launch.tempGitDir && options.exportPatchPath !== undefined) {
       try {
         exportTempGitPatch(launch.tempGitDir, cwd, options.exportPatchPath || undefined);

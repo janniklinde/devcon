@@ -1,0 +1,164 @@
+#!/bin/sh
+set -eu
+
+invoked_as="$(basename "$0")"
+case "$invoked_as" in
+  sudo|apt|apt-get)
+    cat >&2 <<'EOF'
+Devcon containers intentionally do not allow system package installation.
+Run `devcon-env info` for persistent Python, Java, and user-binary installation paths.
+Do not retry with sudo or apt; use the non-root Devcon environment instead.
+EOF
+    exit 126
+    ;;
+esac
+
+ENV_ROOT="${DEVCON_ENV:-/opt/devcon/env}"
+MAX_BYTES="${DEVCON_ENV_MAX_BYTES:-10737418240}"
+PYTHON_ENV="$ENV_ROOT/python"
+JAVA_ROOT="$ENV_ROOT/java"
+
+usage_bytes() {
+  du -sb "$ENV_ROOT" 2>/dev/null | awk '{print $1}' || printf '0\n'
+}
+
+human_bytes() {
+  awk -v bytes="$1" 'BEGIN {
+    split("B KiB MiB GiB TiB", units, " ");
+    value = bytes + 0; unit = 1;
+    while (value >= 1024 && unit < 5) { value /= 1024; unit++ }
+    printf "%.1f %s", value, units[unit]
+  }'
+}
+
+show_info() {
+  used="$(usage_bytes)"
+  if [ "${1:-}" = --json ]; then
+    python_ready=false
+    java_ready=false
+    [ -x "$PYTHON_ENV/bin/python" ] && python_ready=true
+    [ -x "$JAVA_ROOT/current/bin/java" ] && java_ready=true
+    printf '{"name":"%s","root":"%s","usedBytes":%s,"maxBytes":%s,"pythonReady":%s,"javaReady":%s}\n' \
+      "${DEVCON_ENV_NAME:-unknown}" "$ENV_ROOT" "$used" "$MAX_BYTES" "$python_ready" "$java_ready"
+    return
+  fi
+  cat <<EOF
+Devcon persistent environment
+  Name:       ${DEVCON_ENV_NAME:-unknown}
+  Root:       $ENV_ROOT
+  Usage:      $(human_bytes "$used") / $(human_bytes "$MAX_BYTES") (soft limit)
+  Python env: $PYTHON_ENV
+  Java home:  $JAVA_ROOT/current
+  Binaries:   $ENV_ROOT/bin
+
+Installation contract:
+  - Do not use sudo, apt, apt-get, or system pip.
+  - Python: run 'devcon-env python ensure', then use normal python/pip commands.
+  - Java: run 'devcon-env java ensure 21' (or another major version).
+  - Put standalone user binaries in '$ENV_ROOT/bin'.
+  - Python, Java, Maven, Gradle, npm, uv, Cargo, and Rustup caches are already redirected here.
+  - Everything under this root persists and is executable in later sessions.
+EOF
+  if [ -x "$PYTHON_ENV/bin/python" ]; then
+    printf '  Active Python: '
+    "$PYTHON_ENV/bin/python" --version 2>&1
+  fi
+  if [ -x "$JAVA_ROOT/current/bin/java" ]; then
+    printf '  Active Java:   '
+    "$JAVA_ROOT/current/bin/java" -version 2>&1 | head -n 1
+  fi
+}
+
+ensure_python() {
+  requested="${1:-}"
+  current="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+  if [ -n "$requested" ] && [ "$requested" != "$current" ] && [ "$requested" != "${current%%.*}" ]; then
+    echo "Base Python is $current; devcon-env can currently create a persistent venv only for that version." >&2
+    echo "Use the base version or install a standalone Python under $ENV_ROOT and place it on PATH." >&2
+    exit 2
+  fi
+  mkdir -p "$ENV_ROOT" "$ENV_ROOT/cache/pip" "$ENV_ROOT/cache/uv"
+  if [ ! -x "$PYTHON_ENV/bin/python" ]; then
+    echo "Creating persistent Python $current environment at $PYTHON_ENV"
+    python3 -m venv "$PYTHON_ENV"
+  else
+    echo "Persistent Python environment already exists at $PYTHON_ENV"
+  fi
+  "$PYTHON_ENV/bin/python" --version
+  echo "Use: python -m pip install <package>"
+}
+
+ensure_java() {
+  version="${1:-21}"
+  case "$version" in
+    ''|*[!0-9]*) echo "Java version must be a major number, for example: devcon-env java ensure 21" >&2; exit 2 ;;
+  esac
+  target="$JAVA_ROOT/jdk-$version"
+  if [ -x "$target/bin/java" ]; then
+    ln -sfn "jdk-$version" "$JAVA_ROOT/current"
+    echo "Persistent Java $version already exists at $target"
+    "$target/bin/java" -version
+    return
+  fi
+  command -v curl >/dev/null 2>&1 || {
+    echo "curl is required in the Devcon image to install a JDK." >&2
+    exit 2
+  }
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) api_arch=x64 ;;
+    aarch64|arm64) api_arch=aarch64 ;;
+    *) echo "Unsupported architecture for automatic JDK installation: $arch" >&2; exit 2 ;;
+  esac
+  mkdir -p "$JAVA_ROOT"
+  work="$(mktemp -d "$JAVA_ROOT/.install-$version-XXXXXX")"
+  trap 'rm -rf "$work"' EXIT HUP INT TERM
+  archive="$work/jdk.tar.gz"
+  url="https://api.adoptium.net/v3/binary/latest/$version/ga/linux/$api_arch/jdk/hotspot/normal/eclipse"
+  echo "Downloading Eclipse Temurin JDK $version from Adoptium..."
+  curl --fail --location --retry 3 --output "$archive" "$url"
+  mkdir "$work/unpack"
+  tar -xzf "$archive" -C "$work/unpack"
+  extracted="$(find "$work/unpack" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+  [ -n "$extracted" ] && [ -x "$extracted/bin/java" ] || {
+    echo "Downloaded archive did not contain a usable JDK." >&2
+    exit 2
+  }
+  mv "$extracted" "$target"
+  ln -sfn "jdk-$version" "$JAVA_ROOT/current"
+  rm -rf "$work"
+  trap - EXIT HUP INT TERM
+  "$target/bin/java" -version
+  echo "JAVA_HOME is $JAVA_ROOT/current"
+}
+
+command="${1:-info}"
+case "$command" in
+  info|status)
+    show_info "${2:-}"
+    ;;
+  help|-h|--help)
+    cat <<'EOF'
+Usage:
+  devcon-env info [--json]
+  devcon-env python ensure [BASE_VERSION]
+  devcon-env java ensure [MAJOR_VERSION]
+
+The active Devcon environment is a persistent, non-root installation prefix.
+Run 'devcon-env info' before installing project runtimes or dependencies.
+EOF
+    ;;
+  python)
+    [ "${2:-}" = ensure ] || { echo "Usage: devcon-env python ensure [BASE_VERSION]" >&2; exit 2; }
+    ensure_python "${3:-}"
+    ;;
+  java)
+    [ "${2:-}" = ensure ] || { echo "Usage: devcon-env java ensure [MAJOR_VERSION]" >&2; exit 2; }
+    ensure_java "${3:-21}"
+    ;;
+  *)
+    echo "Unknown devcon-env command: $command" >&2
+    echo "Run: devcon-env help" >&2
+    exit 2
+    ;;
+esac
