@@ -59,6 +59,7 @@ interface CliOptions {
   exportPatchPath?: string;
   forceIpv4: boolean;
   networkHost: boolean;
+  gpu: boolean;
   conscious: boolean;
   consciousStatePath?: string;
   environmentName?: string;
@@ -806,6 +807,7 @@ function parseArgs(argv: string[]): CliOptions {
   let exportPatchPath: string | undefined;
   let forceIpv4 = false;
   let networkHost = false;
+  let gpu = false;
   let conscious = false;
   let consciousStatePath: string | undefined;
   let environmentName: string | undefined;
@@ -984,6 +986,21 @@ function parseArgs(argv: string[]): CliOptions {
       continue;
     }
 
+    if (arg === '--gpu' || arg === '--gpu=nvidia') {
+      gpu = true;
+      continue;
+    }
+
+    if (arg.startsWith('--gpu=')) {
+      const provider = arg.substring('--gpu='.length);
+      throw new Error(`Unsupported GPU provider "${provider || '(empty)'}". Devcon currently supports only --gpu or --gpu=nvidia.`);
+    }
+
+    if (arg === '--no-gpu') {
+      gpu = false;
+      continue;
+    }
+
     if (arg === '--conscious' || arg === '-conscious') {
       conscious = true;
       continue;
@@ -1091,6 +1108,7 @@ function parseArgs(argv: string[]): CliOptions {
     exportPatchPath,
     forceIpv4,
     networkHost,
+    gpu,
     conscious,
     consciousStatePath,
     environmentName,
@@ -2759,6 +2777,26 @@ function ensureDockerAvailable(): void {
   }
 }
 
+function ensureNvidiaGpuSupport(): void {
+  const help = spawnSync('docker', ['run', '--help'], { encoding: 'utf8' });
+  if (help.error || help.status !== 0 || !help.stdout.includes('--gpus')) {
+    throw new Error('--gpu requires a Docker version that supports the --gpus option (Docker 19.03 or newer).');
+  }
+
+  const nvidiaSmi = spawnSync('nvidia-smi', ['-L'], { stdio: 'ignore' });
+  const hostGpuDetected = nvidiaSmi.status === 0
+    || existsSync('/dev/nvidia0')
+    || existsSync('/dev/dxg');
+  if (!hostGpuDetected) {
+    throw new Error('No NVIDIA GPU was detected on this Linux host. Verify that the NVIDIA driver is installed and that nvidia-smi works.');
+  }
+
+  const info = spawnSync('docker', ['info', '--format', '{{json .Runtimes}}'], { encoding: 'utf8' });
+  if (info.status === 0 && !info.stdout.toLowerCase().includes('nvidia')) {
+    console.warn('Docker does not report an NVIDIA runtime. If launch fails, install NVIDIA Container Toolkit and run "nvidia-ctk runtime configure --runtime=docker", then restart Docker.');
+  }
+}
+
 function ensureHostGitAvailable(): void {
   const result = spawnSync('git', ['version'], { stdio: 'ignore' });
   if (result.error || result.status !== 0) {
@@ -3869,6 +3907,7 @@ function printHelp(tools: ToolMap): void {
   console.log('  --export-patch[=PATH] Export changes from temp-git repo after run (defaults to .devcon/drafts/<ts>.patch)');
   console.log('  --network-host, -network-host Use host networking (helps with VPNs that block Docker bridge DNS/NAT)');
   console.log('  --ipv4, -ipv4 Force IPv4-only networking by disabling IPv6 inside the container');
+  console.log('  --gpu[=nvidia] Give the container access to all NVIDIA GPUs (requires NVIDIA Container Toolkit)');
   console.log('  --web         Run tool inside tmux and expose it through the built-in web terminal');
   console.log('  --web-host HOST Web server bind host (default: 0.0.0.0)');
   console.log('  --web-port PORT Web server port (default: 7682)');
@@ -3907,6 +3946,7 @@ function buildDockerArgs(options: {
   tempGit: boolean;
   forceIpv4: boolean;
   networkHost: boolean;
+  gpu: boolean;
   environment?: PersistentEnvironment;
   conscious?: ConsciousRuntime;
 }): DockerLaunchPlan {
@@ -3930,6 +3970,11 @@ function buildDockerArgs(options: {
     dockerArgs.push('--security-opt', 'apparmor=unconfined');
     console.log('Bwrap-compatible sandbox enabled: Docker seccomp/AppArmor restrictions relaxed for this container.');
     console.log('Host note: bubblewrap still requires unprivileged user namespaces to be enabled on the Docker host.');
+  }
+
+  if (options.gpu) {
+    dockerArgs.push('--gpus', 'all');
+    console.log('NVIDIA GPU access enabled: all host NVIDIA GPUs will be visible to the container.');
   }
 
   if (options.networkHost) {
@@ -4281,7 +4326,7 @@ async function main(): Promise<void> {
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon upgrade".');
     }
-    if (options.allowGit || options.hideGit || options.tempGit || options.forceIpv4 || options.networkHost || options.conscious || options.environmentName || options.disableEnvironment) {
+    if (options.allowGit || options.hideGit || options.tempGit || options.forceIpv4 || options.networkHost || options.gpu || options.conscious || options.environmentName || options.disableEnvironment) {
       throw new Error('Container runtime flags are not supported with "devcon upgrade".');
     }
     assertNoExtraMounts(options.mountPaths, 'upgrade');
@@ -4292,6 +4337,9 @@ async function main(): Promise<void> {
   if (options.toolName === 'update') {
     if (options.webMode) {
       throw new Error('The --web flag cannot be used with "devcon update".');
+    }
+    if (options.gpu) {
+      throw new Error('The --gpu flag cannot be used with "devcon update".');
     }
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon update". Specify the desired image in the tool configuration instead.');
@@ -4305,6 +4353,9 @@ async function main(): Promise<void> {
     if (options.webMode) {
       throw new Error('The --web flag cannot be used with "devcon rebuild".');
     }
+    if (options.gpu) {
+      throw new Error('The --gpu flag cannot be used with "devcon rebuild".');
+    }
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon rebuild". Specify the desired image in the tool configuration instead.');
     }
@@ -4316,7 +4367,7 @@ async function main(): Promise<void> {
   const cwd = getCurrentWorkingDirectory();
 
   if (options.toolName === 'env') {
-    if (options.webMode || options.imageOverride || options.environmentName || options.disableEnvironment) {
+    if (options.webMode || options.imageOverride || options.environmentName || options.disableEnvironment || options.gpu) {
       throw new Error('Container runtime flags are not supported with "devcon env".');
     }
     assertNoExtraMounts(options.mountPaths, 'env');
@@ -4327,6 +4378,9 @@ async function main(): Promise<void> {
   if (options.toolName === 'sensitive') {
     if (options.webMode) {
       throw new Error('The --web flag cannot be used with "devcon sensitive".');
+    }
+    if (options.gpu) {
+      throw new Error('The --gpu flag cannot be used with "devcon sensitive".');
     }
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon sensitive". This command only manages sensitive-file patterns.');
@@ -4340,6 +4394,9 @@ async function main(): Promise<void> {
     if (options.webMode) {
       throw new Error('The --web flag cannot be used with "devcon skip-scan".');
     }
+    if (options.gpu) {
+      throw new Error('The --gpu flag cannot be used with "devcon skip-scan".');
+    }
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon skip-scan". This command only manages directory scan skips.');
     }
@@ -4351,6 +4408,9 @@ async function main(): Promise<void> {
   if (options.toolName === 'conscious') {
     if (options.webMode) {
       throw new Error('The --web flag cannot be used with "devcon conscious".');
+    }
+    if (options.gpu) {
+      throw new Error('The --gpu flag cannot be used with "devcon conscious".');
     }
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon conscious". This command manages conscious storage only.');
@@ -4364,7 +4424,7 @@ async function main(): Promise<void> {
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon webhub".');
     }
-    if (options.allowGit || options.hideGit || options.tempGit || options.forceIpv4 || options.networkHost || options.conscious || options.environmentName || options.disableEnvironment) {
+    if (options.allowGit || options.hideGit || options.tempGit || options.forceIpv4 || options.networkHost || options.gpu || options.conscious || options.environmentName || options.disableEnvironment) {
       throw new Error('Container runtime flags are not supported with "devcon webhub".');
     }
     if (options.webMode) {
@@ -4380,6 +4440,9 @@ async function main(): Promise<void> {
 
   if (options.toolName === 'run') {
     ensureDockerAvailable();
+    if (options.gpu && !options.dryRun) {
+      ensureNvidiaGpuSupport();
+    }
     const persistentEnvironment = resolvePersistentEnvironment(cwd, options.environmentName, options.disableEnvironment, options.dryRun);
     const consciousRuntime = options.conscious
       ? await prepareConsciousRuntime(cwd, options.toolArgs, options.consciousStatePath)
@@ -4423,6 +4486,7 @@ async function main(): Promise<void> {
       tempGit: options.tempGit,
       forceIpv4: options.forceIpv4,
       networkHost,
+      gpu: options.gpu,
       environment: persistentEnvironment,
       conscious: consciousRuntime,
     });
@@ -4475,6 +4539,9 @@ async function main(): Promise<void> {
   }
 
   ensureDockerAvailable();
+  if (options.gpu && !options.dryRun) {
+    ensureNvidiaGpuSupport();
+  }
 
   const persistentEnvironment = resolvePersistentEnvironment(cwd, options.environmentName, options.disableEnvironment, options.dryRun);
   const consciousRuntime = options.conscious
@@ -4516,6 +4583,7 @@ async function main(): Promise<void> {
     tempGit: options.tempGit,
     forceIpv4: options.forceIpv4,
     networkHost,
+    gpu: options.gpu,
     environment: persistentEnvironment,
     conscious: consciousRuntime,
   });

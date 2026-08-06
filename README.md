@@ -7,6 +7,7 @@
 - Spin up a disposable Docker container per invocation.
 - Bind-mount the current working directory at `/workspace/<current-folder-name>` and run as your host UID/GID so file permissions stay intact.
 - Optionally bind-mount extra host directories for a single run via `--mount PATH[:NAME]` (repeatable), mounted under `/workspace/<folder-name>` by default or `/workspace/NAME` when an alias is supplied.
+- Optionally expose all host NVIDIA GPUs to a tool container with `--gpu`.
 - Keep the host home directory private by default. Opt in with `--home` or `DEVCON_SHARE_HOME=1`, or whitelist individual directories via `writablePaths` so credentials like `~/.codex` can still be shared.
 - Automatically attach a persistent, non-root development environment to each workspace so agents can retain Python environments, JDKs, user binaries, and build caches without retaining the container root filesystem.
 - Hide `.env*`, `.git-credentials`, and private local Git metadata. A standard repository's `.git` is exposed read-only by default for history/status/diff inspection, with local config, hooks, reflogs, submodule metadata, and linked-worktree metadata masked.
@@ -83,6 +84,11 @@ devcon -ipv4 codex
 
 # Use host networking (helpful with VPNs that block Docker bridge DNS/NAT)
 devcon --network-host codex
+
+# Give the container access to all NVIDIA GPUs
+devcon --gpu codex
+# Equivalent explicit provider spelling
+devcon --gpu=nvidia codex
 
 # Override the docker image just for this run
 devcon codex --image ghcr.io/my/codex:latest -- --trace
@@ -169,6 +175,7 @@ Useful flags (place before `--` that separates devcon flags from tool args):
 - `--export-patch[=PATH]` – With `--temp-git`, export patches after the run to PATH (or `.devcon/drafts/<timestamp>.patch`).
 - `--network-host` / `-network-host` – Use host networking (often required on VPNs that block Docker bridge DNS/NAT).
 - `--ipv4` / `-ipv4` – Force IPv4-only networking by disabling IPv6 inside the container.
+- `--gpu` / `--gpu=nvidia` – Give the container access to all NVIDIA GPUs. Requires an NVIDIA driver, Docker 19.03+, and NVIDIA Container Toolkit configured on the host.
 - `--web` – Run the tool inside tmux and expose it through the built-in web terminal.
 - `--web-host HOST` – Override web server bind host (default: `0.0.0.0`).
 - `--web-port PORT` – Override web server port (default: `7682`).
@@ -179,6 +186,25 @@ Useful flags (place before `--` that separates devcon flags from tool args):
 - `--help` / `--list` – Show usage plus the registered tools.
 - Startup preflight: when bridge networking cannot resolve `api.openai.com` but host networking can, Devcon prompts to switch this run to `--network-host`.
 - Startup preflight timeout defaults to 2500ms per probe and can be adjusted with `DEVCON_NETWORK_PROBE_TIMEOUT_MS`.
+
+### NVIDIA GPU access
+
+GPU access is opt-in and currently supports NVIDIA GPUs on Linux. Both spellings expose all host NVIDIA GPUs:
+
+```bash
+devcon --gpu codex
+devcon --gpu=nvidia run -- nvidia-smi
+```
+
+Host requirements:
+
+- A working NVIDIA driver (`nvidia-smi -L` should list the GPU).
+- Docker 19.03 or newer.
+- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) installed and configured for Docker. A typical toolkit configuration is `nvidia-ctk runtime configure --runtime=docker`, followed by restarting Docker.
+
+`--gpu` controls device exposure only. The bundled `devcon:latest` image does not include a CUDA toolkit. Python packages that bundle CUDA userspace libraries may work in the default image; CUDA compilation or other specialized workloads should use a suitable custom image through `--image` or `tools.json`.
+
+GPU access broadens the host kernel-driver interface available to code inside the container and allows that code to consume GPU memory and compute resources. Enable it only for workloads you trust.
 
 Pass tool arguments after `--` so they are not parsed by devcon. Examples:
 

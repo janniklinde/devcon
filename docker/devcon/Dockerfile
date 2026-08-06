@@ -14,7 +14,11 @@ RUN apt-get update \
 
 FROM devcon-base AS devcon-tools
 
+# Claude Code needs its postinstall step to copy its platform-native binary. Keep
+# lifecycle scripts disabled for the bulk install, then run Claude's known setup
+# script explicitly.
 RUN npm install -g --ignore-scripts @openai/codex@latest @anthropic-ai/claude-code@latest opencode-ai@latest @earendil-works/pi-coding-agent@latest \
+    && node /usr/local/lib/node_modules/@anthropic-ai/claude-code/install.cjs \
     && npm cache clean --force
 
 WORKDIR /workspace
