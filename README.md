@@ -166,7 +166,8 @@ Useful flags (place before `--` that separates devcon flags from tool args):
 - `--strict` – Use Docker's stricter default seccomp/AppArmor sandbox instead of Devcon's bwrap-friendly default.
 - `--home` / `--no-home` – Force-enable or force-disable home-directory sharing for this run.
 - `--image=NAME` – Override the docker image configured for the tool.
-- `--with-git` – Make the host `.git` writable for staging/committing; a sandboxed global identity (`devcon-bot <devcon@example.com>`) is injected. The default is read-only Git history access.
+- `--with-git` – Make the host `.git` writable for staging/committing, including its local configuration; a sandboxed global identity (`devcon-bot <devcon@example.com>`) is injected.
+- `--local-git` – Make local Git state writable for staging, committing, and checking out already-fetched branches while masking repository configuration, credentials, hooks, and linked metadata. This prevents normal remote pushes because no remote URL is exposed.
 - `--no-git` – Fully mask the host `.git`, including repository history.
 - `--temp-git` – Keep host `.git` masked but mount a temporary git repo/worktree in the container (sandboxed identity pre-configured).
 - `--env NAME` – Use an existing named persistent development environment for this run instead of the workspace default.
@@ -444,7 +445,9 @@ Environment toggles:
 - Every run masks `.env`, `.env.*`, `.git-credentials`, and `.git/credentials` from the container by mounting empty placeholders after the workspace volume is attached.
 - For a standard checkout with a `.git` directory, Git metadata is mounted read-only by default so `git status`, `git diff`, `git log`, `git blame`, and similar inspection commands work without allowing changes to the host index, refs, or objects. Local `.git/config`, `config.worktree`, hooks, reflogs, submodule metadata, and linked-worktree metadata remain masked.
 - Git receives an isolated global config, no system config, no credential helper, disabled terminal prompting, and the identity `devcon-bot <devcon@example.com>`. The host home remains unmounted unless explicitly shared.
-- Use `--no-git` to hide `.git` completely, `--temp-git` for disposable writable metadata, or `--with-git` to explicitly make the host `.git` writable.
+- Use `--no-git` to hide `.git` completely, `--temp-git` for disposable writable metadata, `--local-git` for writable local commits and checkouts without repository remote configuration, or `--with-git` to expose all host Git metadata.
+- `--local-git` exposes local refs and objects, so `git checkout branch` works for any branch already fetched into the host repository, including a private repository. It cannot fetch new branches because the remote URL is masked.
+- `--local-git` is not a general network or credential boundary: do not share a home directory or pass tokens to an agent that must not be able to authenticate to a remote it already knows.
 - Linked worktrees use a `.git` pointer file rather than a self-contained directory; Devcon masks that file by default because safely remapping its external metadata is not currently supported.
 - Read-only does not mean non-sensitive: commit objects can expose author names/emails and files (including secrets) deleted from the current tree. Reflogs and local config are masked, but use `--no-git` when repository history itself is outside the agent's allowed data scope.
 - Containers inherit your host UID/GID so they have no more privileges than you already do.

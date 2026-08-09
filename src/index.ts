@@ -54,6 +54,7 @@ interface CliOptions {
   strictSandbox: boolean;
   helpRequested: boolean;
   allowGit: boolean;
+  localGit: boolean;
   hideGit: boolean;
   tempGit: boolean;
   exportPatchPath?: string;
@@ -802,6 +803,7 @@ function parseArgs(argv: string[]): CliOptions {
   let shareHome = SHARE_HOME_DEFAULT;
   let strictSandbox = false;
   let allowGit = false;
+  let localGit = false;
   let hideGit = false;
   let tempGit = false;
   let exportPatchPath: string | undefined;
@@ -971,6 +973,11 @@ function parseArgs(argv: string[]): CliOptions {
       continue;
     }
 
+    if (arg === '--local-git') {
+      localGit = true;
+      continue;
+    }
+
     if (arg === '--no-git') {
       hideGit = true;
       continue;
@@ -1103,6 +1110,7 @@ function parseArgs(argv: string[]): CliOptions {
     strictSandbox,
     helpRequested,
     allowGit,
+    localGit,
     hideGit,
     tempGit,
     exportPatchPath,
@@ -2086,12 +2094,17 @@ function resolveDefaultWorkspaceTarget(cwd: string): string {
   return path.posix.join(WORKSPACE_ROOT, workspaceDirname);
 }
 
-type GitExposure = 'none' | 'readonly' | 'writable';
+type GitExposure = 'none' | 'readonly' | 'local' | 'writable';
 
 function discoverSensitivePaths(cwd: string, targetBase: string, options: { gitExposure: GitExposure }): SensitivePath[] {
   const defaultPatterns = DEFAULT_SENSITIVE_PATTERNS.filter((pattern) => {
     if (options.gitExposure === 'writable') {
       return !DEFAULT_GIT_METADATA_PATTERNS.has(pattern);
+    }
+    if (options.gitExposure === 'local') {
+      // Permit writes to refs, objects, index, and reflogs, while retaining the
+      // overlays that hide remote URLs, credentials, hooks, and linked metadata.
+      return pattern !== '.git' && pattern !== '.git/logs';
     }
     if (options.gitExposure === 'readonly') {
       return pattern !== '.git';
@@ -3898,7 +3911,8 @@ function printHelp(tools: ToolMap): void {
   console.log('  --home        Share your host home directory with the container (disabled by default)');
   console.log('  --no-home     Do not share your host home directory with the container');
   console.log('  --image=IMG   Override the docker image for this run');
-  console.log('  --with-git    Make the host .git writable (read-only history access is the default)');
+  console.log('  --with-git    Make the host .git writable, including its configuration');
+  console.log('  --local-git   Make local Git state writable but mask remotes, credentials, and hooks');
   console.log('  --no-git      Fully mask host .git, including its history');
   console.log('  --temp-git    Mask host .git but provide a temporary git repo/worktree inside the container');
   console.log('  --env NAME    Use a named persistent development environment for this run');
@@ -3942,6 +3956,7 @@ function buildDockerArgs(options: {
   strictSandbox: boolean;
   image: string;
   allowGit: boolean;
+  localGit: boolean;
   hideGit: boolean;
   tempGit: boolean;
   forceIpv4: boolean;
@@ -4069,9 +4084,11 @@ function buildDockerArgs(options: {
 
   const requestedGitExposure: GitExposure = options.allowGit
     ? 'writable'
-    : options.tempGit || options.hideGit
-      ? 'none'
-      : 'readonly';
+    : options.localGit
+      ? 'local'
+      : options.tempGit || options.hideGit
+        ? 'none'
+        : 'readonly';
   const scanTargets = [
     {
       label: 'workspace',
@@ -4085,7 +4102,8 @@ function buildDockerArgs(options: {
     })),
   ].map((target) => ({
     ...target,
-    gitExposure: requestedGitExposure === 'readonly' && !hasStandardGitDirectory(target.hostPath)
+    gitExposure: (requestedGitExposure === 'readonly' || requestedGitExposure === 'local')
+      && !hasStandardGitDirectory(target.hostPath)
       ? 'none' as GitExposure
       : requestedGitExposure,
   }));
@@ -4161,6 +4179,8 @@ function buildDockerArgs(options: {
     dockerArgs.push('-e', 'GIT_TERMINAL_PROMPT=0');
     if (options.allowGit) {
       console.log('Writable git access enabled with sandboxed global identity (devcon-bot).');
+    } else if (options.localGit) {
+      console.log('Local writable git enabled; repository config, credentials, and hooks remain masked.');
     }
   }
 
@@ -4296,9 +4316,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  const gitModeFlags = Number(options.allowGit) + Number(options.hideGit) + Number(options.tempGit);
+  const gitModeFlags = Number(options.allowGit) + Number(options.localGit) + Number(options.hideGit) + Number(options.tempGit);
   if (gitModeFlags > 1) {
-    throw new Error('Use only one of --with-git, --no-git, or --temp-git.');
+    throw new Error('Use only one of --with-git, --local-git, --no-git, or --temp-git.');
   }
   if (options.environmentName && options.disableEnvironment) {
     throw new Error('Use either --env NAME or --no-env, not both.');
@@ -4326,7 +4346,7 @@ async function main(): Promise<void> {
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon upgrade".');
     }
-    if (options.allowGit || options.hideGit || options.tempGit || options.forceIpv4 || options.networkHost || options.gpu || options.conscious || options.environmentName || options.disableEnvironment) {
+    if (options.allowGit || options.localGit || options.hideGit || options.tempGit || options.forceIpv4 || options.networkHost || options.gpu || options.conscious || options.environmentName || options.disableEnvironment) {
       throw new Error('Container runtime flags are not supported with "devcon upgrade".');
     }
     assertNoExtraMounts(options.mountPaths, 'upgrade');
@@ -4424,7 +4444,7 @@ async function main(): Promise<void> {
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon webhub".');
     }
-    if (options.allowGit || options.hideGit || options.tempGit || options.forceIpv4 || options.networkHost || options.gpu || options.conscious || options.environmentName || options.disableEnvironment) {
+    if (options.allowGit || options.localGit || options.hideGit || options.tempGit || options.forceIpv4 || options.networkHost || options.gpu || options.conscious || options.environmentName || options.disableEnvironment) {
       throw new Error('Container runtime flags are not supported with "devcon webhub".');
     }
     if (options.webMode) {
@@ -4482,6 +4502,7 @@ async function main(): Promise<void> {
       strictSandbox: options.strictSandbox,
       image,
       allowGit: options.allowGit,
+      localGit: options.localGit,
       hideGit: options.hideGit,
       tempGit: options.tempGit,
       forceIpv4: options.forceIpv4,
@@ -4579,6 +4600,7 @@ async function main(): Promise<void> {
     strictSandbox: options.strictSandbox,
     image,
     allowGit: options.allowGit,
+    localGit: options.localGit,
     hideGit: options.hideGit,
     tempGit: options.tempGit,
     forceIpv4: options.forceIpv4,
