@@ -148,6 +148,13 @@ const DEFAULT_WORKSPACE_DIRNAME = 'project';
 const HOME_READONLY_DEFAULT = parseBooleanEnv(process.env.DEVCON_HOME_READONLY);
 const SHARE_HOME_DEFAULT = parseBooleanEnv(process.env.DEVCON_SHARE_HOME);
 const DEFAULT_IMAGE_TAG = 'devcon:latest';
+const SHARED_SKILL_TOOL_NAMES = new Set(['codex', 'claude', 'opencode', 'pi']);
+const SHARED_SKILLS_RELATIVE_PATH = path.join('.agents', 'skills');
+const LEGACY_SKILLS_RELATIVE_PATHS: Record<string, string> = {
+  codex: path.join('.codex', 'skills'),
+  opencode: path.join('.config', 'opencode', 'skills'),
+  pi: path.join('.pi', 'agent', 'skills'),
+};
 const DEFAULT_IMAGE_DOCKERFILE = path.resolve(__dirname, '..', 'docker', 'devcon', 'Dockerfile');
 const DEVCON_PACKAGE_ROOT = path.resolve(__dirname, '..');
 const DEVCON_REPO_URL = process.env.DEVCON_UPGRADE_REPO || 'https://github.com/janniklinde/devcon.git';
@@ -261,6 +268,14 @@ function buildEnvironmentAgentInstructions(environment: PersistentEnvironment): 
   ].join('\n');
 }
 
+function buildSharedSkillsAgentInstructions(skillsPath: string): string {
+  return [
+    `Devcon centralizes global agent skills at ${skillsPath}.`,
+    'Create, install, update, and remove global skills only in this directory (also available as `$DEVCON_SKILLS_DIR`).',
+    'Do not place global skills in harness-specific legacy directories. Repository-local skills continue to use the harness\'s normal project paths.',
+  ].join('\n');
+}
+
 function parseBooleanEnv(value: string | undefined): boolean {
   if (!value) {
     return false;
@@ -330,6 +345,15 @@ function ensureWritablePath(target: string): SensitivePath['type'] {
 
   mkdirSync(target, { recursive: true });
   return 'dir';
+}
+
+function ensureSharedSkillsDirectory(homeDir: string): string {
+  const skillsPath = path.join(homeDir, SHARED_SKILLS_RELATIVE_PATH);
+  const pathType = ensureWritablePath(skillsPath);
+  if (pathType !== 'dir') {
+    throw new Error(`Shared skills path ${skillsPath} must be a directory.`);
+  }
+  return skillsPath;
 }
 
 function resolveExtraMountInput(input: string, cwd: string, homeDir: string): string {
@@ -3972,6 +3996,17 @@ function buildDockerArgs(options: {
   const shareHome = options.shareHome;
   const homeReadOnly = shareHome ? (options.tool.homeReadOnly ?? HOME_READONLY_DEFAULT) : false;
   const shouldMountWritable = writablePaths.length > 0 && (!shareHome || homeReadOnly);
+  const usesSharedSkills = SHARED_SKILL_TOOL_NAMES.has(options.toolName);
+  const sharedSkillsPath = usesSharedSkills ? ensureSharedSkillsDirectory(homeDir) : undefined;
+  const claudeSkillsPath = options.toolName === 'claude'
+    ? path.join(homeDir, '.claude', 'skills')
+    : undefined;
+  const legacySkillsPath = LEGACY_SKILLS_RELATIVE_PATHS[options.toolName]
+    ? path.join(homeDir, LEGACY_SKILLS_RELATIVE_PATHS[options.toolName])
+    : undefined;
+  const redirectedSkillTargets = new Set(
+    [sharedSkillsPath, claudeSkillsPath, legacySkillsPath].filter((target): target is string => Boolean(target)),
+  );
   let homeEnvSet = false;
 
   if (typeof process.getuid === 'function' && typeof process.getgid === 'function') {
@@ -4017,7 +4052,7 @@ function buildDockerArgs(options: {
     console.log(`Additional mount enabled: ${extra.hostPath} -> ${extra.containerPath}`);
   }
 
-  let environmentInstructionPath: string | undefined;
+  let agentInstructionPath: string | undefined;
   let environmentInstructions: string | undefined;
   if (options.environment) {
     if (!existsSync(ENVIRONMENT_HELPER_HOST_PATH)) {
@@ -4045,12 +4080,6 @@ function buildDockerArgs(options: {
     dockerArgs.push('-e', `PATH=/usr/local/sbin:/usr/local/bin:${ENVIRONMENT_CONTAINER_PATH}/python/bin:${ENVIRONMENT_CONTAINER_PATH}/java/current/bin:${ENVIRONMENT_CONTAINER_PATH}/bin:${ENVIRONMENT_CONTAINER_PATH}/npm/bin:${ENVIRONMENT_CONTAINER_PATH}/cargo/bin:/usr/sbin:/usr/bin:/sbin:/bin`);
 
     environmentInstructions = buildEnvironmentAgentInstructions(options.environment);
-    const instructionsDir = mkdtempSync(path.join(os.tmpdir(), 'devcon-environment-instructions-'));
-    cleanupTargets.push(instructionsDir);
-    environmentInstructionPath = path.join(instructionsDir, 'AGENT_ENVIRONMENT.md');
-    writeFileSync(environmentInstructionPath, `${environmentInstructions}\n`, 'utf8');
-    dockerArgs.push('--mount', `type=bind,source=${environmentInstructionPath},target=${ENVIRONMENT_INSTRUCTIONS_CONTAINER_PATH},readonly`);
-    dockerArgs.push('-e', `DEVCON_ENV_INSTRUCTIONS=${ENVIRONMENT_INSTRUCTIONS_CONTAINER_PATH}`);
     console.log(`Persistent environment enabled: ${options.environment.name} (${formatBytes(environmentDiskUsage(options.environment.hostPath))} / ${formatBytes(options.environment.maxBytes)} soft limit).`);
   }
 
@@ -4075,11 +4104,54 @@ function buildDockerArgs(options: {
     for (const rawPath of writablePaths) {
       const resolved = resolveUserPath(rawPath, homeDir);
       ensurePathWithinHome(resolved, homeDir);
+      if (redirectedSkillTargets.has(resolved)) {
+        continue;
+      }
       ensureWritablePath(resolved);
       dockerArgs.push('--mount', `type=bind,source=${resolved},target=${resolved}`);
     }
   } else if (shareHome && writablePaths.length > 0 && !homeReadOnly) {
     console.warn('Writable paths were provided but the home directory is not mounted read-only. Ignoring writablePaths.');
+  }
+
+  if (sharedSkillsPath) {
+    // A writable home mount already exposes the canonical path. Otherwise add a
+    // focused writable mount so shared skills work without exposing the rest of HOME.
+    if (!shareHome || homeReadOnly) {
+      dockerArgs.push('--mount', `type=bind,source=${sharedSkillsPath},target=${sharedSkillsPath}`);
+    }
+    dockerArgs.push('-e', `DEVCON_SKILLS_DIR=${sharedSkillsPath}`);
+
+    if (claudeSkillsPath) {
+      // Claude Code has no configurable global skills directory. Overlay only its
+      // skills subtree, leaving the rest of ~/.claude available for auth and state.
+      dockerArgs.push('--mount', `type=bind,source=${sharedSkillsPath},target=${claudeSkillsPath}`);
+    }
+
+    if (legacySkillsPath) {
+      if (existsSync(legacySkillsPath) && detectPathType(legacySkillsPath) === 'dir' && readdirSync(legacySkillsPath).length > 0) {
+        console.warn(`Legacy global skills at ${legacySkillsPath} are hidden in Devcon; move them to ${sharedSkillsPath}.`);
+      }
+      const emptyLegacySkills = createPlaceholder('dir', cleanupTargets);
+      dockerArgs.push('--mount', `type=bind,source=${emptyLegacySkills},target=${legacySkillsPath},readonly`);
+    }
+  }
+
+  const agentInstructions = [
+    sharedSkillsPath ? buildSharedSkillsAgentInstructions(sharedSkillsPath) : undefined,
+    environmentInstructions,
+  ].filter((instructions): instructions is string => Boolean(instructions)).join('\n\n');
+
+  if (agentInstructions) {
+    const instructionsDir = mkdtempSync(path.join(os.tmpdir(), 'devcon-agent-instructions-'));
+    cleanupTargets.push(instructionsDir);
+    agentInstructionPath = path.join(instructionsDir, 'AGENT_ENVIRONMENT.md');
+    writeFileSync(agentInstructionPath, `${agentInstructions}\n`, 'utf8');
+    dockerArgs.push('--mount', `type=bind,source=${agentInstructionPath},target=${ENVIRONMENT_INSTRUCTIONS_CONTAINER_PATH},readonly`);
+    dockerArgs.push('-e', `DEVCON_AGENT_INSTRUCTIONS=${ENVIRONMENT_INSTRUCTIONS_CONTAINER_PATH}`);
+    if (environmentInstructions) {
+      dockerArgs.push('-e', `DEVCON_ENV_INSTRUCTIONS=${ENVIRONMENT_INSTRUCTIONS_CONTAINER_PATH}`);
+    }
   }
 
   const requestedGitExposure: GitExposure = options.allowGit
@@ -4227,7 +4299,7 @@ function buildDockerArgs(options: {
       );
       postRunCleanupLines.push(`claude mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`);
     } else if (options.toolName === 'opencode') {
-      dockerArgs.push('-e', `OPENCODE_CONFIG_CONTENT=${buildOpenCodeRuntimeConfig(serverArgs, environmentInstructionPath ? ENVIRONMENT_INSTRUCTIONS_CONTAINER_PATH : undefined)}`);
+      dockerArgs.push('-e', `OPENCODE_CONFIG_CONTENT=${buildOpenCodeRuntimeConfig(serverArgs, agentInstructionPath ? ENVIRONMENT_INSTRUCTIONS_CONTAINER_PATH : undefined)}`);
       initScriptLines.push(
         'if command -v opencode >/dev/null 2>&1; then',
         `  ${warmupGuard}`,
@@ -4240,7 +4312,7 @@ function buildDockerArgs(options: {
       `  codex mcp remove ${CONSCIOUS_MCP_NAME} >/dev/null 2>&1 || true`,
       'fi',
     );
-  } else if (options.toolName === 'opencode' && environmentInstructionPath) {
+  } else if (options.toolName === 'opencode' && agentInstructionPath) {
     dockerArgs.push('-e', `OPENCODE_CONFIG_CONTENT=${buildOpenCodeRuntimeConfig(undefined, ENVIRONMENT_INSTRUCTIONS_CONTAINER_PATH)}`);
   }
 
@@ -4260,13 +4332,13 @@ ${initScriptLines.join('\n')}
 
   const toolCommand = options.tool.command ?? [];
   const injectedArgs: string[] = [];
-  if (environmentInstructions && toolCommand.length > 0) {
+  if (agentInstructions && toolCommand.length > 0) {
     if (options.toolName === 'pi') {
-      injectedArgs.push('--append-system-prompt', environmentInstructions);
+      injectedArgs.push('--append-system-prompt', agentInstructions);
     } else if (options.toolName === 'claude') {
-      injectedArgs.push('--append-system-prompt', environmentInstructions);
+      injectedArgs.push('--append-system-prompt', agentInstructions);
     } else if (options.toolName === 'codex') {
-      injectedArgs.push('-c', `developer_instructions=${JSON.stringify(environmentInstructions)}`);
+      injectedArgs.push('-c', `developer_instructions=${JSON.stringify(agentInstructions)}`);
     }
   }
   const commandArgs = toolCommand.length > 0

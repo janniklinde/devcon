@@ -9,6 +9,7 @@
 - Optionally bind-mount extra host directories for a single run via `--mount PATH[:NAME]` (repeatable), mounted under `/workspace/<folder-name>` by default or `/workspace/NAME` when an alias is supplied.
 - Optionally expose all host NVIDIA GPUs to a tool container with `--gpu`.
 - Keep the host home directory private by default. Opt in with `--home` or `DEVCON_SHARE_HOME=1`, or whitelist individual directories via `writablePaths` so credentials like `~/.codex` can still be shared.
+- Share global agent skills across all bundled harnesses through the host's `~/.agents/skills` directory, without requiring the persistent development environment.
 - Automatically attach a persistent, non-root development environment to each workspace so agents can retain Python environments, JDKs, user binaries, and build caches without retaining the container root filesystem.
 - Hide `.env*`, `.git-credentials`, and private local Git metadata. A standard repository's `.git` is exposed read-only by default for history/status/diff inspection, with local config, hooks, reflogs, submodule metadata, and linked-worktree metadata masked.
 - Detect when the default `devcon:latest` docker image is missing and (after a `y` confirmation) build it automatically from `docker/devcon/Dockerfile`.
@@ -253,6 +254,14 @@ Use `--env NAME` to select another environment for one run, `devcon env use NAME
 The default budget is 10 GiB, configurable for newly auto-created environments with `DEVCON_ENV_MAX_GB`. `--size` controls explicitly created environments. This is currently a **soft limit** because portable Docker bind-mount quotas are not available: Devcon blocks future launches when an environment is over budget and warns after a session that crosses it, but it cannot prevent a running process from temporarily exceeding the limit.
 
 The environment runs as the host UID/GID but has no `sudo` and does not receive the host home or Docker socket. Persistent package state is executable and therefore trusted state: a malicious dependency can affect later sessions using that environment. Authentication mounts and the writable workspace retain their existing security implications.
+
+## Shared agent skills
+
+Devcon uses the host's `~/.agents/skills` as the global skills directory for all bundled agent harnesses. Codex, OpenCode, and Pi discover this location natively. For Claude Code, Devcon mounts the same directory at `~/.claude/skills` inside the container because Claude does not currently provide a separate global skills-path setting. The original host `~/.claude/skills` directory is left unchanged but is hidden for the duration of a Devcon Claude session.
+
+The shared directory is mounted read/write even when the rest of the host home is unavailable or read-only, and is exposed as `DEVCON_SKILLS_DIR` inside supported tool containers. On startup, Devcon also instructs each bundled harness to use this directory rather than a harness-specific legacy directory when creating, installing, updating, or removing global skills. Legacy global skill directories under `~/.codex`, `~/.config/opencode`, and `~/.pi/agent` are masked with empty read-only directories inside their respective tool containers to prevent duplicate-name conflicts; existing host files are not changed, and Devcon warns when they should be migrated. Consequently, every bundled harness discovers global skills from the same store. Treat these skills as trusted executable state: a skill can contain scripts and can instruct an agent to run commands.
+
+This only centralizes global skills. Repository-local discovery remains harness-native: Codex, OpenCode, and Pi use `.agents/skills`, while Claude Code continues to use `.claude/skills`.
 
 ## Conscious mode (`--conscious`)
 
