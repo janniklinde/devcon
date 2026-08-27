@@ -42,6 +42,7 @@ devcon upgrade --branch main
 
 ```bash
 devcon <tool> [flags] [-- tool arguments]
+devcon resume             # choose a recent startup command used in this directory
 
 # Rebuild the default tool images (all tools or a specific one)
 devcon upgrade
@@ -67,6 +68,8 @@ devcon --mount ../other/devcon:reference codex # mount a same-named directory as
 devcon run -- git log --oneline # inspect history using the default read-only Git access
 devcon --conscious codex       # enable persistent archive memory for this run
 ```
+
+`devcon resume` shows the latest successful startup commands recorded for the exact current directory. Use the arrow keys to choose one and press Enter; the most recent command is selected by default. Devcon keeps up to 20 distinct startup commands per directory in `~/.config/devcon/startup-history.json`. Administrative commands, help, invalid launches, and dry runs are not recorded.
 
 Examples:
 

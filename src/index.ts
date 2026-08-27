@@ -97,6 +97,16 @@ interface EnvironmentRegistry {
   workspaceDefaults: Record<string, string>;
 }
 
+interface StartupHistoryEntry {
+  argv: string[];
+  usedAt: string;
+}
+
+interface StartupHistory {
+  version: 1;
+  workspaces: Record<string, StartupHistoryEntry[]>;
+}
+
 interface PersistentEnvironment extends EnvironmentRecord {
   hostPath: string;
 }
@@ -122,6 +132,8 @@ const SENSITIVE_CONFIG_PATH = path.join(os.homedir(), '.config', 'devcon', 'sens
 const SKIP_SCAN_CONFIG_PATH = path.join(os.homedir(), '.config', 'devcon', 'skip-scan.json');
 const CONSCIOUS_ROOT_PATH = path.join(os.homedir(), '.config', 'devcon', 'conscious');
 const ENVIRONMENT_REGISTRY_PATH = path.join(os.homedir(), '.config', 'devcon', 'environments.json');
+const STARTUP_HISTORY_PATH = path.join(os.homedir(), '.config', 'devcon', 'startup-history.json');
+const STARTUP_HISTORY_LIMIT = 20;
 const ENVIRONMENT_STORAGE_PATH = path.join(os.homedir(), '.local', 'share', 'devcon', 'environments');
 const ENVIRONMENT_CONTAINER_PATH = '/opt/devcon/env';
 const ENVIRONMENT_HELPER_HOST_PATH = path.resolve(__dirname, '..', 'docker', 'devcon', 'devcon-env');
@@ -562,6 +574,126 @@ function loadEnvironmentRegistry(): EnvironmentRegistry {
 function saveEnvironmentRegistry(registry: EnvironmentRegistry): void {
   mkdirSync(path.dirname(ENVIRONMENT_REGISTRY_PATH), { recursive: true, mode: 0o700 });
   writeFileSync(ENVIRONMENT_REGISTRY_PATH, `${JSON.stringify(registry, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+}
+
+function emptyStartupHistory(): StartupHistory {
+  return { version: 1, workspaces: {} };
+}
+
+function loadStartupHistory(): StartupHistory {
+  if (!existsSync(STARTUP_HISTORY_PATH)) return emptyStartupHistory();
+  try {
+    const parsed = JSON.parse(readFileSync(STARTUP_HISTORY_PATH, 'utf8')) as Partial<StartupHistory>;
+    if (parsed.version !== 1 || !parsed.workspaces || typeof parsed.workspaces !== 'object') {
+      throw new Error('expected a version 1 startup history');
+    }
+    const workspaces: Record<string, StartupHistoryEntry[]> = {};
+    for (const [workspace, entries] of Object.entries(parsed.workspaces)) {
+      if (!Array.isArray(entries)) continue;
+      workspaces[workspace] = entries.filter((entry): entry is StartupHistoryEntry => (
+        Boolean(entry) && Array.isArray(entry.argv)
+        && entry.argv.every((arg) => typeof arg === 'string')
+        && typeof entry.usedAt === 'string'
+      ));
+    }
+    return { version: 1, workspaces };
+  } catch (error) {
+    throw new Error(`Unable to read ${STARTUP_HISTORY_PATH}: ${error instanceof Error ? error.message : error}`);
+  }
+}
+
+function startupHistoryWorkspaceKey(cwd: string): string {
+  return path.resolve(cwd);
+}
+
+function recordStartupCommand(cwd: string, argv: string[]): void {
+  const history = loadStartupHistory();
+  const workspaceKey = startupHistoryWorkspaceKey(cwd);
+  const serializedArgv = JSON.stringify(argv);
+  const previous = history.workspaces[workspaceKey] ?? [];
+  history.workspaces[workspaceKey] = [
+    { argv: [...argv], usedAt: new Date().toISOString() },
+    ...previous.filter((entry) => JSON.stringify(entry.argv) !== serializedArgv),
+  ].slice(0, STARTUP_HISTORY_LIMIT);
+  mkdirSync(path.dirname(STARTUP_HISTORY_PATH), { recursive: true, mode: 0o700 });
+  writeFileSync(STARTUP_HISTORY_PATH, `${JSON.stringify(history, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  chmodSync(STARTUP_HISTORY_PATH, 0o600);
+}
+
+function tryRecordStartupCommand(cwd: string, argv: string[]): void {
+  try {
+    recordStartupCommand(cwd, argv);
+  } catch (error) {
+    console.warn(`Unable to update startup history at ${STARTUP_HISTORY_PATH}: ${error instanceof Error ? error.message : error}`);
+  }
+}
+
+function formatStartupCommand(argv: string[]): string {
+  return buildShellCommand('devcon', argv).replace(/[\r\n\t]/g, ' ');
+}
+
+function selectStartupCommand(cwd: string): Promise<string[]> {
+  const entries = loadStartupHistory().workspaces[startupHistoryWorkspaceKey(cwd)] ?? [];
+  if (entries.length === 0) {
+    throw new Error(`No startup history exists for ${cwd}. Launch a tool here before using "devcon resume".`);
+  }
+  if (!process.stdin.isTTY || !process.stdout.isTTY || !process.stdin.setRawMode) {
+    throw new Error('"devcon resume" requires an interactive terminal.');
+  }
+
+  return new Promise((resolve, reject) => {
+    let selected = 0;
+    let renderedLines = 0;
+    const render = (): void => {
+      if (renderedLines > 0) {
+        readline.moveCursor(process.stdout, 0, -renderedLines);
+        readline.cursorTo(process.stdout, 0);
+        readline.clearScreenDown(process.stdout);
+      }
+      const width = Math.max(20, process.stdout.columns || 80);
+      const lines = [
+        'Choose a startup command (most recent first):',
+        ...entries.map((entry, index) => {
+          const prefix = index === selected ? '> ' : '  ';
+          const command = formatStartupCommand(entry.argv);
+          const available = Math.max(1, width - prefix.length);
+          return `${prefix}${command.length > available ? `${command.slice(0, Math.max(1, available - 1))}…` : command}`;
+        }),
+        'Use ↑/↓ and Enter; Esc cancels.',
+      ];
+      process.stdout.write(`${lines.join('\n')}\n`);
+      renderedLines = lines.length;
+    };
+    const cleanup = (): void => {
+      process.stdin.removeListener('keypress', onKeypress);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      process.stdout.write('\x1b[?25h');
+    };
+    const onKeypress = (_value: string, key: readline.Key): void => {
+      if (key.name === 'up') {
+        selected = (selected - 1 + entries.length) % entries.length;
+        render();
+      } else if (key.name === 'down') {
+        selected = (selected + 1) % entries.length;
+        render();
+      } else if (key.name === 'return' || key.name === 'enter') {
+        const selectedArgv = [...entries[selected].argv];
+        cleanup();
+        resolve(selectedArgv);
+      } else if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
+        cleanup();
+        reject(new Error('Resume cancelled.'));
+      }
+    };
+
+    readline.emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdout.write('\x1b[?25l');
+    process.stdin.on('keypress', onKeypress);
+    render();
+  });
 }
 
 function validateEnvironmentName(name: string): void {
@@ -3921,6 +4053,7 @@ async function ensureImageAvailable(image: string, autoBuild?: AutoBuildConfig):
 function printHelp(tools: ToolMap): void {
   console.log('Usage:');
   console.log('  devcon <tool> [-- tool args]');
+  console.log('  devcon resume');
   console.log('  devcon upgrade [--branch main]');
   console.log('  devcon update [tool ...]');
   console.log('  devcon rebuild [tool ...]');
@@ -3955,6 +4088,7 @@ function printHelp(tools: ToolMap): void {
   console.log('  --conscious-path PATH Override where conscious state is stored (default: ~/.config/devcon/conscious)');
   console.log('  --help        Show this message');
   console.log('\nCommands:');
+  console.log('  resume        Choose and rerun a recent startup command from this exact directory');
   console.log('  upgrade       Pull and install the latest devcon repo, then rebuild bundled containers');
   console.log('  update        Refresh Docker images for one or more tools (pull base, rerun npm install)');
   console.log('  rebuild       Fully rebuild Docker images for one or more tools (no cache)');
@@ -4379,7 +4513,13 @@ ${initScriptLines.join('\n')}
 }
 
 async function main(): Promise<void> {
-  const argv = process.argv.slice(2);
+  let argv = process.argv.slice(2);
+  if (argv[0] === 'resume') {
+    if (argv.length !== 1) {
+      throw new Error('Usage: devcon resume');
+    }
+    argv = await selectStartupCommand(getCurrentWorkingDirectory());
+  }
   const options = parseArgs(argv);
   const tools = readTools();
 
@@ -4589,6 +4729,9 @@ async function main(): Promise<void> {
         console.warn('Web mode note: conscious auto-capture on CLI exit is not performed while running inside tmux.');
       }
       await launchWebModeSession(options, cwd, launch);
+      if (!options.dryRun) {
+        tryRecordStartupCommand(cwd, argv);
+      }
       return;
     }
 
@@ -4599,6 +4742,7 @@ async function main(): Promise<void> {
     }
 
     const child = spawn(launch.command, launch.args, { stdio: 'inherit' });
+    child.once('spawn', () => tryRecordStartupCommand(cwd, argv));
     const terminate = (): void => {
       child.kill('SIGINT');
     };
@@ -4690,6 +4834,9 @@ async function main(): Promise<void> {
       console.warn('Web mode note: conscious auto-capture on CLI exit is not performed while running inside tmux.');
     }
     await launchWebModeSession(options, cwd, launch);
+    if (!options.dryRun) {
+      tryRecordStartupCommand(cwd, argv);
+    }
     return;
   }
 
@@ -4700,6 +4847,7 @@ async function main(): Promise<void> {
   }
 
   const child = spawn(launch.command, launch.args, { stdio: 'inherit' });
+  child.once('spawn', () => tryRecordStartupCommand(cwd, argv));
   const terminate = (): void => {
     child.kill('SIGINT');
   };
