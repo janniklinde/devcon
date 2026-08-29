@@ -69,7 +69,7 @@ devcon run -- git log --oneline # inspect history using the default read-only Gi
 devcon --conscious codex       # enable persistent archive memory for this run
 ```
 
-`devcon resume` shows the latest successful startup commands recorded for the exact current directory. Use the arrow keys to choose one and press Enter; the most recent command is selected by default. Devcon keeps up to 20 distinct startup commands per directory in `~/.config/devcon/startup-history.json`. Administrative commands, help, invalid launches, and dry runs are not recorded.
+`devcon resume` shows the latest successful startup commands recorded for the exact current directory. Use ↑/↓ to choose one and ←/→ to scroll through a command that is wider than the terminal; the most recent command is selected by default. Press Enter once to edit the selected command and Enter again to execute it. Devcon keeps up to 20 distinct startup commands per directory in `~/.config/devcon/startup-history.json`. Administrative commands, help, invalid launches, and dry runs are not recorded.
 
 Examples:
 

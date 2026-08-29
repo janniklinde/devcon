@@ -632,6 +632,63 @@ function formatStartupCommand(argv: string[]): string {
   return buildShellCommand('devcon', argv).replace(/[\r\n\t]/g, ' ');
 }
 
+function parseEditedStartupCommand(command: string): string[] {
+  const words: string[] = [];
+  let word = '';
+  let wordStarted = false;
+  let quote: 'single' | 'double' | undefined;
+
+  for (let i = 0; i < command.length; i += 1) {
+    const char = command[i];
+    if (quote === 'single') {
+      if (char === "'") quote = undefined;
+      else word += char;
+      wordStarted = true;
+      continue;
+    }
+    if (quote === 'double') {
+      if (char === '"') {
+        quote = undefined;
+      } else if (char === '\\') {
+        i += 1;
+        if (i >= command.length) throw new Error('The command ends with an unfinished escape.');
+        word += command[i];
+      } else {
+        word += char;
+      }
+      wordStarted = true;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (wordStarted) {
+        words.push(word);
+        word = '';
+        wordStarted = false;
+      }
+    } else if (char === "'") {
+      quote = 'single';
+      wordStarted = true;
+    } else if (char === '"') {
+      quote = 'double';
+      wordStarted = true;
+    } else if (char === '\\') {
+      i += 1;
+      if (i >= command.length) throw new Error('The command ends with an unfinished escape.');
+      word += command[i];
+      wordStarted = true;
+    } else {
+      word += char;
+      wordStarted = true;
+    }
+  }
+  if (quote) throw new Error(`The command has an unfinished ${quote}-quoted string.`);
+  if (wordStarted) words.push(word);
+  if (words[0] !== 'devcon') throw new Error('The edited command must begin with "devcon".');
+  if (words.length === 1) throw new Error('The edited command must include a tool to start.');
+  if (words[1] === 'resume') throw new Error('The edited command cannot resume another history entry.');
+  return words.slice(1);
+}
+
 function selectStartupCommand(cwd: string): Promise<string[]> {
   const entries = loadStartupHistory().workspaces[startupHistoryWorkspaceKey(cwd)] ?? [];
   if (entries.length === 0) {
@@ -643,44 +700,143 @@ function selectStartupCommand(cwd: string): Promise<string[]> {
 
   return new Promise((resolve, reject) => {
     let selected = 0;
+    let horizontalOffset = 0;
+    let editing = false;
+    let editCommand = '';
+    let editCursor = 0;
+    let editOffset = 0;
+    let editError: string | undefined;
     let renderedLines = 0;
+    let renderedCursorRow = 0;
+
+    const viewport = (command: string, available: number, offset: number): { text: string; offset: number } => {
+      const clampedOffset = Math.min(Math.max(0, offset), Math.max(0, command.length - available + 1));
+      const left = clampedOffset > 0 ? '…' : '';
+      const contentWidth = Math.max(1, available - left.length);
+      const hasRight = clampedOffset + contentWidth < command.length;
+      const visibleWidth = Math.max(1, contentWidth - (hasRight ? 1 : 0));
+      return {
+        text: `${left}${command.slice(clampedOffset, clampedOffset + visibleWidth)}${hasRight ? '…' : ''}`,
+        offset: clampedOffset,
+      };
+    };
+
     const render = (): void => {
       if (renderedLines > 0) {
-        readline.moveCursor(process.stdout, 0, -renderedLines);
+        readline.moveCursor(process.stdout, 0, -renderedCursorRow);
         readline.cursorTo(process.stdout, 0);
         readline.clearScreenDown(process.stdout);
       }
       const width = Math.max(20, process.stdout.columns || 80);
-      const lines = [
-        'Choose a startup command (most recent first):',
-        ...entries.map((entry, index) => {
-          const prefix = index === selected ? '> ' : '  ';
-          const command = formatStartupCommand(entry.argv);
-          const available = Math.max(1, width - prefix.length);
-          return `${prefix}${command.length > available ? `${command.slice(0, Math.max(1, available - 1))}…` : command}`;
-        }),
-        'Use ↑/↓ and Enter; Esc cancels.',
-      ];
+      let lines: string[];
+      if (editing) {
+        const prefix = '> ';
+        const available = Math.max(1, width - prefix.length);
+        if (editCursor < editOffset) editOffset = editCursor;
+        if (editCursor >= editOffset + available - 1) editOffset = editCursor - available + 2;
+        const shown = viewport(editCommand, available, editOffset);
+        editOffset = shown.offset;
+        lines = [
+          'Edit startup command:',
+          `${prefix}${shown.text}`,
+          editError ?? 'Press Enter to execute; use ←/→ to move the cursor; Esc cancels.',
+        ];
+      } else {
+        lines = [
+          'Choose a startup command (most recent first):',
+          ...entries.map((entry, index) => {
+            const prefix = index === selected ? '> ' : '  ';
+            const command = formatStartupCommand(entry.argv);
+            const available = Math.max(1, width - prefix.length);
+            const shown = viewport(command, available, index === selected ? horizontalOffset : 0);
+            if (index === selected) horizontalOffset = shown.offset;
+            return `${prefix}${shown.text}`;
+          }),
+          'Use ↑/↓ to choose, ←/→ to scroll, and Enter to edit; Esc cancels.',
+        ];
+      }
       process.stdout.write(`${lines.join('\n')}\n`);
       renderedLines = lines.length;
+      renderedCursorRow = renderedLines;
+      if (editing) {
+        const cursorColumn = 2 + (editOffset > 0 ? 1 : 0) + editCursor - editOffset;
+        readline.moveCursor(process.stdout, 0, -(renderedLines - 1));
+        readline.cursorTo(process.stdout, Math.min(width - 1, cursorColumn));
+        renderedCursorRow = 1;
+        process.stdout.write('\x1b[?25h');
+      } else {
+        process.stdout.write('\x1b[?25l');
+      }
     };
     const cleanup = (): void => {
       process.stdin.removeListener('keypress', onKeypress);
       process.stdin.setRawMode(false);
       process.stdin.pause();
+      if (renderedLines > 0 && renderedCursorRow < renderedLines) {
+        readline.moveCursor(process.stdout, 0, renderedLines - renderedCursorRow);
+        readline.cursorTo(process.stdout, 0);
+      }
       process.stdout.write('\x1b[?25h');
     };
-    const onKeypress = (_value: string, key: readline.Key): void => {
-      if (key.name === 'up') {
+    const onKeypress = (value: string, key: readline.Key): void => {
+      if (editing && (key.name === 'return' || key.name === 'enter')) {
+        try {
+          const editedArgv = parseEditedStartupCommand(editCommand);
+          cleanup();
+          resolve(editedArgv);
+        } catch (error) {
+          editError = error instanceof Error ? error.message : String(error);
+          render();
+        }
+      } else if (editing && key.name === 'left') {
+        editCursor = Math.max(0, editCursor - 1);
+        editError = undefined;
+        render();
+      } else if (editing && key.name === 'right') {
+        editCursor = Math.min(editCommand.length, editCursor + 1);
+        editError = undefined;
+        render();
+      } else if (editing && (key.name === 'backspace' || key.name === 'delete')) {
+        if (key.name === 'backspace' && editCursor > 0) {
+          editCommand = `${editCommand.slice(0, editCursor - 1)}${editCommand.slice(editCursor)}`;
+          editCursor -= 1;
+        } else if (key.name === 'delete' && editCursor < editCommand.length) {
+          editCommand = `${editCommand.slice(0, editCursor)}${editCommand.slice(editCursor + 1)}`;
+        }
+        editError = undefined;
+        render();
+      } else if (editing && key.name === 'home') {
+        editCursor = 0;
+        render();
+      } else if (editing && key.name === 'end') {
+        editCursor = editCommand.length;
+        render();
+      } else if (editing && /^[^\x00-\x1f\x7f]+$/.test(value) && !key.ctrl && !key.meta && key.name !== 'escape') {
+        editCommand = `${editCommand.slice(0, editCursor)}${value}${editCommand.slice(editCursor)}`;
+        editCursor += value.length;
+        editError = undefined;
+        render();
+      } else if (!editing && key.name === 'up') {
         selected = (selected - 1 + entries.length) % entries.length;
+        horizontalOffset = 0;
         render();
-      } else if (key.name === 'down') {
+      } else if (!editing && key.name === 'down') {
         selected = (selected + 1) % entries.length;
+        horizontalOffset = 0;
         render();
-      } else if (key.name === 'return' || key.name === 'enter') {
-        const selectedArgv = [...entries[selected].argv];
-        cleanup();
-        resolve(selectedArgv);
+      } else if (!editing && key.name === 'left') {
+        horizontalOffset = Math.max(0, horizontalOffset - 4);
+        render();
+      } else if (!editing && key.name === 'right') {
+        horizontalOffset += 4;
+        render();
+      } else if (!editing && (key.name === 'return' || key.name === 'enter')) {
+        editing = true;
+        editCommand = formatStartupCommand(entries[selected].argv);
+        editCursor = editCommand.length;
+        editOffset = 0;
+        editError = undefined;
+        render();
       } else if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
         cleanup();
         reject(new Error('Resume cancelled.'));
