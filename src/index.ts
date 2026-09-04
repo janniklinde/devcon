@@ -172,6 +172,7 @@ const DEVCON_PACKAGE_ROOT = path.resolve(__dirname, '..');
 const DEVCON_REPO_URL = process.env.DEVCON_UPGRADE_REPO || 'https://github.com/janniklinde/devcon.git';
 const DEVCON_UPGRADE_DEFAULT_BRANCH = 'main';
 const DEFAULT_DOCKER_REFRESH_STAGE = 'devcon-tools';
+const DEFAULT_DOCKER_BUILD_NETWORK = 'host';
 const NETWORK_CHECK_HOST = 'api.openai.com';
 const NETWORK_PROBE_TIMEOUT_MS = parsePositiveIntEnv(process.env.DEVCON_NETWORK_PROBE_TIMEOUT_MS, 2500);
 const WEB_DEFAULT_HOST = '0.0.0.0';
@@ -3844,14 +3845,43 @@ function runCommand(
   });
 }
 
-function dockerSupportsNoCacheFilter(): boolean {
+function readDockerBuildHelp(): string {
   const result = spawnSync('docker', ['build', '--help'], {
     encoding: 'utf8',
   });
   if (result.error || result.status !== 0) {
-    return false;
+    return '';
   }
-  return `${result.stdout}\n${result.stderr}`.includes('--no-cache-filter');
+  return `${result.stdout}\n${result.stderr}`;
+}
+
+function dockerSupportsNoCacheFilter(): boolean {
+  return readDockerBuildHelp().includes('--no-cache-filter');
+}
+
+function dockerSupportsBuildNetwork(): boolean {
+  const help = readDockerBuildHelp();
+  if (help.trim().length === 0) {
+    // Docker help is unavailable (e.g. docker missing); assume support and let docker report the real error.
+    return true;
+  }
+  return /(^|\s)--network(\s|=|,)/.test(help);
+}
+
+function resolveDockerBuildNetwork(): string | undefined {
+  const configured = process.env.DEVCON_BUILD_NETWORK?.trim();
+  const mode = configured && configured.length > 0 ? configured : DEFAULT_DOCKER_BUILD_NETWORK;
+  if (mode === 'off') {
+    return undefined;
+  }
+  if (!/^[A-Za-z0-9._-]+$/.test(mode)) {
+    throw new Error(`Invalid DEVCON_BUILD_NETWORK value "${mode}". Use a docker network mode like "host", "default", or "off".`);
+  }
+  if (!dockerSupportsBuildNetwork()) {
+    console.warn('Docker build does not support --network; building with the default build network.');
+    return undefined;
+  }
+  return mode;
 }
 
 async function runDockerBuild(
@@ -3879,8 +3909,14 @@ async function runDockerBuild(
     }
   }
 
+  const buildNetwork = resolveDockerBuildNetwork();
+  if (buildNetwork) {
+    args.push('--network', buildNetwork);
+  }
+
   args.push('.');
-  console.log(`Building Docker image "${spec.tag}" using ${spec.dockerfile} ...`);
+  const networkNote = buildNetwork ? ` (build network: ${buildNetwork})` : '';
+  console.log(`Building Docker image "${spec.tag}" using ${spec.dockerfile}${networkNote} ...`);
   await runCommand('docker', args, { cwd: dockerfileDir });
 }
 
@@ -3926,7 +3962,8 @@ async function handleUpdateCommand(
   for (const { spec, toolNames } of specs.values()) {
     const descriptor = `image "${spec.tag}" for tool(s): ${toolNames.join(', ')}`;
     if (dryRun) {
-      console.log(`[dry-run] Would rebuild ${descriptor} using ${spec.dockerfile}`);
+      const network = resolveDockerBuildNetwork();
+      console.log(`[dry-run] Would rebuild ${descriptor} using ${spec.dockerfile}${network ? ` with build network "${network}"` : ''}`);
       continue;
     }
     console.log(`Rebuilding ${descriptor}`);
@@ -3976,7 +4013,8 @@ async function handleRebuildCommand(
   for (const { spec, toolNames } of specs.values()) {
     const descriptor = `image "${spec.tag}" for tool(s): ${toolNames.join(', ')}`;
     if (dryRun) {
-      console.log(`[dry-run] Would fully rebuild ${descriptor} (no cache) using ${spec.dockerfile}`);
+      const network = resolveDockerBuildNetwork();
+      console.log(`[dry-run] Would fully rebuild ${descriptor} (no cache) using ${spec.dockerfile}${network ? ` with build network "${network}"` : ''}`);
       continue;
     }
     console.log(`Fully rebuilding ${descriptor} (cache disabled)`);
@@ -4140,6 +4178,8 @@ async function handleUpgradeCommand(args: string[], dryRun: boolean): Promise<vo
     console.log('[dry-run] Would run: npm run build');
     console.log('[dry-run] Would run: npm install -g .');
     console.log('[dry-run] Would run: devcon rebuild');
+    const upgradeBuildNetwork = resolveDockerBuildNetwork();
+    console.log(`[dry-run] Docker builds would use build network "${upgradeBuildNetwork ?? 'docker default'}".`);
     return;
   }
 
@@ -4233,6 +4273,7 @@ function printHelp(tools: ToolMap): void {
   console.log('  --mount PATH[:NAME] Bind-mount an extra host directory under /workspace/NAME (repeatable)');
   console.log('  --export-patch[=PATH] Export changes from temp-git repo after run (defaults to .devcon/drafts/<ts>.patch)');
   console.log('  --network-host, -network-host Use host networking (helps with VPNs that block Docker bridge DNS/NAT)');
+  console.log('                (upgrade/update/rebuild always build images with host networking; override via DEVCON_BUILD_NETWORK)');
   console.log('  --ipv4, -ipv4 Force IPv4-only networking by disabling IPv6 inside the container');
   console.log('  --gpu[=nvidia] Give the container access to all NVIDIA GPUs (requires NVIDIA Container Toolkit)');
   console.log('  --web         Run tool inside tmux and expose it through the built-in web terminal');
@@ -4714,8 +4755,11 @@ async function main(): Promise<void> {
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon upgrade".');
     }
-    if (options.allowGit || options.localGit || options.hideGit || options.tempGit || options.forceIpv4 || options.networkHost || options.gpu || options.conscious || options.environmentName || options.disableEnvironment) {
+    if (options.allowGit || options.localGit || options.hideGit || options.tempGit || options.forceIpv4 || options.gpu || options.conscious || options.environmentName || options.disableEnvironment) {
       throw new Error('Container runtime flags are not supported with "devcon upgrade".');
+    }
+    if (options.networkHost) {
+      console.log('Note: devcon upgrade already builds images with host networking; --network-host is redundant.');
     }
     assertNoExtraMounts(options.mountPaths, 'upgrade');
     await handleUpgradeCommand(options.toolArgs, options.dryRun);

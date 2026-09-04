@@ -179,6 +179,7 @@ Useful flags (place before `--` that separates devcon flags from tool args):
 - `--mount PATH[:NAME]` – Add an extra bind mount for the current run only (repeatable). By default it is mounted under `/workspace/<folder-name>`; append `:NAME` to choose another name (e.g. `--mount ../other/devcon:reference` => `/workspace/reference`). Extra mounts are scanned/masked with the same sensitive-path rules as the main project mount.
 - `--export-patch[=PATH]` – With `--temp-git`, export patches after the run to PATH (or `.devcon/drafts/<timestamp>.patch`).
 - `--network-host` / `-network-host` – Use host networking (often required on VPNs that block Docker bridge DNS/NAT).
+  Image builds run by `upgrade`/`update`/`rebuild` always use host networking; see `DEVCON_BUILD_NETWORK` below.
 - `--ipv4` / `-ipv4` – Force IPv4-only networking by disabling IPv6 inside the container.
 - `--gpu` / `--gpu=nvidia` – Give the container access to all NVIDIA GPUs. Requires an NVIDIA driver, Docker 19.03+, and NVIDIA Container Toolkit configured on the host.
 - `--web` – Run the tool inside tmux and expose it through the built-in web terminal.
@@ -366,6 +367,8 @@ devcon update codex  # limit the rebuild to a single tool/image
 `devcon upgrade [--branch main]` updates the Devcon package from the GitHub repo, runs `npm install`, `npm run build`, and `npm install -g .`, then runs `devcon rebuild`. In a Git checkout it uses `git pull --ff-only` and refuses to continue over uncommitted changes. In a packaged install without `.git`, it builds a temporary clone first, then replaces the installed package after the build succeeds.
 
 `devcon update` refreshes the Dockerfile stage that installs the bundled CLIs without throwing away the whole Docker cache, so base layers stay hot while Codex CLI, Claude Code, OpenCode, and Pi get refreshed. On older Docker versions without stage-level cache filtering, it falls back to a full no-cache rebuild.
+
+Image builds started by `devcon upgrade`, `devcon update`, `devcon rebuild`, and the interactive auto-build prompt run with `docker build --network host`, so package installs inside the Dockerfile use the host DNS/routing stack (the same reason `--network-host` exists for containers, and usually required on VPNs that break Docker bridge DNS/NAT). Override it with `DEVCON_BUILD_NETWORK=<mode>` (for example `DEVCON_BUILD_NETWORK=default`), or `DEVCON_BUILD_NETWORK=off` to omit the flag entirely. Passing `--network-host` to `devcon upgrade` is accepted but redundant.
 
 When you need a clean slate (ignore every cached layer), use:
 
