@@ -8,6 +8,7 @@
 - Bind-mount the current working directory at `/workspace/<current-folder-name>` and run as your host UID/GID so file permissions stay intact.
 - Optionally bind-mount extra host directories for a single run via `--mount PATH[:NAME]` (repeatable), mounted under `/workspace/<folder-name>` by default or `/workspace/NAME` when an alias is supplied.
 - Optionally expose all host NVIDIA GPUs to a tool container with `--gpu`.
+- Opt into cgroup v2 controller delegation (`--cgroup`) so agents can run memory- and I/O-bounded experiments without root inside the container.
 - Keep the host home directory private by default. Opt in with `--home` or `DEVCON_SHARE_HOME=1`, or whitelist individual directories via `writablePaths` so credentials like `~/.codex` can still be shared.
 - Share global agent skills across all bundled harnesses through the host's `~/.agents/skills` directory, without requiring the persistent development environment.
 - Automatically attach a persistent, non-root development environment to each workspace so agents can retain Python environments, JDKs, user binaries, and build caches without retaining the container root filesystem.
@@ -67,6 +68,7 @@ devcon --mount ../shared codex # add one extra host directory for this run only
 devcon --mount ../other/devcon:reference codex # mount a same-named directory as /workspace/reference
 devcon run -- git log --oneline # inspect history using the default read-only Git access
 devcon --conscious codex       # enable persistent archive memory for this run
+devcon --cgroup pi              # delegate cgroup v2 controllers for resource-limit experiments
 ```
 
 `devcon resume` shows the latest successful startup commands recorded for the exact current directory. Use ↑/↓ to choose one and ←/→ to scroll through a command that is wider than the terminal; the most recent command is selected by default. Press Enter once to edit the selected command and Enter again to execute it. Devcon keeps up to 20 distinct startup commands per directory in `~/.config/devcon/startup-history.json`. Administrative commands, help, invalid launches, and dry runs are not recorded.
@@ -211,6 +213,40 @@ Host requirements:
 `--gpu` controls device exposure only. The bundled `devcon:latest` image does not include a CUDA toolkit. Python packages that bundle CUDA userspace libraries may work in the default image; CUDA compilation or other specialized workloads should use a suitable custom image through `--image` or `tools.json`.
 
 GPU access broadens the host kernel-driver interface available to code inside the container and allows that code to consume GPU memory and compute resources. Enable it only for workloads you trust.
+
+## Cgroup delegation (`--cgroup`)
+
+`--cgroup` delegates cgroup v2 controllers into the container so agents can run resource-isolated experiments — bounded memory, page-cache accounting, I/O throttling — as a normal user, without root:
+
+```bash
+devcon --cgroup pi
+```
+
+Host requirements: a cgroup v2 (unified hierarchy) host and Docker 20.10 or newer. `--no-cgroup` disables it for one run; `DEVCON_CGROUP=1` in the environment makes it the default.
+
+Devcon starts a trusted root bootstrap in a private cgroup namespace. It checks Docker’s namespace-scoped cgroup2 mount and makes that mount writable with a bind remount (never the host cgroup tree or the shared filesystem superblock), moves bootstrap processes into `devcon/holding`, enables memory, io, pids and cpu, and assigns the `devcon` subtree to your UID. Missing controllers or setup failures stop the session before agent startup. A preflight runs as your UID and must trigger an OOM kill under a 64 MiB cap before startup proceeds.
+
+The bootstrap needs `SYS_ADMIN`, but the agent starts through `setpriv` with your UID/GID, no supplementary groups, an empty capability bounding set, and `no_new_privs`. `SYS_PTRACE`, privileged mode, host PID namespaces, host cgroup binds, and Docker socket access are not needed. The root bootstrap still broadens the kernel interface during setup; use a trusted image. Custom images need `mount`, `setpriv`, Node.js, and `/usr/bin/tini`. `--strict-sandbox` is incompatible with the bootstrap mount. Launch as a non-root host user.
+
+Rebuild the bundled image to obtain `sysstat` (`iostat`) and `util-linux` (`setpriv`). Inside the session:
+
+```bash
+D=$DEVCON_CGROUP_DIR
+mkdir "$D/exp1"
+echo 536870912 > "$D/exp1/memory.max"
+echo 0 > "$D/exp1/memory.swap.max"
+# BASHPID identifies the subshell; $$ still identifies the parent shell in Bash.
+( echo "$BASHPID" > "$D/exp1/cgroup.procs"; exec ./my_experiment )
+cat "$D/exp1/memory.events" "$D/exp1/memory.peak"
+cat "$D/exp1/io.stat"
+rmdir "$D/exp1" # succeeds once processes and child cgroups are gone
+```
+
+`memory.current` includes charged page cache. Removing a cgroup does **not** evict cached file data: use per-file `POSIX_FADV_DONTNEED` when appropriate, and disclose that cache control is best effort. `/proc/sys/vm/drop_caches` affects the whole host and is not exposed for writing.
+
+`io.stat` reports I/O attributed to the experiment; `iostat -dx 1` reports device-wide activity, which can include other host workloads. Neither requires raw block-device mounts. `io.max` supports device-specific throttling, but filesystem, storage driver, and writeback support affect accounting; verify the counters on your workload before relying on them. Standard `/proc` device counters can reveal aggregate host activity, so this option does not promise private host I/O telemetry.
+
+Only the delegated subtree is user-owned; the agent cannot change the container's outer limits. Docker cleans up its cgroups at exit. Once controllers are enabled at the namespace root, runtimes that place `docker exec` processes there may reject exec with EBUSY; devcon uses no post-start exec bootstrap. A failed preflight exits with status 78 (other setup commands may return their own nonzero status). Container behavior and OOM enforcement should also be checked on each target Docker/runtime version.
 
 Pass tool arguments after `--` so they are not parsed by devcon. Examples:
 

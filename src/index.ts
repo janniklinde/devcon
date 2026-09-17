@@ -61,6 +61,7 @@ interface CliOptions {
   forceIpv4: boolean;
   networkHost: boolean;
   gpu: boolean;
+  cgroup: boolean;
   conscious: boolean;
   consciousStatePath?: string;
   environmentName?: string;
@@ -159,6 +160,9 @@ const WORKSPACE_ROOT = '/workspace';
 const DEFAULT_WORKSPACE_DIRNAME = 'project';
 const HOME_READONLY_DEFAULT = parseBooleanEnv(process.env.DEVCON_HOME_READONLY);
 const SHARE_HOME_DEFAULT = parseBooleanEnv(process.env.DEVCON_SHARE_HOME);
+const CGROUP_DEFAULT = parseBooleanEnv(process.env.DEVCON_CGROUP);
+const CGROUP_CONTROLLERS = ['memory', 'io', 'pids', 'cpu'];
+const CGROUP_DELEGATED_DIR = '/sys/fs/cgroup/devcon';
 const DEFAULT_IMAGE_TAG = 'devcon:latest';
 const SHARED_SKILL_TOOL_NAMES = new Set(['codex', 'claude', 'opencode', 'pi']);
 const SHARED_SKILLS_RELATIVE_PATH = path.join('.agents', 'skills');
@@ -1123,6 +1127,7 @@ function parseArgs(argv: string[]): CliOptions {
   let forceIpv4 = false;
   let networkHost = false;
   let gpu = false;
+  let cgroup = CGROUP_DEFAULT;
   let conscious = false;
   let consciousStatePath: string | undefined;
   let environmentName: string | undefined;
@@ -1321,6 +1326,16 @@ function parseArgs(argv: string[]): CliOptions {
       continue;
     }
 
+    if (arg === '--cgroup') {
+      cgroup = true;
+      continue;
+    }
+
+    if (arg === '--no-cgroup') {
+      cgroup = false;
+      continue;
+    }
+
     if (arg === '--conscious' || arg === '-conscious') {
       conscious = true;
       continue;
@@ -1430,6 +1445,7 @@ function parseArgs(argv: string[]): CliOptions {
     forceIpv4,
     networkHost,
     gpu,
+    cgroup,
     conscious,
     consciousStatePath,
     environmentName,
@@ -3123,6 +3139,60 @@ function ensureNvidiaGpuSupport(): void {
   }
 }
 
+function ensureCgroupDelegationSupported(): void {
+  const fsType = spawnSync('stat', ['-fc', '%T', '/sys/fs/cgroup'], { encoding: 'utf8' });
+  if (fsType.error || fsType.status !== 0 || fsType.stdout.trim() !== 'cgroup2fs') {
+    throw new Error('--cgroup requires a cgroup v2 (unified hierarchy) host: /sys/fs/cgroup must be a cgroup2fs mount.');
+  }
+  const help = spawnSync('docker', ['run', '--help'], { encoding: 'utf8' });
+  if (help.error || help.status !== 0 || !help.stdout.includes('--cgroupns')) {
+    throw new Error('--cgroup requires a Docker version that supports the --cgroupns option (Docker 20.10 or newer).');
+  }
+}
+
+function buildCgroupBootstrapScript(uid: number, gid: number): string {
+  return `#!/bin/sh
+set -eu
+fail() { echo "[devcon cgroup] DELEGATION FAILED: $*" >&2; exit 78; }
+for cmd in mount awk setpriv node; do command -v "$cmd" >/dev/null || fail "missing $cmd in image"; done
+# Docker must supply a private cgroup namespace; verify its namespace-root path.
+[ "$(cat /proc/self/cgroup)" = '0::/' ] || fail "unexpected cgroup namespace"
+root=/sys/fs/cgroup
+# Docker already mounts a namespace-scoped cgroup2 view. Check its mount root
+# before changing this mount's read-only flag; never remount the superblock.
+awk '$5 == "/sys/fs/cgroup" && $4 == "/" { for (i=7;i<=NF;i++) if ($i == "-" && $(i+1) == "cgroup2") ok=1 } END { exit !ok }' /proc/self/mountinfo || fail "unexpected cgroup2 mount root"
+mount -o remount,bind,rw,nosuid,nodev,noexec "$root" || fail "cannot make private cgroup2 mount writable"
+[ -w "$root/cgroup.subtree_control" ] || fail "private cgroup2 mount is still read-only"
+for c in ${CGROUP_CONTROLLERS.join(' ')}; do
+  grep -qw "$c" "$root/cgroup.controllers" || fail "controller $c unavailable"
+done
+mkdir "$root/devcon"
+mkdir "$root/devcon/holding"
+# Before launching user code all processes belong to this trusted root bootstrap.
+for p in $(cat "$root/cgroup.procs"); do
+  if ! echo "$p" > "$root/devcon/holding/cgroup.procs"; then
+    [ ! -d "/proc/$p" ] || fail "cannot migrate bootstrap process"
+  fi
+done
+[ -z "$(cat "$root/cgroup.procs")" ] || fail "namespace root is populated"
+echo '${CGROUP_CONTROLLERS.map(c => '+' + c).join(' ')}' > "$root/cgroup.subtree_control"
+echo '${CGROUP_CONTROLLERS.map(c => '+' + c).join(' ')}' > "$root/devcon/cgroup.subtree_control"
+chown -R ${uid}:${gid} "$root/devcon"
+# Test migration and memory enforcement as the eventual agent UID, without capabilities.
+probe="$root/devcon/preflight"
+mkdir "$probe"
+chown -R ${uid}:${gid} "$probe"
+echo 67108864 > "$probe/memory.max"
+echo 0 > "$probe/memory.swap.max"
+setpriv --reuid=${uid} --regid=${gid} --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs node -e 'const fs=require("fs"); fs.writeFileSync(process.argv[1]+"/cgroup.procs",String(process.pid)); const b=Buffer.alloc(256*1024*1024); for(let i=0;i<b.length;i+=4096)b[i]=1; console.error("memory cap not enforced");' "$probe" && fail "memory cap not enforced"
+grep -Eq '^oom_kill [1-9][0-9]*$' "$probe/memory.events" || fail "memory probe did not produce a cgroup OOM kill"
+rmdir "$probe"
+echo '[devcon cgroup] delegation active; unprivileged migration and 64 MiB memory cap verified' >&2
+# No agent code runs before privileges and the capability bounding set are dropped.
+exec setpriv --reuid=${uid} --regid=${gid} --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs /usr/bin/tini -- "$@"
+`;
+}
+
 function ensureHostGitAvailable(): void {
   const result = spawnSync('git', ['version'], { stdio: 'ignore' });
   if (result.error || result.status !== 0) {
@@ -4276,6 +4346,8 @@ function printHelp(tools: ToolMap): void {
   console.log('                (upgrade/update/rebuild always build images with host networking; override via DEVCON_BUILD_NETWORK)');
   console.log('  --ipv4, -ipv4 Force IPv4-only networking by disabling IPv6 inside the container');
   console.log('  --gpu[=nvidia] Give the container access to all NVIDIA GPUs (requires NVIDIA Container Toolkit)');
+  console.log('  --cgroup      Delegate cgroup v2 controllers (memory, io, pids, cpu) into the container for resource-limit experiments');
+  console.log('  --no-cgroup   Disable cgroup delegation for this run (default: off; DEVCON_CGROUP=1 makes it the default)');
   console.log('  --web         Run tool inside tmux and expose it through the built-in web terminal');
   console.log('  --web-host HOST Web server bind host (default: 0.0.0.0)');
   console.log('  --web-port PORT Web server port (default: 7682)');
@@ -4317,6 +4389,7 @@ function buildDockerArgs(options: {
   forceIpv4: boolean;
   networkHost: boolean;
   gpu: boolean;
+  cgroup: boolean;
   environment?: PersistentEnvironment;
   conscious?: ConsciousRuntime;
 }): DockerLaunchPlan {
@@ -4341,7 +4414,7 @@ function buildDockerArgs(options: {
   let homeEnvSet = false;
 
   if (typeof process.getuid === 'function' && typeof process.getgid === 'function') {
-    dockerArgs.push('-u', `${process.getuid()}:${process.getgid()}`);
+    dockerArgs.push('-u', options.cgroup ? '0:0' : `${process.getuid()}:${process.getgid()}`);
   }
 
   if (!options.strictSandbox) {
@@ -4356,6 +4429,26 @@ function buildDockerArgs(options: {
   if (options.gpu) {
     dockerArgs.push('--gpus', 'all');
     console.log('NVIDIA GPU access enabled: all host NVIDIA GPUs will be visible to the container.');
+  }
+
+  if (options.cgroup) {
+    const uid = process.getuid?.();
+    const gid = process.getgid?.();
+    if (uid === undefined || gid === undefined || uid === 0) {
+      throw new Error('--cgroup requires a non-root POSIX host user.');
+    }
+    if (options.strictSandbox) {
+      throw new Error('--cgroup cannot use --strict-sandbox: the bootstrap needs a cgroup2 mount.');
+    }
+    dockerArgs.push('--cgroupns', 'private', '--cap-add', 'SYS_ADMIN');
+    dockerArgs.push('--security-opt', 'no-new-privileges=true');
+    const cgroupWorkDir = mkdtempSync(path.join(os.tmpdir(), 'devcon-cgroup-'));
+    cleanupTargets.push(cgroupWorkDir);
+    const scriptPath = path.join(cgroupWorkDir, 'bootstrap.sh');
+    writeFileSync(scriptPath, buildCgroupBootstrapScript(uid, gid), { mode: 0o700 });
+    dockerArgs.push('--mount', `type=bind,source=${scriptPath},target=/tmp/devcon-cgroup-bootstrap.sh,readonly`);
+    dockerArgs.push('--entrypoint', '/tmp/devcon-cgroup-bootstrap.sh');
+    dockerArgs.push('-e', `DEVCON_CGROUP_DIR=${CGROUP_DELEGATED_DIR}`);
   }
 
   if (options.networkHost) {
@@ -4687,7 +4780,7 @@ ${initScriptLines.join('\n')}
       dockerArgs.push('/bin/bash', '--noprofile', '--norc', '-c', `source /tmp/devcon/init.sh && exec ${commandString}`);
     }
   } else {
-    dockerArgs.push(...commandArgs);
+    dockerArgs.push(...(options.cgroup && commandArgs.length === 0 ? ['/bin/bash'] : commandArgs));
   }
 
   const cleanup = (): void => {
@@ -4755,7 +4848,7 @@ async function main(): Promise<void> {
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon upgrade".');
     }
-    if (options.allowGit || options.localGit || options.hideGit || options.tempGit || options.forceIpv4 || options.gpu || options.conscious || options.environmentName || options.disableEnvironment) {
+    if (options.allowGit || options.localGit || options.hideGit || options.tempGit || options.forceIpv4 || options.gpu || options.cgroup || options.conscious || options.environmentName || options.disableEnvironment) {
       throw new Error('Container runtime flags are not supported with "devcon upgrade".');
     }
     if (options.networkHost) {
@@ -4773,6 +4866,9 @@ async function main(): Promise<void> {
     if (options.gpu) {
       throw new Error('The --gpu flag cannot be used with "devcon update".');
     }
+    if (options.cgroup) {
+      throw new Error('The --cgroup flag cannot be used with "devcon update".');
+    }
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon update". Specify the desired image in the tool configuration instead.');
     }
@@ -4787,6 +4883,9 @@ async function main(): Promise<void> {
     }
     if (options.gpu) {
       throw new Error('The --gpu flag cannot be used with "devcon rebuild".');
+    }
+    if (options.cgroup) {
+      throw new Error('The --cgroup flag cannot be used with "devcon rebuild".');
     }
     if (options.imageOverride) {
       throw new Error('The --image flag cannot be used with "devcon rebuild". Specify the desired image in the tool configuration instead.');
@@ -4875,6 +4974,9 @@ async function main(): Promise<void> {
     if (options.gpu && !options.dryRun) {
       ensureNvidiaGpuSupport();
     }
+    if (options.cgroup && !options.dryRun) {
+      ensureCgroupDelegationSupported();
+    }
     const persistentEnvironment = resolvePersistentEnvironment(cwd, options.environmentName, options.disableEnvironment, options.dryRun);
     const consciousRuntime = options.conscious
       ? await prepareConsciousRuntime(cwd, options.toolArgs, options.consciousStatePath)
@@ -4920,6 +5022,7 @@ async function main(): Promise<void> {
       forceIpv4: options.forceIpv4,
       networkHost,
       gpu: options.gpu,
+      cgroup: options.cgroup,
       environment: persistentEnvironment,
       conscious: consciousRuntime,
     });
@@ -4979,6 +5082,9 @@ async function main(): Promise<void> {
   if (options.gpu && !options.dryRun) {
     ensureNvidiaGpuSupport();
   }
+  if (options.cgroup && !options.dryRun) {
+    ensureCgroupDelegationSupported();
+  }
 
   const persistentEnvironment = resolvePersistentEnvironment(cwd, options.environmentName, options.disableEnvironment, options.dryRun);
   const consciousRuntime = options.conscious
@@ -5022,6 +5128,7 @@ async function main(): Promise<void> {
     forceIpv4: options.forceIpv4,
     networkHost,
     gpu: options.gpu,
+    cgroup: options.cgroup,
     environment: persistentEnvironment,
     conscious: consciousRuntime,
   });
