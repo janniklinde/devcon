@@ -50,13 +50,15 @@ Devcon persistent environment
   Python env: $PYTHON_ENV
   Java home:  $JAVA_ROOT/current
   Binaries:   $ENV_ROOT/bin
+  npm prefix: ${NPM_CONFIG_PREFIX:-$ENV_ROOT/npm}
 
 Installation contract:
   - Do not use sudo, apt, apt-get, or system pip.
   - Python: run 'devcon-env python ensure', then use normal python/pip commands.
   - Java: run 'devcon-env java ensure 21' (or another major version).
   - Put standalone user binaries in '$ENV_ROOT/bin'.
-  - Python, Java, Maven, Gradle, npm, uv, Cargo, and Rustup caches are already redirected here.
+  - Python, Java, Maven, Gradle, uv, Cargo, and Rustup caches are redirected here.
+  - Bundled agents use a shared persistent npm prefix at /opt/devcon/agents/npm.
   - Everything under this root persists and is executable in later sessions.
 EOF
   if [ -x "$PYTHON_ENV/bin/python" ]; then

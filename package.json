@@ -11,6 +11,7 @@
   "scripts": {
     "build": "tsc",
     "test:cgroup": "npm run build && node tests/cgroup-bootstrap.cjs",
+    "test:agents": "npm run build && node tests/persistent-agents.cjs",
     "prepare": "npm run build",
     "clean": "rimraf dist",
     "start": "node dist/index.js",

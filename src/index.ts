@@ -137,6 +137,15 @@ const STARTUP_HISTORY_PATH = path.join(os.homedir(), '.config', 'devcon', 'start
 const STARTUP_HISTORY_LIMIT = 20;
 const ENVIRONMENT_STORAGE_PATH = path.join(os.homedir(), '.local', 'share', 'devcon', 'environments');
 const ENVIRONMENT_CONTAINER_PATH = '/opt/devcon/env';
+const AGENT_STORAGE_PATH = path.join(os.homedir(), '.local', 'share', 'devcon', 'agents');
+const AGENT_CONTAINER_PATH = '/opt/devcon/agents';
+const AGENT_NPM_PREFIX = `${AGENT_CONTAINER_PATH}/npm`;
+const AGENT_PACKAGES: Record<string, string> = {
+  codex: '@openai/codex',
+  claude: '@anthropic-ai/claude-code',
+  opencode: 'opencode-ai',
+  pi: '@earendil-works/pi-coding-agent',
+};
 const ENVIRONMENT_HELPER_HOST_PATH = path.resolve(__dirname, '..', 'docker', 'devcon', 'devcon-env');
 const ENVIRONMENT_HELPER_CONTAINER_PATH = '/usr/local/bin/devcon-env';
 const ENVIRONMENT_INSTRUCTIONS_CONTAINER_PATH = '/tmp/devcon/environment-instructions.md';
@@ -175,7 +184,6 @@ const DEFAULT_IMAGE_DOCKERFILE = path.resolve(__dirname, '..', 'docker', 'devcon
 const DEVCON_PACKAGE_ROOT = path.resolve(__dirname, '..');
 const DEVCON_REPO_URL = process.env.DEVCON_UPGRADE_REPO || 'https://github.com/janniklinde/devcon.git';
 const DEVCON_UPGRADE_DEFAULT_BRANCH = 'main';
-const DEFAULT_DOCKER_REFRESH_STAGE = 'devcon-tools';
 const DEFAULT_DOCKER_BUILD_NETWORK = 'host';
 const NETWORK_CHECK_HOST = 'api.openai.com';
 const NETWORK_PROBE_TIMEOUT_MS = parsePositiveIntEnv(process.env.DEVCON_NETWORK_PROBE_TIMEOUT_MS, 2500);
@@ -185,7 +193,7 @@ const WEBHUB_DEFAULT_PORT = 7690;
 const DEFAULT_AUTO_BUILD: AutoBuildConfig = {
   dockerfile: DEFAULT_IMAGE_DOCKERFILE,
   tag: DEFAULT_IMAGE_TAG,
-  description: 'Builds the devcon base image with Codex CLI, Claude Code, OpenCode, and Pi preinstalled.',
+  description: 'Builds the Devcon base runtime. Agent CLIs are installed separately into persistent storage.',
 };
 const DEFAULT_SENSITIVE_PATTERNS = [
   '.env',
@@ -274,7 +282,7 @@ function buildOpenCodeRuntimeConfig(serverCommand?: string[], instructionPath?: 
   return JSON.stringify(config);
 }
 
-function buildEnvironmentAgentInstructions(environment: PersistentEnvironment): string {
+function buildEnvironmentAgentInstructions(environment: PersistentEnvironment, managedAgentInstall = false): string {
   return [
     'You are running in a Devcon container with a persistent, non-root development environment.',
     `The active environment is "${environment.name}" at ${ENVIRONMENT_CONTAINER_PATH}.`,
@@ -282,7 +290,8 @@ function buildEnvironmentAgentInstructions(environment: PersistentEnvironment): 
     'Do not repeatedly try sudo, apt, apt-get, or system pip; they are intentionally unavailable.',
     'Use `devcon-env python ensure` before pip installs and `devcon-env java ensure 21` (or another major) for a JDK.',
     `Install standalone tools under ${ENVIRONMENT_CONTAINER_PATH}/bin. Content there persists across sessions and counts toward a soft size budget.`,
-  ].join('\n');
+    managedAgentInstall ? `The bundled agent CLI uses a shared npm prefix at ${AGENT_NPM_PREFIX}; upgrading that CLI there persists across workspaces.` : undefined,
+  ].filter((line): line is string => Boolean(line)).join('\n');
 }
 
 function buildSharedSkillsAgentInstructions(skillsPath: string): string {
@@ -3925,10 +3934,6 @@ function readDockerBuildHelp(): string {
   return `${result.stdout}\n${result.stderr}`;
 }
 
-function dockerSupportsNoCacheFilter(): boolean {
-  return readDockerBuildHelp().includes('--no-cache-filter');
-}
-
 function dockerSupportsBuildNetwork(): boolean {
   const help = readDockerBuildHelp();
   if (help.trim().length === 0) {
@@ -3956,27 +3961,18 @@ function resolveDockerBuildNetwork(): string | undefined {
 
 async function runDockerBuild(
   spec: AutoBuildConfig,
-  options: { refresh?: boolean; noCache?: boolean; pull?: boolean } = {},
+  options: { noCache?: boolean; pull?: boolean } = {},
 ): Promise<void> {
   const dockerfileDir = path.dirname(spec.dockerfile);
   const dockerfileName = path.basename(spec.dockerfile);
   const args = ['build', '-f', dockerfileName, '-t', spec.tag];
 
-  if (options.refresh || options.pull) {
+  if (options.pull) {
     args.push('--pull');
   }
 
   if (options.noCache) {
     args.push('--no-cache');
-  }
-
-  if (options.refresh) {
-    if (dockerSupportsNoCacheFilter()) {
-      args.push('--no-cache-filter', DEFAULT_DOCKER_REFRESH_STAGE);
-    } else {
-      console.warn('Docker does not support --no-cache-filter; falling back to a full no-cache image rebuild.');
-      args.push('--no-cache');
-    }
   }
 
   const buildNetwork = resolveDockerBuildNetwork();
@@ -3988,6 +3984,51 @@ async function runDockerBuild(
   const networkNote = buildNetwork ? ` (build network: ${buildNetwork})` : '';
   console.log(`Building Docker image "${spec.tag}" using ${spec.dockerfile}${networkNote} ...`);
   await runCommand('docker', args, { cwd: dockerfileDir });
+}
+
+function usesManagedAgentInstall(name: string, tool: ToolDefinition): boolean {
+  return Boolean(AGENT_PACKAGES[name]
+    && tool.image === DEFAULT_IMAGE_TAG
+    && tool.command?.[0] === name);
+}
+
+function agentExecutablePath(name: string): string {
+  return path.join(AGENT_STORAGE_PATH, 'npm', 'bin', name);
+}
+
+async function installManagedAgent(name: string, image: string, dryRun: boolean): Promise<void> {
+  const packageName = AGENT_PACKAGES[name];
+  if (!packageName) {
+    throw new Error(`No managed package is configured for agent "${name}".`);
+  }
+  if (dryRun) {
+    console.log(`[dry-run] Would install ${packageName}@latest into ${AGENT_STORAGE_PATH}`);
+    return;
+  }
+  mkdirSync(path.join(AGENT_STORAGE_PATH, 'npm'), { recursive: true, mode: 0o700 });
+  mkdirSync(path.join(AGENT_STORAGE_PATH, 'cache', 'npm'), { recursive: true, mode: 0o700 });
+  const args = [
+    'run', '--rm', '--user', `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`,
+    '--mount', `type=bind,source=${AGENT_STORAGE_PATH},target=${AGENT_CONTAINER_PATH}`,
+    '-e', `NPM_CONFIG_PREFIX=${AGENT_NPM_PREFIX}`,
+    '-e', `NPM_CONFIG_CACHE=${AGENT_CONTAINER_PATH}/cache/npm`,
+    '-e', 'HOME=/tmp',
+    '--entrypoint', 'npm',
+  ];
+  const network = resolveDockerBuildNetwork();
+  if (network) {
+    args.push('--network', network);
+  }
+  args.push(image, 'install', '-g');
+  if (name !== 'claude') {
+    args.push('--ignore-scripts');
+  }
+  args.push(`${packageName}@latest`);
+  console.log(`Installing ${packageName}@latest into persistent Devcon agent storage...`);
+  await runCommand('docker', args);
+  if (!existsSync(agentExecutablePath(name))) {
+    throw new Error(`Agent install completed but ${agentExecutablePath(name)} was not created.`);
+  }
 }
 
 async function handleUpdateCommand(
@@ -4006,6 +4047,15 @@ async function handleUpdateCommand(
     const tool = tools[name];
     if (!tool) {
       throw new Error(`Unknown tool "${name}" specified for update.`);
+    }
+    if (usesManagedAgentInstall(name, tool)) {
+      if (dryRun) {
+        await installManagedAgent(name, tool.image, true);
+      } else {
+        await ensureImageAvailable(tool.image, tool.autoBuild);
+        await installManagedAgent(name, tool.image, false);
+      }
+      continue;
     }
     if (!tool.autoBuild) {
       console.warn(`Tool "${name}" does not have an auto-build configuration and will be skipped.`);
@@ -4036,8 +4086,8 @@ async function handleUpdateCommand(
       console.log(`[dry-run] Would rebuild ${descriptor} using ${spec.dockerfile}${network ? ` with build network "${network}"` : ''}`);
       continue;
     }
-    console.log(`Rebuilding ${descriptor}`);
-    await runDockerBuild(spec, { refresh: true });
+    console.log(`Rebuilding ${descriptor} (cache disabled)`);
+    await runDockerBuild(spec, { noCache: true });
   }
 }
 
@@ -4343,7 +4393,7 @@ function printHelp(tools: ToolMap): void {
   console.log('  --mount PATH[:NAME] Bind-mount an extra host directory under /workspace/NAME (repeatable)');
   console.log('  --export-patch[=PATH] Export changes from temp-git repo after run (defaults to .devcon/drafts/<ts>.patch)');
   console.log('  --network-host, -network-host Use host networking (helps with VPNs that block Docker bridge DNS/NAT)');
-  console.log('                (upgrade/update/rebuild always build images with host networking; override via DEVCON_BUILD_NETWORK)');
+  console.log('                (agent installs and image builds use host networking by default; override via DEVCON_BUILD_NETWORK)');
   console.log('  --ipv4, -ipv4 Force IPv4-only networking by disabling IPv6 inside the container');
   console.log('  --gpu[=nvidia] Give the container access to all NVIDIA GPUs (requires NVIDIA Container Toolkit)');
   console.log('  --cgroup      Delegate cgroup v2 controllers (memory, io, pids, cpu) into the container for resource-limit experiments');
@@ -4358,8 +4408,8 @@ function printHelp(tools: ToolMap): void {
   console.log('  --help        Show this message');
   console.log('\nCommands:');
   console.log('  resume        Choose and rerun a recent startup command from this exact directory');
-  console.log('  upgrade       Pull and install the latest devcon repo, then rebuild bundled containers');
-  console.log('  update        Refresh Docker images for one or more tools (pull base, rerun npm install)');
+  console.log('  upgrade       Pull and install the latest devcon repo, then rebuild the base image');
+  console.log('  update        Refresh persistent bundled agents, or rebuild configured custom images');
   console.log('  rebuild       Fully rebuild Docker images for one or more tools (no cache)');
   console.log('  sensitive     List/add/remove sensitive-path patterns that get masked in containers');
   console.log('  skip-scan     List/add/remove directory names skipped during sensitive-pattern scanning');
@@ -4392,6 +4442,7 @@ function buildDockerArgs(options: {
   cgroup: boolean;
   environment?: PersistentEnvironment;
   conscious?: ConsciousRuntime;
+  managedAgentInstall?: boolean;
 }): DockerLaunchPlan {
   const dockerArgs: string[] = ['run', '--rm', '-it'];
   const cleanupTargets: string[] = [];
@@ -4496,15 +4547,25 @@ function buildDockerArgs(options: {
     dockerArgs.push('-e', `UV_CACHE_DIR=${ENVIRONMENT_CONTAINER_PATH}/cache/uv`);
     dockerArgs.push('-e', `GRADLE_USER_HOME=${ENVIRONMENT_CONTAINER_PATH}/gradle`);
     dockerArgs.push('-e', `MAVEN_OPTS=-Dmaven.repo.local=${ENVIRONMENT_CONTAINER_PATH}/maven/repository`);
-    dockerArgs.push('-e', `NPM_CONFIG_PREFIX=${ENVIRONMENT_CONTAINER_PATH}/npm`);
+    if (!options.managedAgentInstall) {
+      dockerArgs.push('-e', `NPM_CONFIG_PREFIX=${ENVIRONMENT_CONTAINER_PATH}/npm`);
+    }
     dockerArgs.push('-e', `CARGO_HOME=${ENVIRONMENT_CONTAINER_PATH}/cargo`);
     dockerArgs.push('-e', `RUSTUP_HOME=${ENVIRONMENT_CONTAINER_PATH}/rustup`);
-    // Keep Devcon's agent CLIs and helper ahead of persistent binaries so an
-    // environment cannot silently replace the agent executable on the next launch.
-    dockerArgs.push('-e', `PATH=/usr/local/sbin:/usr/local/bin:${ENVIRONMENT_CONTAINER_PATH}/python/bin:${ENVIRONMENT_CONTAINER_PATH}/java/current/bin:${ENVIRONMENT_CONTAINER_PATH}/bin:${ENVIRONMENT_CONTAINER_PATH}/npm/bin:${ENVIRONMENT_CONTAINER_PATH}/cargo/bin:/usr/sbin:/usr/bin:/sbin:/bin`);
+    const agentBin = options.managedAgentInstall ? `${AGENT_NPM_PREFIX}/bin:` : '';
+    dockerArgs.push('-e', `PATH=${agentBin}/usr/local/sbin:/usr/local/bin:${ENVIRONMENT_CONTAINER_PATH}/python/bin:${ENVIRONMENT_CONTAINER_PATH}/java/current/bin:${ENVIRONMENT_CONTAINER_PATH}/bin:${ENVIRONMENT_CONTAINER_PATH}/npm/bin:${ENVIRONMENT_CONTAINER_PATH}/cargo/bin:/usr/sbin:/usr/bin:/sbin:/bin`);
 
-    environmentInstructions = buildEnvironmentAgentInstructions(options.environment);
+    environmentInstructions = buildEnvironmentAgentInstructions(options.environment, options.managedAgentInstall);
     console.log(`Persistent environment enabled: ${options.environment.name} (${formatBytes(environmentDiskUsage(options.environment.hostPath))} / ${formatBytes(options.environment.maxBytes)} soft limit).`);
+  }
+
+  if (options.managedAgentInstall) {
+    dockerArgs.push('--mount', `type=bind,source=${AGENT_STORAGE_PATH},target=${AGENT_CONTAINER_PATH}`);
+    dockerArgs.push('-e', `NPM_CONFIG_PREFIX=${AGENT_NPM_PREFIX}`);
+    dockerArgs.push('-e', `NPM_CONFIG_CACHE=${AGENT_CONTAINER_PATH}/cache/npm`);
+    if (!options.environment) {
+      dockerArgs.push('-e', `PATH=${AGENT_NPM_PREFIX}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`);
+    }
   }
 
   if (shareHome && homeDir && existsSync(homeDir)) {
@@ -5101,6 +5162,10 @@ async function main(): Promise<void> {
 
   const image = options.imageOverride ?? tool.image;
   await ensureImageAvailable(image, options.imageOverride ? undefined : tool.autoBuild);
+  const managedAgentInstall = !options.imageOverride && usesManagedAgentInstall(options.toolName, tool);
+  if (managedAgentInstall && !existsSync(agentExecutablePath(options.toolName))) {
+    await installManagedAgent(options.toolName, image, options.dryRun);
+  }
   const networkHost = await maybeEnableHostNetwork(image, options.networkHost, options.dryRun);
   if (consciousRuntime) {
     if (networkHost) {
@@ -5131,6 +5196,7 @@ async function main(): Promise<void> {
     cgroup: options.cgroup,
     environment: persistentEnvironment,
     conscious: consciousRuntime,
+    managedAgentInstall,
   });
 
   if (options.webMode) {

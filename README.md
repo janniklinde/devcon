@@ -1,6 +1,6 @@
 # devcon
 
-`devcon` is a Linux-only CLI that launches AI coding agents like Codex CLI, Claude Code, OpenCode, or Pi in fresh Docker containers that already have your working directory wired up. Install globally (`npm install -g devcon`) and run `devcon codex` (or `devcon claude`, `devcon opencode`, or `devcon pi`) from any project to get a locked-down shell within seconds. If no image is configured, Devcon defaults to a local `devcon:latest` image that bundles all four CLIs; the first time you run a tool the CLI offers to build this image for you.
+`devcon` is a Linux-only CLI that launches AI coding agents like Codex CLI, Claude Code, OpenCode, or Pi in fresh Docker containers that already have your working directory wired up. Install globally (`npm install -g devcon`) and run `devcon codex` (or `devcon claude`, `devcon opencode`, or `devcon pi`) from any project to get a locked-down shell. If no image is configured, Devcon defaults to a local `devcon:latest` base image; the first time you run a bundled tool, the CLI offers to build the image and installs that agent into persistent storage.
 
 ## What it does
 
@@ -30,7 +30,7 @@ npm run build
 npm install -g .
 ```
 
-To upgrade an existing Devcon install from the upstream repo and rebuild the bundled containers:
+To upgrade an existing Devcon install from the upstream repo and rebuild the base image:
 
 ```bash
 devcon upgrade
@@ -45,7 +45,7 @@ devcon upgrade --branch main
 devcon <tool> [flags] [-- tool arguments]
 devcon resume             # choose a recent startup command used in this directory
 
-# Rebuild the default tool images (all tools or a specific one)
+# Update agents or rebuild the base image
 devcon upgrade
 devcon upgrade --branch main
 devcon update
@@ -181,7 +181,7 @@ Useful flags (place before `--` that separates devcon flags from tool args):
 - `--mount PATH[:NAME]` – Add an extra bind mount for the current run only (repeatable). By default it is mounted under `/workspace/<folder-name>`; append `:NAME` to choose another name (e.g. `--mount ../other/devcon:reference` => `/workspace/reference`). Extra mounts are scanned/masked with the same sensitive-path rules as the main project mount.
 - `--export-patch[=PATH]` – With `--temp-git`, export patches after the run to PATH (or `.devcon/drafts/<timestamp>.patch`).
 - `--network-host` / `-network-host` – Use host networking (often required on VPNs that block Docker bridge DNS/NAT).
-  Image builds run by `upgrade`/`update`/`rebuild` always use host networking; see `DEVCON_BUILD_NETWORK` below.
+  Agent installs and image builds use host networking by default; see `DEVCON_BUILD_NETWORK` below.
 - `--ipv4` / `-ipv4` – Force IPv4-only networking by disabling IPv6 inside the container.
 - `--gpu` / `--gpu=nvidia` – Give the container access to all NVIDIA GPUs. Requires an NVIDIA driver, Docker 19.03+, and NVIDIA Container Toolkit configured on the host.
 - `--web` – Run the tool inside tmux and expose it through the built-in web terminal.
@@ -210,7 +210,7 @@ Host requirements:
 - Docker 19.03 or newer.
 - [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) installed and configured for Docker. A typical toolkit configuration is `nvidia-ctk runtime configure --runtime=docker`, followed by restarting Docker.
 
-`--gpu` controls device exposure only. The bundled `devcon:latest` image does not include a CUDA toolkit. Python packages that bundle CUDA userspace libraries may work in the default image; CUDA compilation or other specialized workloads should use a suitable custom image through `--image` or `tools.json`.
+`--gpu` controls device exposure only. The bundled `devcon:latest` image does not include a CUDA toolkit. Python packages that bundle CUDA userspace libraries can be installed in the persistent Python environment; CUDA compilation or other specialized workloads should use a suitable custom image through `--image` or `tools.json`.
 
 GPU access broadens the host kernel-driver interface available to code inside the container and allows that code to consume GPU memory and compute resources. Enable it only for workloads you trust.
 
@@ -259,9 +259,9 @@ devcon codex -- --dry-run "my prompt"
 
 ## Persistent development environments
 
-Devcon automatically creates one persistent environment for each workspace on its first tool launch. The container itself remains disposable; only the dedicated environment directory under `~/.local/share/devcon/environments/` persists. Workspace-to-environment assignments are stored in `~/.config/devcon/environments.json`.
+Devcon automatically creates one persistent environment for each workspace on its first tool launch. The container itself remains disposable; the dedicated environment directory under `~/.local/share/devcon/environments/` persists. Workspace-to-environment assignments are stored in `~/.config/devcon/environments.json`.
 
-Inside the container, the environment is mounted at `/opt/devcon/env`. Devcon configures `PATH`, `VIRTUAL_ENV`, `JAVA_HOME`, and Python, uv, Maven, Gradle, npm, Cargo, and Rustup cache/install locations to use it. Built-in agents receive explicit system instructions to run `devcon-env info` before installing anything and not to retry `sudo`, `apt`, or system `pip`. `sudo`, `apt`, and `apt-get` are replaced with explanatory shims that point agents back to `devcon-env` instead of returning an ambiguous permission error.
+Inside the container, the environment is mounted at `/opt/devcon/env`. Devcon configures `PATH`, `VIRTUAL_ENV`, `JAVA_HOME`, and Python, uv, Maven, Gradle, Cargo, and Rustup cache/install locations to use it. Bundled agents use a separate shared npm prefix described below; custom tools continue to use the workspace environment's npm prefix. Built-in agents receive explicit system instructions to run `devcon-env info` before installing project dependencies and not to retry `sudo`, `apt`, or system `pip`. `sudo`, `apt`, and `apt-get` are replaced with explanatory shims that point agents back to `devcon-env` instead of returning an ambiguous permission error.
 
 Common flows:
 
@@ -293,7 +293,7 @@ Use `--env NAME` to select another environment for one run, `devcon env use NAME
 
 The default budget is 10 GiB, configurable for newly auto-created environments with `DEVCON_ENV_MAX_GB`. `--size` controls explicitly created environments. This is currently a **soft limit** because portable Docker bind-mount quotas are not available: Devcon blocks future launches when an environment is over budget and warns after a session that crosses it, but it cannot prevent a running process from temporarily exceeding the limit.
 
-The environment runs as the host UID/GID but has no `sudo` and does not receive the host home or Docker socket. Persistent package state is executable and therefore trusted state: a malicious dependency can affect later sessions using that environment. Authentication mounts and the writable workspace retain their existing security implications.
+The environment runs as the host UID/GID but has no `sudo` and does not receive the host home or Docker socket. Persistent package state is executable and therefore trusted state: a malicious dependency can affect later sessions using that environment. The shared agent install directory is also executable trusted state across workspaces. Authentication mounts and the writable workspace retain their existing security implications.
 
 ## Shared agent skills
 
@@ -384,7 +384,9 @@ Notes:
 
 ## Default image (`devcon:latest`)
 
-The bundled tools (`codex`, `claude`, `opencode`, `pi`) point to an image named `devcon:latest` that bakes in all four CLIs. The image uses Node.js 22 because current Pi releases require it. On the first run Devcon checks whether that tag exists locally; if not, you’ll see a short explanation plus a `Build it now? [y/N]` prompt. Answer `y` and the CLI runs:
+The bundled tools (`codex`, `claude`, `opencode`, `pi`) use an image named `devcon:latest` with Node.js 22 and common system utilities. Agent CLIs are installed separately, on first use, into `~/.local/share/devcon/agents/` on the host. This directory is mounted at `/opt/devcon/agents` and shared across workspaces, including sessions started with `--no-env`. The bundled agent executable in that directory is first on `PATH`, and global npm installs made inside bundled agent sessions use the same persistent prefix. The image no longer includes general Python data science packages; use `devcon-env python ensure` and install the packages a project needs in its environment.
+
+On the first run Devcon checks whether the image exists locally; if not, you’ll see a `Build it now? [y/N]` prompt. Answer `y` and the CLI builds the base image. It then installs the selected agent once. Later launches use the stored executable without an image rebuild.
 
 ```bash
 docker build -f docker/devcon/Dockerfile -t devcon:latest docker/devcon
@@ -392,25 +394,25 @@ docker build -f docker/devcon/Dockerfile -t devcon:latest docker/devcon
 
 The build context lives inside the npm package, so everything works even if you run `devcon codex` from a random project. If you prefer a custom image, pass `--image my/tag` or set `image` in `~/.config/devcon/tools.json`—auto-build only triggers for the default image.
 
-To manually refresh the bundled image (for example to pick up new Codex CLI or OpenCode releases), run:
+To refresh the bundled agents, run:
 
 ```bash
-devcon upgrade       # upgrade Devcon itself and then rebuild bundled images
-devcon update        # rebuilds every tool with an auto-build config
-devcon update codex  # limit the rebuild to a single tool/image
+devcon upgrade       # upgrade Devcon itself and rebuild the base image
+devcon update        # update all four persistent agents
+devcon update codex  # update only Codex, without rebuilding the image
 ```
 
-`devcon upgrade [--branch main]` updates the Devcon package from the GitHub repo, runs `npm install`, `npm run build`, and `npm install -g .`, then runs `devcon rebuild`. In a Git checkout it uses `git pull --ff-only` and refuses to continue over uncommitted changes. In a packaged install without `.git`, it builds a temporary clone first, then replaces the installed package after the build succeeds.
+`devcon upgrade [--branch main]` updates the Devcon package from the GitHub repo, runs `npm install`, `npm run build`, and `npm install -g .`, then runs `devcon rebuild` to refresh the base image. It does not update already installed agents; run `devcon update` for those. In a Git checkout it uses `git pull --ff-only` and refuses to continue over uncommitted changes. In a packaged install without `.git`, it builds a temporary clone first, then replaces the installed package after the build succeeds.
 
-`devcon update` refreshes the Dockerfile stage that installs the bundled CLIs without throwing away the whole Docker cache, so base layers stay hot while Codex CLI, Claude Code, OpenCode, and Pi get refreshed. On older Docker versions without stage-level cache filtering, it falls back to a full no-cache rebuild.
+`devcon update` runs npm inside a short-lived container with the shared agent directory mounted. Its npm cache is persistent, so unchanged packages can be reused. Agent update prompts inside Codex and Claude can also update this writable prefix; restart the agent to use the new version. Use `command -v codex` or `command -v claude` in the container to confirm that the executable comes from `/opt/devcon/agents/npm/bin`. Custom tools with an `autoBuild` configuration still use an image rebuild when selected by `devcon update`.
 
-Image builds started by `devcon upgrade`, `devcon update`, `devcon rebuild`, and the interactive auto-build prompt run with `docker build --network host`, so package installs inside the Dockerfile use the host DNS/routing stack (the same reason `--network-host` exists for containers, and usually required on VPNs that break Docker bridge DNS/NAT). Override it with `DEVCON_BUILD_NETWORK=<mode>` (for example `DEVCON_BUILD_NETWORK=default`), or `DEVCON_BUILD_NETWORK=off` to omit the flag entirely. Passing `--network-host` to `devcon upgrade` is accepted but redundant.
+Agent installs and image builds use host networking by default so package downloads work on VPNs that break Docker bridge DNS/NAT. Override it with `DEVCON_BUILD_NETWORK=<mode>` (for example `DEVCON_BUILD_NETWORK=default`), or `DEVCON_BUILD_NETWORK=off` to omit the flag entirely. Passing `--network-host` to `devcon upgrade` is accepted but redundant.
 
 When you need a clean slate (ignore every cached layer), use:
 
 ```bash
 devcon rebuild         # fully rebuilds every tool with an auto-build config
-devcon rebuild codex   # fully rebuild just the bundled Codex/Claude/OpenCode/Pi base image
+devcon rebuild codex   # fully rebuild the shared base image; installed agents persist
 ```
 
 Additional handy invocations:
