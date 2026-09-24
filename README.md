@@ -195,6 +195,12 @@ Useful flags (place before `--` that separates devcon flags from tool args):
 - Startup preflight: when bridge networking cannot resolve `api.openai.com` but host networking can, Devcon prompts to switch this run to `--network-host`.
 - Startup preflight timeout defaults to 2500ms per probe and can be adjusted with `DEVCON_NETWORK_PROBE_TIMEOUT_MS`.
 
+### Terminal appearance
+
+Devcon attaches a Docker pseudo-TTY and passes the host's common terminal color settings (`COLORTERM`, `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`, and `COLORFGBG`). It passes portable `TERM` values directly and uses `xterm-256color` for host-specific values whose terminfo may be absent from the image. Direct terminal sessions also receive `TERM_PROGRAM` and `TERM_PROGRAM_VERSION`. The browser terminal uses its own xterm.js and tmux settings.
+
+Your terminal emulator still controls the font, font size, and window theme. The agent's full-screen interface also has its own layout. Devcon does not mount shell startup files by default, so an interactive shell inside the container may have a different prompt or aliases than your host shell.
+
 ### NVIDIA GPU access
 
 GPU access is opt-in and currently supports NVIDIA GPUs on Linux. Both spellings expose all host NVIDIA GPUs:

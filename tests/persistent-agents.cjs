@@ -36,6 +36,10 @@ const env = {
   PATH: `${fakeBin}:${process.env.PATH}`,
   FAKE_DOCKER_LOG: log,
   DEVCON_BUILD_NETWORK: 'host',
+  TERM: 'xterm-256color',
+  COLORTERM: 'truecolor',
+  NO_COLOR: '1',
+  TERM_PROGRAM: 'TestTerminal',
 };
 delete env.DEVCON_TOOLS_FILE;
 
@@ -67,6 +71,10 @@ try {
   assert.ok(launch.includes(`type=bind,source=${path.join(home, '.local/share/devcon/agents')},target=/opt/devcon/agents`));
   assert.ok(launch.includes('NPM_CONFIG_PREFIX=/opt/devcon/agents/npm'));
   assert.ok(launch.includes('PATH=/opt/devcon/agents/npm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'));
+  assert.ok(launch.includes('TERM=xterm-256color'));
+  assert.ok(launch.includes('COLORTERM=truecolor'));
+  assert.ok(launch.includes('NO_COLOR=1'));
+  assert.ok(launch.includes('TERM_PROGRAM=TestTerminal'));
 
   devcon(['update', 'claude']);
   runs = loggedRuns();
@@ -79,6 +87,24 @@ try {
   assert.equal(runs.length, 5, 'first launch should install only the selected agent');
   assert.equal(runs[3].at(-1), 'opencode-ai@latest');
   assert.ok(runs[4].includes('opencode'));
+
+  env.TERM = 'xterm-kitty';
+  devcon(['--no-env', 'codex', '--', '--version']);
+  runs = loggedRuns();
+  assert.ok(runs[5].includes('TERM=xterm-256color'), 'an image without host-specific terminfo should use a portable TERM');
+
+  // A configured untagged image name is the same Docker image as :latest.
+  fs.unlinkSync(path.join(home, '.local/share/devcon/agents/npm/bin/codex'));
+  const toolsFile = path.join(root, 'tools.json');
+  fs.writeFileSync(toolsFile, JSON.stringify({ codex: { image: 'devcon' } }));
+  env.DEVCON_TOOLS_FILE = toolsFile;
+  devcon(['--no-env', 'codex', '--', '--version']);
+  runs = loggedRuns();
+  assert.equal(runs.length, 8, 'an untagged default image should install and launch Codex');
+  assert.equal(runs[6].at(-1), '@openai/codex@latest');
+  assert.ok(runs[7].includes('devcon'));
+  assert.ok(runs[7].includes(`type=bind,source=${path.join(home, '.local/share/devcon/agents')},target=/opt/devcon/agents`));
+  assert.ok(runs[7].includes('PATH=/opt/devcon/agents/npm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'));
   console.log('persistent agents: targeted update, first-use install, shared mount, and launch reuse passed');
 } finally {
   fs.rmSync(root, { recursive: true, force: true });

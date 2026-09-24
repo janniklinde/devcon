@@ -185,6 +185,8 @@ const DEVCON_PACKAGE_ROOT = path.resolve(__dirname, '..');
 const DEVCON_REPO_URL = process.env.DEVCON_UPGRADE_REPO || 'https://github.com/janniklinde/devcon.git';
 const DEVCON_UPGRADE_DEFAULT_BRANCH = 'main';
 const DEFAULT_DOCKER_BUILD_NETWORK = 'host';
+const PORTABLE_TERMS = new Set(['xterm', 'xterm-256color', 'screen', 'screen-256color', 'linux', 'vt100', 'dumb']);
+const TERMINAL_COLOR_ENV = ['COLORTERM', 'NO_COLOR', 'CLICOLOR', 'CLICOLOR_FORCE', 'FORCE_COLOR', 'COLORFGBG'];
 const NETWORK_CHECK_HOST = 'api.openai.com';
 const NETWORK_PROBE_TIMEOUT_MS = parsePositiveIntEnv(process.env.DEVCON_NETWORK_PROBE_TIMEOUT_MS, 2500);
 const WEB_DEFAULT_HOST = '0.0.0.0';
@@ -3987,8 +3989,11 @@ async function runDockerBuild(
 }
 
 function usesManagedAgentInstall(name: string, tool: ToolDefinition): boolean {
+  // Docker treats an untagged local image name as :latest.
+  const usesDefaultImage = tool.image === DEFAULT_IMAGE_TAG
+    || tool.image === DEFAULT_IMAGE_TAG.slice(0, -':latest'.length);
   return Boolean(AGENT_PACKAGES[name]
-    && tool.image === DEFAULT_IMAGE_TAG
+    && usesDefaultImage
     && tool.command?.[0] === name);
 }
 
@@ -4423,6 +4428,29 @@ function printHelp(tools: ToolMap): void {
   }
 }
 
+function appendTerminalEnvironment(dockerArgs: string[], webMode: boolean): void {
+  const hostTerm = process.env.TERM;
+  if (hostTerm) {
+    // Images need not contain terminfo for host-specific TERM names such as
+    // xterm-kitty. Use a widely available entry for those terminals.
+    dockerArgs.push('-e', `TERM=${PORTABLE_TERMS.has(hostTerm) ? hostTerm : 'xterm-256color'}`);
+  }
+  for (const name of TERMINAL_COLOR_ENV) {
+    const value = process.env[name];
+    if (value !== undefined) {
+      dockerArgs.push('-e', `${name}=${value}`);
+    }
+  }
+  if (!webMode) {
+    for (const name of ['TERM_PROGRAM', 'TERM_PROGRAM_VERSION']) {
+      const value = process.env[name];
+      if (value !== undefined) {
+        dockerArgs.push('-e', `${name}=${value}`);
+      }
+    }
+  }
+}
+
 function buildDockerArgs(options: {
   cwd: string;
   toolName: string;
@@ -4443,8 +4471,10 @@ function buildDockerArgs(options: {
   environment?: PersistentEnvironment;
   conscious?: ConsciousRuntime;
   managedAgentInstall?: boolean;
+  webMode: boolean;
 }): DockerLaunchPlan {
   const dockerArgs: string[] = ['run', '--rm', '-it'];
+  appendTerminalEnvironment(dockerArgs, options.webMode);
   const cleanupTargets: string[] = [];
   const writablePaths = options.tool.writablePaths ?? [];
   const homeDir = os.homedir();
@@ -5068,6 +5098,7 @@ async function main(): Promise<void> {
     };
 
     const launch = buildDockerArgs({
+      webMode: options.webMode,
       cwd,
       toolName: options.toolName,
       tool: toolDef,
@@ -5178,6 +5209,7 @@ async function main(): Promise<void> {
   }
 
   const launch = buildDockerArgs({
+    webMode: options.webMode,
     cwd,
     toolName: options.toolName,
     tool,
